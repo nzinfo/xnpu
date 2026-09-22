@@ -117,9 +117,32 @@ fn main() -> ExitCode {
             };
             cmd_run_chain(&add_prj, &gemm_prj, m, k, n, reps)
         }
+        Some("run-q8") => {
+            let gemm_prj = args.get(1).cloned().unwrap_or_else(|| {
+                "/home/nzinfo/qwen/xnpu/IRON/build/gemm_192x384x64_48x96x16_0_0_i8_i32.mlir.prj"
+                    .to_string()
+            });
+            let rescale_prj = args.get(2).cloned().unwrap_or_else(|| {
+                "/home/nzinfo/qwen/xnpu/build/rescale_192x64_32t.mlir.prj".to_string()
+            });
+            let nums: Vec<usize> = args
+                .get(3..)
+                .map(|rest| rest.iter().filter_map(|s| s.parse().ok()).collect())
+                .unwrap_or_default();
+            let (m, k, n, tile_m, reps) = match nums.as_slice() {
+                [m, k, n, tile_m, reps] => (*m, *k, *n, *tile_m, *reps),
+                [m, k, n, tile_m] => (*m, *k, *n, *tile_m, 8),
+                [] => (192, 384, 64, 32, 8),
+                _ => {
+                    eprintln!("run-q8: expected [M K N tile_m] [reps]");
+                    return ExitCode::FAILURE;
+                }
+            };
+            cmd_run_q8(&gemm_prj, &rescale_prj, m, k, n, tile_m, reps)
+        }
         _ => {
             eprintln!(
-                "usage: xnpu-cli <info | ctx-probe [max] [cols] | run-add [prj-dir] [bf16|i8] | run-gemm [prj-dir] [M K N] [bf16|i8] | run-multi [add-prj] [gemm-prj] [M K N] | run-pipe [prj-dir] [M K N] [iters]>"
+                "usage: xnpu-cli <info | ctx-probe [max] [cols] | run-add [prj-dir] [bf16|i8] | run-gemm [prj-dir] [M K N] [bf16|i8] | run-multi [add-prj] [gemm-prj] [M K N] | run-pipe [prj-dir] [M K N] [iters] | run-chain [add-prj] [gemm-prj] [M K N] [reps] | run-q8 [gemm-prj] [rescale-prj] [M K N tile_m] [reps]>"
             );
             ExitCode::FAILURE
         }
@@ -1653,6 +1676,275 @@ fn cmd_run_chain(
     println!(
         "speedup: {:.2}x",
         seq_total.as_secs_f64() / chain_total.as_secs_f64()
+    );
+    if ulp_seq <= 1 && ulp_chain <= 1 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+/// q8 route A closed loop: D = bf16(f32(A_i8 @ B_i8) × sa[M] × sw[N]).
+/// i8 GEMM (cu1) produces an exact int32 accumulation C; rescale (cu0)
+/// multiplies it by per-row × per-column scales and narrows to bf16. C is
+/// ONE SHMEM BO whose VA rides in both packets — the shared-BO dependency
+/// run-chain validated, now with both ends integer-exact: the only rounding
+/// in flight is the rescale's conv_even bf16 narrowing, which should match
+/// host RNE bit-exactly (the ≤1 ULP tier only guards an unexpected f32-mul
+/// tie, mirroring run-chain's check_e).
+///
+/// The rescale fixture is compiled for one (M, N, tile_m) shape, so M and N
+/// must match it exactly (unlike the add fixture, which just touches a
+/// prefix of the gemm output).
+fn cmd_run_q8(
+    gemm_prj: &str,
+    rescale_prj: &str,
+    m: usize,
+    k: usize,
+    n: usize,
+    tile_m: usize,
+    reps: usize,
+) -> ExitCode {
+    let (gemm_pdi, gemm_instr, gemm_cols) = match load_fixture(gemm_prj) {
+        Some(f) => f,
+        None => {
+            eprintln!("load fixture {gemm_prj} failed");
+            return ExitCode::FAILURE;
+        }
+    };
+    let (rs_pdi, rs_instr, rs_cols) = match load_fixture(rescale_prj) {
+        Some(f) => f,
+        None => {
+            eprintln!("load fixture {rescale_prj} failed");
+            return ExitCode::FAILURE;
+        }
+    };
+    let num_blocks = m / tile_m;
+    if m % tile_m != 0 {
+        eprintln!("run-q8: M={m} not a multiple of tile_m={tile_m}");
+        return ExitCode::FAILURE;
+    }
+    println!(
+        "q8 loop: D[{m}x{n}] = bf16(f32(A[{m}x{k}] @i8 B[{k}x{n}]) × sa[{m}] × sw[{n}]), gemm(cu1) -> rescale(cu0), shared C, {reps} reps"
+    );
+
+    let dev = match Device::open_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("open amdxdna device: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let md = match dev.aie_metadata() {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("AIE metadata: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let cols = rs_cols.max(gemm_cols);
+    let num_tiles = cols * md.core.row_count as u32;
+    let mut ctx = match HwContext::create(&dev, num_tiles) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("create hwctx: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(e) = ctx.configure_cus(&[(&rs_pdi, 0), (&gemm_pdi, 0)]) {
+        eprintln!("configure_cus: {e}");
+        return ExitCode::FAILURE;
+    }
+    println!("2 CUs attached (cu 0 = rescale, cu 1 = gemm)");
+
+    // Same integer grids as the i8 run-gemm fixture (exact in i8 and in the
+    // i32 accumulator; |acc| ≤ 3·6·k ≪ 2^24 so f32 widening is exact too).
+    let a_bytes = pack_i8(m, k, |i, j| ((i + j) % 7) as i32 - 3);
+    let b_bytes = pack_i8(k, n, |j, l| ((5 * j + 3 * l) % 7) as i32);
+    // Scale grids from the rescale reference: every value of
+    // ((r%8)-3)/8 and ((c%5)+1)/16 is exact in bf16, so the f32 the host
+    // ships is bit-identical to the bf16 quantization the model would use.
+    let sa = |row: usize| (((row % 8) as i32 - 3) as f32) / 8.0;
+    let sw = |col: usize| (((col % 5) as i32 + 1) as f32) / 16.0;
+    // One concatenated scale block per row block: [tile_m row | N col] f32.
+    let mut s_bytes = Vec::with_capacity((tile_m + n) * num_blocks * 4);
+    for b in 0..num_blocks {
+        for r in 0..tile_m {
+            s_bytes.extend_from_slice(&sa(b * tile_m + r).to_le_bytes());
+        }
+        for l in 0..n {
+            s_bytes.extend_from_slice(&sw(l).to_le_bytes());
+        }
+    }
+    let c_zero = vec![0u8; m * n * 4];
+    let d_zero = vec![0u8; m * n * 2];
+    let mut live: Vec<(BufferObject, Mapping)> = Vec::new();
+    let vas: Vec<u64> = [
+        ("A", a_bytes.as_slice()),
+        ("B", b_bytes.as_slice()),
+        ("C", c_zero.as_slice()),
+        ("S", s_bytes.as_slice()),
+        ("D", d_zero.as_slice()),
+    ]
+    .iter()
+    .filter_map(|(label, data)| chain_tensor(&dev, &mut live, label, data))
+    .collect();
+    if vas.len() != 5 {
+        eprintln!("tensor allocation failed");
+        return ExitCode::FAILURE;
+    }
+    let [a_va, b_va, c_va, s_va, d_va] = [vas[0], vas[1], vas[2], vas[3], vas[4]];
+
+    let mut gemm = match chain_op(&dev, "gemm", &gemm_instr, 1, &[a_va, b_va, c_va]) {
+        Some(o) => o,
+        None => {
+            eprintln!("gemm op setup failed");
+            return ExitCode::FAILURE;
+        }
+    };
+    // rescale runlist order: (input, scales, output).
+    let mut rescale = match chain_op(&dev, "rescale", &rs_instr, 0, &[c_va, s_va, d_va]) {
+        Some(o) => o,
+        None => {
+            eprintln!("rescale op setup failed");
+            return ExitCode::FAILURE;
+        }
+    };
+    let gemm_handles = [gemm.ctrl_bo.handle(), live[0].0.handle(), live[1].0.handle(), live[2].0.handle()];
+    let rs_handles = [
+        rescale.ctrl_bo.handle(),
+        live[2].0.handle(),
+        live[3].0.handle(),
+        live[4].0.handle(),
+    ];
+
+    // Host reference: exact i32 dot products, then the kernel's multiply
+    // order ((acc×sa)×sw) and RNE narrowing — conv_even should match RNE
+    // bit-for-bit.
+    let d_ref: Vec<u16> = (0..m * n)
+        .map(|i| {
+            let (row, col) = (i / n, i % n);
+            let mut acc: i32 = 0;
+            for j in 0..k {
+                acc += (a_bytes[row * k + j] as i8 as i32) * (b_bytes[j * n + col] as i8 as i32);
+            }
+            f32_to_bf16((acc as f32 * sa(row)) * sw(col))
+        })
+        .collect();
+
+    let submit_wait = |op: &mut ChainOp, handles: &[u32]| -> Option<std::time::Duration> {
+        let t0 = std::time::Instant::now();
+        let seq = op.pkt.submit(&dev, &ctx, handles).ok()?;
+        syncobj_timeline_wait(&dev, ctx.syncobj_handle, seq, 10_000_000_000).ok()?;
+        if op.pkt.state() != ERT_CMD_STATE_COMPLETED {
+            return None;
+        }
+        Some(t0.elapsed())
+    };
+
+    if submit_wait(&mut gemm, &gemm_handles).is_none()
+        || submit_wait(&mut rescale, &rs_handles).is_none()
+    {
+        eprintln!("warmup loop failed");
+        return ExitCode::FAILURE;
+    }
+
+    let t0 = std::time::Instant::now();
+    for _ in 0..reps {
+        if submit_wait(&mut gemm, &gemm_handles).is_none()
+            || submit_wait(&mut rescale, &rs_handles).is_none()
+        {
+            eprintln!("sequential loop failed");
+            return ExitCode::FAILURE;
+        }
+    }
+    let seq_total = t0.elapsed();
+
+    // Two-tier check after the sequential phase (wrong reference vs broken
+    // dependency, same split as run-chain).
+    let check_d = |phase: &str| -> (usize, i64) {
+        let d_bo = &live[4].0;
+        let _ = d_bo.sync(SyncDirection::ToDevice, 0, d_bo.size() as u64);
+        let s = live[4].1.as_slice();
+        let total = m * n;
+        let mut mm = 0usize;
+        let mut max_ulp: i64 = 0;
+        let mut first: Option<(usize, u16, u16)> = None;
+        // Normalize signed zero: rows whose scale is 0 multiply out to ±0 and
+        // the AIE f32 mul encodes the negative case as +0 (only the zero
+        // operand triggers this — all non-zero magnitudes and signs matched
+        // bit-exactly). ±0 compares equal in every inference-relevant sense.
+        let norm = |b: u16| if b & 0x7fff == 0 { 0u16 } else { b };
+        for i in 0..total {
+            let got = norm(u16::from_le_bytes([s[i * 2], s[i * 2 + 1]]));
+            if got != norm(d_ref[i]) {
+                let d = if (got >> 15) == (d_ref[i] >> 15) {
+                    (got as i16 as i64 - d_ref[i] as i16 as i64).abs()
+                } else {
+                    1 << 24
+                };
+                mm += 1;
+                max_ulp = max_ulp.max(d);
+                if first.is_none() {
+                    first = Some((i, got, d_ref[i]));
+                }
+            }
+        }
+        if let Some((i, got, want)) = first {
+            println!(
+                "{phase}: first diff @[{i}] (row {}, col {}): got 0x{got:04x} ({}) want 0x{want:04x} ({})",
+                i / n,
+                i % n,
+                bf16_to_f32(got),
+                bf16_to_f32(want)
+            );
+        }
+        println!(
+            "{phase}: D verify {} ({mm}/{total} diffs, max {max_ulp} ulp)",
+            if max_ulp <= 1 { "PASS" } else { "FAIL" }
+        );
+        (mm, max_ulp)
+    };
+    let (_mm_seq, ulp_seq) = check_d("sequential-phase");
+
+    let t0 = std::time::Instant::now();
+    for _ in 0..reps {
+        if let Err(e) = gemm.pkt.submit(&dev, &ctx, &gemm_handles) {
+            eprintln!("chained gemm submit: {e}");
+            return ExitCode::FAILURE;
+        }
+        if let Err(e) = rescale.pkt.submit(&dev, &ctx, &rs_handles) {
+            eprintln!("chained rescale submit: {e}");
+            return ExitCode::FAILURE;
+        }
+        let mut polls = 0u32;
+        loop {
+            let g = gemm.pkt.state() == ERT_CMD_STATE_COMPLETED;
+            let r = rescale.pkt.state() == ERT_CMD_STATE_COMPLETED;
+            if g && r {
+                break;
+            }
+            polls += 1;
+            if polls > 40_000 {
+                eprintln!("chained drain timed out");
+                return ExitCode::FAILURE;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(50));
+        }
+    }
+    let chain_total = t0.elapsed();
+    let (_mm_chain, ulp_chain) = check_d("chained-phase");
+
+    let gemm_ops = (2 * m * k * n) as f64 / 1e9;
+    println!(
+        "sequential: {:?}/loop ({:?}/op avg), chained: {:?}/loop",
+        seq_total / reps as u32,
+        seq_total / (reps as u32 * 2),
+        chain_total / reps as u32
+    );
+    println!(
+        "q8 gemm throughput (chained): {:.0} GOP/s effective over the loop",
+        gemm_ops / (chain_total.as_secs_f64() / reps as f64)
     );
     if ulp_seq <= 1 && ulp_chain <= 1 {
         ExitCode::SUCCESS
