@@ -1,0 +1,9 @@
+[package]
+name = "xnpu-cli"
+description = "Probe / diagnose / load tools for XDNA NPUs via xnpu-hal."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+xnpu-hal = { path = "../xnpu-hal" }

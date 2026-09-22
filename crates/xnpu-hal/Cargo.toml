@@ -1,0 +1,9 @@
+[package]
+name = "xnpu-hal"
+description = "Direct-DRM userspace for AMD XDNA NPUs (amdxdna accel driver). All unsafe lives here."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+libc.workspace = true
