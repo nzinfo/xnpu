@@ -140,9 +140,30 @@ fn main() -> ExitCode {
             };
             cmd_run_q8(&gemm_prj, &rescale_prj, m, k, n, tile_m, reps)
         }
+        Some("run-w4gemv") => {
+            let prj = args.get(1).cloned().unwrap_or_else(|| {
+                "/home/nzinfo/qwen/xnpu/build/fused_dequant_gemv_2048x2048_1tsi_512tso_4col_g32.mlir.prj"
+                    .to_string()
+            });
+            let nums: Vec<usize> = args
+                .get(2..)
+                .map(|rest| rest.iter().filter_map(|s| s.parse().ok()).collect())
+                .unwrap_or_default();
+            let (m, k, group, iters) = match nums.as_slice() {
+                [m, k, group, iters] => (*m, *k, *group, *iters),
+                [m, k, group] => (*m, *k, *group, 32),
+                [m, k] => (*m, *k, 32, 32),
+                [] => (2048, 2048, 32, 32),
+                _ => {
+                    eprintln!("run-w4gemv: expected [M K] [group] [iters]");
+                    return ExitCode::FAILURE;
+                }
+            };
+            cmd_run_w4gemv(&prj, m, k, group, iters)
+        }
         _ => {
             eprintln!(
-                "usage: xnpu-cli <info | ctx-probe [max] [cols] | run-add [prj-dir] [bf16|i8] | run-gemm [prj-dir] [M K N] [bf16|i8] | run-multi [add-prj] [gemm-prj] [M K N] | run-pipe [prj-dir] [M K N] [iters] | run-chain [add-prj] [gemm-prj] [M K N] [reps] | run-q8 [gemm-prj] [rescale-prj] [M K N tile_m] [reps]>"
+                "usage: xnpu-cli <info | ctx-probe [max] [cols] | run-add [prj-dir] [bf16|i8] | run-gemm [prj-dir] [M K N] [bf16|i8] | run-multi [add-prj] [gemm-prj] [M K N] | run-pipe [prj-dir] [M K N] [iters] | run-chain [add-prj] [gemm-prj] [M K N] [reps] | run-q8 [gemm-prj] [rescale-prj] [M K N tile_m] [reps] | run-w4gemv [prj-dir] [M K] [group] [iters]>"
             );
             ExitCode::FAILURE
         }
@@ -1947,6 +1968,278 @@ fn cmd_run_q8(
         gemm_ops / (chain_total.as_secs_f64() / reps as f64)
     );
     if ulp_seq <= 1 && ulp_chain <= 1 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+/// W4 GEMV through the upstream fused INT4-dequant fixture: persistent
+/// workers (infinite fifo loop, no core restart between launches) stream
+/// packed uint4 weights + per-group-32 bf16 scales, dequantize in-register
+/// and produce C[i] = bf16(Σ_k w_dequant(i,k)·x[k]) with a conv_even
+/// narrowing.
+///
+/// Test data keeps every intermediate exact (the M1 recipe, now for the
+/// quantized-weight path): scales are dyadics ((g%4)+1)/16, nibbles ≤ 15,
+/// so w_dequant = nibble×scale is exact in bf16; x is small integers; each
+/// product is a multiple of 2⁻⁴ with ≤ 19 significant bits summed over K
+/// terms — exact in f32 regardless of the kernel's lane split and
+/// reduce_add order. The only rounding in flight is the final bf16
+/// narrowing, so host RNE must match bit-for-bit.
+fn cmd_run_w4gemv(prj: &str, m: usize, k: usize, group: usize, iters: usize) -> ExitCode {
+    let (pdi, instr, cols) = match load_fixture(prj) {
+        Some(f) => f,
+        None => {
+            eprintln!("load fixture {prj} failed");
+            return ExitCode::FAILURE;
+        }
+    };
+    // Fixture geometry: m_input=1 row per tile, `cols` AIE columns each
+    // owning M/cols rows; per tile [K/2 nibble bytes | K/group bf16 scales].
+    let ncols = cols as usize;
+    let tile_bytes = k / 2 + (k / group) * 2;
+    let a_bytes_len = ncols * (m / ncols) * tile_bytes;
+    println!(
+        "w4 gemv: C[{m}] = W_packed[{m}x{k}] @ x[{k}], uint4/g{group} scales, {cols} cols, tile {tile_bytes} B, weights {} KB, {iters} iters",
+        a_bytes_len / 1024
+    );
+
+    let dev = match Device::open_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("open amdxdna device: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let md = match dev.aie_metadata() {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("AIE metadata: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let num_tiles = cols * md.core.row_count as u32;
+    let mut ctx = match HwContext::create(&dev, num_tiles) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("create hwctx: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(e) = ctx.configure_cu(&pdi, 0) {
+        eprintln!("configure_cu (PDI load): {e}");
+        return ExitCode::FAILURE;
+    }
+    println!("PDI loaded, CU configured ({cols} cols / {num_tiles} tiles)");
+
+    // Deterministic data: nibble(i,k) = (13i+7k)%16, scale(g) = ((g%4)+1)/16
+    // (exact bf16 dyadic), x[k] = (k%7)-3 (small integer).
+    let nibble = |i: usize, kk: usize| ((13 * i + 7 * kk) % 16) as u8;
+    let scale = |g: usize| (((g % 4) + 1) as f32) / 16.0;
+    let groups_per_row = k / group;
+    let mut a_bytes = vec![0u8; a_bytes_len];
+    for i in 0..m {
+        // Tile layout: col-major over columns, m_input=1 row per tile, so
+        // row i's tile index is exactly i and its byte offset i*tile_bytes.
+        let off = i * tile_bytes;
+        for p in 0..k / 2 {
+            a_bytes[off + p] = nibble(i, 2 * p) | (nibble(i, 2 * p + 1) << 4);
+        }
+        for g in 0..groups_per_row {
+            let bits = f32_to_bf16(scale(g));
+            a_bytes[off + k / 2 + g * 2..off + k / 2 + g * 2 + 2]
+                .copy_from_slice(&bits.to_le_bytes());
+        }
+    }
+    let x_bits: Vec<u16> = (0..k).map(|kk| f32_to_bf16(((kk % 7) as i32 - 3) as f32)).collect();
+    let mut b_bytes = vec![0u8; k * 2];
+    for (kk, b) in x_bits.iter().enumerate() {
+        b_bytes[kk * 2..kk * 2 + 2].copy_from_slice(&b.to_le_bytes());
+    }
+    let c_zero = vec![0u8; m * 2];
+
+    let mut live: Vec<(BufferObject, Mapping)> = Vec::new();
+    let vas: Vec<u64> = [
+        ("W", a_bytes.as_slice()),
+        ("x", b_bytes.as_slice()),
+        ("C", c_zero.as_slice()),
+    ]
+    .iter()
+    .filter_map(|(label, data)| chain_tensor(&dev, &mut live, label, data))
+    .collect();
+    if vas.len() != 3 {
+        eprintln!("tensor allocation failed");
+        return ExitCode::FAILURE;
+    }
+    let [w_va, x_va, c_va] = [vas[0], vas[1], vas[2]];
+
+    let mut op = match chain_op(&dev, "w4gemv", &instr, 0, &[w_va, x_va, c_va]) {
+        Some(o) => o,
+        None => {
+            eprintln!("w4gemv op setup failed");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut handles = vec![op.ctrl_bo.handle()];
+    handles.extend(live.iter().map(|(b, _)| b.handle()));
+
+    // Host reference: exact f32 dot per row (see doc comment), one RNE
+    // narrowing — must match the kernel bit-for-bit.
+    let c_ref: Vec<u16> = (0..m)
+        .map(|i| {
+            let mut acc = 0f32;
+            for kk in 0..k {
+                let w = (nibble(i, kk) as f32) * scale(kk / group);
+                acc += w * bf16_to_f32(x_bits[kk]);
+            }
+            f32_to_bf16(acc)
+        })
+        .collect();
+
+    // Warmup.
+    let t0 = std::time::Instant::now();
+    let seq = match op.pkt.submit(&dev, &ctx, &handles) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("warmup submit: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if syncobj_timeline_wait(&dev, ctx.syncobj_handle, seq, 10_000_000_000).is_err()
+        || op.pkt.state() != ERT_CMD_STATE_COMPLETED
+    {
+        eprintln!("warmup did not complete");
+        return ExitCode::FAILURE;
+    }
+    println!("warmup: {:?}", t0.elapsed());
+
+    let check_c = |label: &str| -> usize {
+        let c_bo = &live[2].0;
+        let _ = c_bo.sync(SyncDirection::ToDevice, 0, c_bo.size() as u64);
+        let s = live[2].1.as_slice();
+        let mut mm = 0usize;
+        let mut first: Option<(usize, u16, u16)> = None;
+        for i in 0..m {
+            let got = u16::from_le_bytes([s[i * 2], s[i * 2 + 1]]);
+            if got != c_ref[i] {
+                mm += 1;
+                if first.is_none() {
+                    first = Some((i, got, c_ref[i]));
+                }
+            }
+        }
+        match first {
+            Some((i, got, want)) => println!(
+                "{label}: first diff @[{i}]: got 0x{got:04x} ({}) want 0x{want:04x} ({})",
+                bf16_to_f32(got),
+                bf16_to_f32(want)
+            ),
+            None => println!("{label}: verify PASS ({mm}/{m} diffs)"),
+        }
+        mm
+    };
+    let mm = check_c("warmup");
+    if mm != 0 {
+        return ExitCode::FAILURE;
+    }
+
+    // Sequential: submit+wait per op (the R3 engine pattern).
+    let t0 = std::time::Instant::now();
+    for _ in 0..iters {
+        let seq = match op.pkt.submit(&dev, &ctx, &handles) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("sequential submit: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        if syncobj_timeline_wait(&dev, ctx.syncobj_handle, seq, 10_000_000_000).is_err()
+            || op.pkt.state() != ERT_CMD_STATE_COMPLETED
+        {
+            eprintln!("sequential exec did not complete");
+            return ExitCode::FAILURE;
+        }
+    }
+    let seq_elapsed = t0.elapsed();
+    let mm_seq = check_c("sequential");
+
+    // Pipelined: a pool of in-flight cmd BOs, submit all, drain by state
+    // (same tensors, in-order queue → last result wins).
+    let ctrl_addr = op.ctrl_bo.xdna_addr();
+    let mut pkts: Vec<StartNpuCmd> = Vec::with_capacity(iters);
+    for _ in 0..iters {
+        let mut p = match StartNpuCmd::new(&dev) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("cmd BO: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        p.set_cu(0);
+        let mut r = p
+            .set_ctrl(ctrl_addr, instr.len() as u32)
+            .and_then(|_| p.arg64(3))
+            .and_then(|_| p.arg64(ctrl_addr))
+            .and_then(|_| p.arg32(instr.len() as u32));
+        for va in &[w_va, x_va, c_va] {
+            r = r.and_then(|_| p.arg64(*va));
+        }
+        if let Err(e) = r {
+            eprintln!("build packet: {e}");
+            return ExitCode::FAILURE;
+        }
+        pkts.push(p);
+    }
+    let t0 = std::time::Instant::now();
+    let mut submits = 0u32;
+    for p in pkts.iter_mut() {
+        if let Err(e) = p.submit(&dev, &ctx, &handles) {
+            eprintln!("pipelined submit (depth {}): {e}", submits + 1);
+            return ExitCode::FAILURE;
+        }
+        submits += 1;
+    }
+    let submit_elapsed = t0.elapsed();
+    let t1 = std::time::Instant::now();
+    let mut spins = 0u64;
+    loop {
+        if pkts.iter().all(|p| p.state() == ERT_CMD_STATE_COMPLETED) {
+            break;
+        }
+        spins += 1;
+        if spins > 4_000_000 {
+            eprintln!("pipelined drain timed out");
+            return ExitCode::FAILURE;
+        }
+        std::thread::sleep(std::time::Duration::from_micros(50));
+    }
+    let pipe_elapsed = t0.elapsed();
+    let mm_pipe = check_c("pipelined");
+
+    // Weight bytes streamed per op: nibbles + scales (the vector and output
+    // are noise at this size) — the number that bounds decode throughput.
+    let weight_bytes = a_bytes_len as f64;
+    let seq_per = seq_elapsed.as_secs_f64() / iters as f64;
+    let pipe_per = pipe_elapsed.as_secs_f64() / iters as f64;
+    println!(
+        "sequential: {:?}/op ({:.0} GB/s weight stream)",
+        seq_elapsed / iters as u32,
+        weight_bytes / seq_per / 1e9
+    );
+    println!(
+        "pipelined:  {:?}/op total, submit loop {:?}, drain {:?} ({:.0} GB/s weight stream)",
+        pipe_elapsed / iters as u32,
+        submit_elapsed,
+        t1.elapsed(),
+        weight_bytes / pipe_per / 1e9
+    );
+    println!(
+        "per-token projection (MiniCPM5 42 layers ≈ 2.66 G weights → 0.70 GB w4): {:.2} ms sequential / {:.2} ms pipelined",
+        0.70e9 / (weight_bytes / seq_per) * 1e3,
+        0.70e9 / (weight_bytes / pipe_per) * 1e3
+    );
+    if mm_seq == 0 && mm_pipe == 0 {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
