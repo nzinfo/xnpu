@@ -26,10 +26,13 @@ fn main() -> ExitCode {
             let prj = args.get(1).cloned().unwrap_or_else(|| {
                 "/home/nzinfo/qwen/xnpu/build/add_1c_2ch_2048_2048t.mlir.prj".to_string()
             });
-            cmd_run_add(&prj)
+            let dtype = args.get(2).cloned().unwrap_or_else(|| "bf16".to_string());
+            cmd_run_add(&prj, &dtype)
         }
         _ => {
-            eprintln!("usage: xnpu-cli <info|ctx-probe [max] [cols] | run-add [prj-dir]>");
+            eprintln!(
+                "usage: xnpu-cli <info | ctx-probe [max] [cols] | run-add [prj-dir] [bf16|i8]>"
+            );
             ExitCode::FAILURE
         }
     }
@@ -42,16 +45,78 @@ fn f32_to_bf16(x: f32) -> u16 {
     ((b.wrapping_add(bias)) >> 16) as u16
 }
 
-fn bf16_to_f32(v: u16) -> f32 {
-    f32::from_bits((v as u32) << 16)
+/// Element type of the add fixture under test.
+#[derive(Clone, Copy, PartialEq)]
+enum DType {
+    Bf16,
+    I8,
+}
+
+impl DType {
+    fn parse(s: &str) -> Option<DType> {
+        match s {
+            "bf16" => Some(DType::Bf16),
+            "i8" => Some(DType::I8),
+            _ => None,
+        }
+    }
+
+    fn itemsize(self) -> usize {
+        match self {
+            DType::Bf16 => 2,
+            DType::I8 => 1,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            DType::Bf16 => "bf16",
+            DType::I8 => "int8",
+        }
+    }
+
+    /// Pack one element (the fixture values are small integers, exactly
+    /// representable in both types) at `i`-th position of a tensor buffer.
+    fn pack_at(self, slice: &mut [u8], i: usize, v: f32) {
+        match self {
+            DType::Bf16 => {
+                let b = f32_to_bf16(v).to_le_bytes();
+                slice[i * 2..i * 2 + 2].copy_from_slice(&b);
+            }
+            DType::I8 => slice[i] = v as i8 as u8,
+        }
+    }
+
+    /// Decode the i-th element of an output buffer as i64 for comparison,
+    /// alongside the expected a+b value (same small-integer values, so the
+    /// int8 add cannot wrap).
+    fn unpack(self, buf: &[u8], i: usize, a: f32, b: f32) -> (i64, i64) {
+        match self {
+            DType::Bf16 => {
+                let g = u16::from_le_bytes([buf[i * 2], buf[i * 2 + 1]]);
+                (g as i64, f32_to_bf16(a + b) as i64)
+            }
+            DType::I8 => (
+                buf[i] as i8 as i64,
+                ((a as i32 + b as i32) as i8) as i64,
+            ),
+        }
+    }
 }
 
 /// End-to-end first operator: load the IRON add_1c_2ch fixture (1 core, 2048
-/// bf16 elements per buffer) over raw DRM and verify the AIE output.
+/// elements per buffer, bf16 or int8) over raw DRM and verify the AIE output.
 ///
 /// Register-map ABI (main_kernels.json / mlir_aie DPU pseudo-kernel):
 /// opcode u64 = 3, instr u64 (ctrl-code VA), ninstr u32, then bo0.. u64 VAs.
-fn cmd_run_add(prj: &str) -> ExitCode {
+fn cmd_run_add(prj: &str, dtype: &str) -> ExitCode {
+    let dt = match DType::parse(dtype) {
+        Some(d) => d,
+        None => {
+            eprintln!("unknown dtype '{dtype}' (expected bf16 or i8)");
+            return ExitCode::FAILURE;
+        }
+    };
     let pdi_path = format!("{prj}/main.pdi");
     // The ctrl-code .bin sits next to the .mlir.prj dir (both in the IRON
     // build dir), named after the shared stem.
@@ -116,12 +181,11 @@ fn cmd_run_add(prj: &str) -> ExitCode {
     }
     println!("PDI loaded, CU configured");
 
-    // Ctrl-code and tensors as DEV BOs carved from the device heap: their
-    // xdna_addr values are firmware-visible through the heap's MAP_HOST_BUFFER
-    // registration, no PASID/SVM needed (this firmware does not dereference
-    // plain user VAs).
+    // Ctrl-code BO is a DEV BO carved from the device heap: the instruction
+    // regmap field must carry its heap xdna_addr (see the tensor comment below
+    // for the opposite, user-VA rule that applies to tensor BOs).
     let n: usize = 2048;
-    let bytes = n * 2;
+    let bytes = n * dt.itemsize();
 
     let ctrl_bo = match BufferObject::new(&dev, BoType::Dev, instr.len()) {
         Ok(b) => b,
@@ -146,7 +210,7 @@ fn cmd_run_add(prj: &str) -> ExitCode {
     );
 
     // in1[i] = (i % 7) - 3, in2[i] = (i / 7) % 5 -> sums stay small integers,
-    // exact in bf16.
+    // exact in both bf16 and int8.
     //
     // Tensors must be SHMEM BOs whose regmap entries carry the *user VA*: the
     // firmware dereferences them through SVM/PASID (it walks the host page
@@ -160,8 +224,7 @@ fn cmd_run_add(prj: &str) -> ExitCode {
             let mut map = bo.map_owned().ok()?;
             let slice = map.as_mut_slice();
             for i in 0..n {
-                let b = f32_to_bf16(f(i)).to_le_bytes();
-                slice[i * 2..i * 2 + 2].copy_from_slice(&b);
+                dt.pack_at(slice, i, f(i));
             }
             bo.sync(SyncDirection::ToDevice, 0, bo.size() as u64).ok()?;
             println!(
@@ -261,12 +324,11 @@ fn cmd_run_add(prj: &str) -> ExitCode {
     let _ = std::fs::write("/tmp/in1.bin", in1_map.as_slice());
     let _ = std::fs::write("/tmp/in2.bin", in2_map.as_slice());
     let mut mismatches = 0usize;
-    let mut first_bad: Option<(usize, u16, u16)> = None;
+    let mut first_bad: Option<(usize, i64, i64)> = None;
     for i in 0..n {
-        let got = u16::from_le_bytes([s[i * 2], s[i * 2 + 1]]);
         let v1 = (i % 7) as f32 - 3.0;
         let v2 = ((i / 7) % 5) as f32;
-        let want = f32_to_bf16(v1 + v2);
+        let (got, want) = dt.unpack(&s, i, v1, v2);
         if got != want {
             mismatches += 1;
             if first_bad.is_none() {
@@ -276,14 +338,21 @@ fn cmd_run_add(prj: &str) -> ExitCode {
     }
     match first_bad {
         Some((i, got, want)) => println!(
-            "first mismatch @[{i}]: got bf16 0x{got:04x} ({}) want 0x{want:04x} ({})",
-            bf16_to_f32(got),
-            bf16_to_f32(want)
+            "first mismatch @[{i}]: got {} ({:#06x}) want {} ({:#06x})",
+            got,
+            got as u16,
+            want,
+            want as u16
         ),
-        None => println!("out[0..8] = {:?}", (0..8).map(|i| bf16_to_f32(u16::from_le_bytes([s[i*2], s[i*2+1]]))).collect::<Vec<_>>()),
+        None => println!(
+            "out[0..8] = {:?}",
+            (0..8)
+                .map(|i| dt.unpack(&s, i, (i % 7) as f32 - 3.0, ((i / 7) % 5) as f32).0)
+                .collect::<Vec<_>>()
+        ),
     }
     if mismatches == 0 {
-        println!("VERIFY: PASS ({n} elements, bf16 exact)");
+        println!("VERIFY: PASS ({n} elements, {} exact)", dt.name());
         ExitCode::SUCCESS
     } else {
         eprintln!("VERIFY: FAIL ({mismatches}/{n} mismatches)");
