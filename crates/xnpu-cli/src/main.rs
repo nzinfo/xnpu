@@ -95,6 +95,28 @@ fn main() -> ExitCode {
             };
             cmd_run_pipe(&prj, m, k, n, iters)
         }
+        Some("run-chain") => {
+            let add_prj = args.get(1).cloned().unwrap_or_else(|| {
+                "/home/nzinfo/qwen/xnpu/build/add_1c_2ch_2048_2048t.mlir.prj".to_string()
+            });
+            let gemm_prj = args.get(2).cloned().unwrap_or_else(|| {
+                "/home/nzinfo/qwen/xnpu/build/gemm_192x384x64_48x96x16_0_0.mlir.prj".to_string()
+            });
+            let nums: Vec<usize> = args
+                .get(3..)
+                .map(|rest| rest.iter().filter_map(|s| s.parse().ok()).collect())
+                .unwrap_or_default();
+            let (m, k, n, reps) = match nums.as_slice() {
+                [m, k, n, reps] => (*m, *k, *n, *reps),
+                [m, k, n] => (*m, *k, *n, 8),
+                [] => (192, 384, 64, 8),
+                _ => {
+                    eprintln!("run-chain: expected [M K N] [reps]");
+                    return ExitCode::FAILURE;
+                }
+            };
+            cmd_run_chain(&add_prj, &gemm_prj, m, k, n, reps)
+        }
         _ => {
             eprintln!(
                 "usage: xnpu-cli <info | ctx-probe [max] [cols] | run-add [prj-dir] [bf16|i8] | run-gemm [prj-dir] [M K N] [bf16|i8] | run-multi [add-prj] [gemm-prj] [M K N] | run-pipe [prj-dir] [M K N] [iters]>"
@@ -1053,7 +1075,7 @@ fn cmd_run_multi(add_prj: &str, gemm_prj: &str, m: usize, k: usize, n: usize) ->
     // interleaved (alternating CUs) here quantifies that switch cost with the
     // submit+wait overhead common to both sides.
     let reps = 8usize;
-    let mut exec_ok = |op: &mut OpState| -> Option<std::time::Duration> {
+    let exec_ok = |op: &mut OpState| -> Option<std::time::Duration> {
         match op.exec(&dev, &ctx) {
             Ok((state, dt)) if state == ERT_CMD_STATE_COMPLETED => Some(dt),
             Ok((state, _)) => {
@@ -1331,6 +1353,308 @@ fn cmd_run_pipe(gemm_prj: &str, m: usize, k: usize, n: usize, iters: usize) -> E
         seq_elapsed.saturating_sub(pipe_elapsed) / iters as u32
     );
     if mm == 0 && mm2 == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+/// Create one SHMEM tensor, fill it, sync it, park the (BO, mapping) pair in
+/// `live` so both outlive the experiment; returns its VA for the regmap.
+fn chain_tensor(
+    dev: &Device,
+    live: &mut Vec<(BufferObject, Mapping)>,
+    label: &str,
+    data: &[u8],
+) -> Option<u64> {
+    let bo = BufferObject::new(dev, BoType::Shmem, data.len()).ok()?;
+    let mut map = bo.map_owned().ok()?;
+    map.as_mut_slice().copy_from_slice(data);
+    bo.sync(SyncDirection::ToDevice, 0, bo.size() as u64).ok()?;
+    println!("{label} BO: hdl={} va=0x{:x}", bo.handle(), map.as_ptr() as u64);
+    let va = map.as_ptr() as u64;
+    live.push((bo, map));
+    Some(va)
+}
+
+/// One op's packet + its ctrl-code BO, kept together so both stay alive.
+struct ChainOp {
+    pkt: StartNpuCmd,
+    ctrl_bo: BufferObject,
+}
+
+fn chain_op(
+    dev: &Device,
+    label: &str,
+    instr: &[u8],
+    cu: u32,
+    tensor_vas: &[u64],
+) -> Option<ChainOp> {
+    let ctrl_bo = BufferObject::new(dev, BoType::Dev, instr.len()).ok()?;
+    dev.write_dev_bo(&ctrl_bo, instr).ok()?;
+    ctrl_bo.sync(SyncDirection::ToDevice, 0, ctrl_bo.size() as u64).ok()?;
+    let ctrl_addr = ctrl_bo.xdna_addr();
+    println!("{label} ctrl BO: hdl={} xdna=0x{:x}", ctrl_bo.handle(), ctrl_addr);
+    let mut pkt = StartNpuCmd::new(dev).ok()?;
+    pkt.set_cu(cu);
+    let mut r = pkt
+        .set_ctrl(ctrl_addr, instr.len() as u32)
+        .and_then(|_| pkt.arg64(3))
+        .and_then(|_| pkt.arg64(ctrl_addr))
+        .and_then(|_| pkt.arg32(instr.len() as u32));
+    for va in tensor_vas {
+        r = r.and_then(|_| pkt.arg64(*va));
+    }
+    r.ok()?;
+    Some(ChainOp { pkt, ctrl_bo })
+}
+
+/// M3 first experiment: a cross-CU data-dependency chain on one context —
+/// the shape of one decode layer. E = (A @ B) + D where the gemm's output C
+/// and the add's first input are THE SAME buffer object: the regmap just
+/// carries the same VA in both packets, the in-order queue provides the
+/// ordering, and no host round trip or copy happens between the ops.
+///
+/// Sequential (wait between ops) vs chained (submit both, wait once)
+/// timings measure what layer-level batching recovers, now with a real
+/// cross-CU dependency in flight — including the PDI-reload switch cost
+/// that run-multi attributed to every cu_mask change.
+fn cmd_run_chain(
+    add_prj: &str,
+    gemm_prj: &str,
+    m: usize,
+    k: usize,
+    n: usize,
+    reps: usize,
+) -> ExitCode {
+    let (add_pdi, add_instr, add_cols) = match load_fixture(add_prj) {
+        Some(f) => f,
+        None => {
+            eprintln!("load fixture {add_prj} failed");
+            return ExitCode::FAILURE;
+        }
+    };
+    let (gemm_pdi, gemm_instr, gemm_cols) = match load_fixture(gemm_prj) {
+        Some(f) => f,
+        None => {
+            eprintln!("load fixture {gemm_prj} failed");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!(
+        "chain: E[0..2048] = (A[{m}x{k}] @ B[{k}x{n}])[0..2048] + D, gemm(cu1) -> add(cu0), shared C, {reps} reps"
+    );
+
+    let dev = match Device::open_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("open amdxdna device: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let md = match dev.aie_metadata() {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("AIE metadata: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let cols = add_cols.max(gemm_cols);
+    let num_tiles = cols * md.core.row_count as u32;
+    let mut ctx = match HwContext::create(&dev, num_tiles) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("create hwctx: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(e) = ctx.configure_cus(&[(&add_pdi, 0), (&gemm_pdi, 0)]) {
+        eprintln!("configure_cus: {e}");
+        return ExitCode::FAILURE;
+    }
+    println!("2 CUs attached (cu 0 = add, cu 1 = gemm)");
+
+    // A/B gemm inputs; C shared gemm-out/add-in (full gemm size — the add
+    // only touches its first 2048 elements); D add input 2; E add output.
+    let a_bytes = pack_bf16(m, k, |i, j| ((i + j) % 7) as i32 - 3);
+    let b_bytes = pack_bf16(k, n, |j, l| ((5 * j + 3 * l) % 7) as i32);
+    let mut d_bytes = vec![0u8; 2048 * 2];
+    for i in 0..2048 {
+        let bits = f32_to_bf16(((i / 7) % 5) as f32).to_le_bytes();
+        d_bytes[i * 2..i * 2 + 2].copy_from_slice(&bits);
+    }
+    let c_zero = vec![0u8; m * n * 2];
+    let e_zero = vec![0u8; 2048 * 2];
+    let mut live: Vec<(BufferObject, Mapping)> = Vec::new();
+    let vas: Vec<u64> = [
+        ("A", a_bytes.as_slice()),
+        ("B", b_bytes.as_slice()),
+        ("C", c_zero.as_slice()),
+        ("D", d_bytes.as_slice()),
+        ("E", e_zero.as_slice()),
+    ]
+    .iter()
+    .filter_map(|(label, data)| chain_tensor(&dev, &mut live, label, data))
+    .collect();
+    if vas.len() != 5 {
+        eprintln!("tensor allocation failed");
+        return ExitCode::FAILURE;
+    }
+    let [a_va, b_va, c_va, d_va, e_va] = [vas[0], vas[1], vas[2], vas[3], vas[4]];
+
+    let mut gemm = match chain_op(&dev, "gemm", &gemm_instr, 1, &[a_va, b_va, c_va]) {
+        Some(o) => o,
+        None => {
+            eprintln!("gemm op setup failed");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut add = match chain_op(&dev, "add", &add_instr, 0, &[c_va, d_va, e_va]) {
+        Some(o) => o,
+        None => {
+            eprintln!("add op setup failed");
+            return ExitCode::FAILURE;
+        }
+    };
+    let gemm_handles = [gemm.ctrl_bo.handle(), live[0].0.handle(), live[1].0.handle(), live[2].0.handle()];
+    let add_handles = [add.ctrl_bo.handle(), live[2].0.handle(), live[3].0.handle(), live[4].0.handle()];
+
+    // Host reference for E: C from the f32-accumulation reference, then the
+    // add's exact bf16 sum (both fixtures are small-integer exact).
+    let e_ref: Vec<u16> = {
+        let dec = |bytes: &[u8], e: usize| bf16_to_f32(u16::from_le_bytes([bytes[e * 2], bytes[e * 2 + 1]]));
+        (0..2048)
+            .map(|i| {
+                // C_ref[i]: row i/n, col i%n of the reference product.
+                let (row, col) = (i / n, i % n);
+                let mut acc = 0f32;
+                for j in 0..k {
+                    let av = dec(&a_bytes, row * k + j);
+                    let bv = dec(&b_bytes, j * n + col);
+                    acc += av * bv;
+                }
+                f32_to_bf16(bf16_to_f32(f32_to_bf16(acc)) + dec(&d_bytes, i))
+            })
+            .collect()
+    };
+
+    let submit_wait = |op: &mut ChainOp, handles: &[u32]| -> Option<std::time::Duration> {
+        let t0 = std::time::Instant::now();
+        let seq = op.pkt.submit(&dev, &ctx, handles).ok()?;
+        syncobj_timeline_wait(&dev, ctx.syncobj_handle, seq, 10_000_000_000).ok()?;
+        if op.pkt.state() != ERT_CMD_STATE_COMPLETED {
+            return None;
+        }
+        Some(t0.elapsed())
+    };
+
+    // Warmup chain.
+    if submit_wait(&mut gemm, &gemm_handles).is_none()
+        || submit_wait(&mut add, &add_handles).is_none()
+    {
+        eprintln!("warmup chain failed");
+        return ExitCode::FAILURE;
+    }
+
+    // Sequential: the R3 pattern, one wait per op.
+    let t0 = std::time::Instant::now();
+    for _ in 0..reps {
+        if submit_wait(&mut gemm, &gemm_handles).is_none()
+            || submit_wait(&mut add, &add_handles).is_none()
+        {
+            eprintln!("sequential chain failed");
+            return ExitCode::FAILURE;
+        }
+    }
+    let seq_total = t0.elapsed();
+
+    // Interim check after the sequential phase only — separates a wrong
+    // reference (fails here too) from a broken cross-CU dependency under
+    // chained submission (fails only below). The final add rounds ties
+    // differently than host RNE — AIE's bf16 conversion only rounds
+    // half-to-even with -DROUND_CONV_EVEN, which the add fixture predates —
+    // so exact matches come first and <=1 ULP tie diffs form the pass tier.
+    let check_e = |phase: &str| -> (usize, i64) {
+        let e_bo = &live[4].0;
+        let _ = e_bo.sync(SyncDirection::ToDevice, 0, e_bo.size() as u64);
+        let s = live[4].1.as_slice();
+        let mut mm = 0usize;
+        let mut max_ulp: i64 = 0;
+        let mut first: Option<(usize, u16, u16)> = None;
+        for i in 0..2048 {
+            let got = u16::from_le_bytes([s[i * 2], s[i * 2 + 1]]);
+            if got != e_ref[i] {
+                let d = if (got >> 15) == (e_ref[i] >> 15) {
+                    (got as i16 as i64 - e_ref[i] as i16 as i64).abs()
+                } else {
+                    1 << 24
+                };
+                mm += 1;
+                max_ulp = max_ulp.max(d);
+                if first.is_none() {
+                    first = Some((i, got, e_ref[i]));
+                }
+            }
+        }
+        if let Some((i, got, want)) = first {
+            println!(
+                "{phase}: first diff @[{i}]: got 0x{got:04x} ({}) want 0x{want:04x} ({})",
+                bf16_to_f32(got),
+                bf16_to_f32(want)
+            );
+        }
+        println!(
+            "{phase}: E verify {} ({mm}/2048 diffs, max {max_ulp} ulp — tie-rounding tier)",
+            if max_ulp <= 1 { "PASS" } else { "FAIL" }
+        );
+        (mm, max_ulp)
+    };
+    let (_mm_seq, ulp_seq) = check_e("sequential-phase");
+
+    // Chained: submit gemm+add pairs back-to-back (in-order queue preserves
+    // the dependency), drain by polling both packets, repeat.
+    let t0 = std::time::Instant::now();
+    for _ in 0..reps {
+        if let Err(e) = gemm.pkt.submit(&dev, &ctx, &gemm_handles) {
+            eprintln!("chained gemm submit: {e}");
+            return ExitCode::FAILURE;
+        }
+        if let Err(e) = add.pkt.submit(&dev, &ctx, &add_handles) {
+            eprintln!("chained add submit: {e}");
+            return ExitCode::FAILURE;
+        }
+        let mut polls = 0u32;
+        loop {
+            let g = gemm.pkt.state() == ERT_CMD_STATE_COMPLETED;
+            let a = add.pkt.state() == ERT_CMD_STATE_COMPLETED;
+            if g && a {
+                break;
+            }
+            polls += 1;
+            if polls > 40_000 {
+                eprintln!("chained drain timed out");
+                return ExitCode::FAILURE;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(50));
+        }
+    }
+    let chain_total = t0.elapsed();
+    let (_mm_chain, ulp_chain) = check_e("chained-phase");
+
+    println!(
+        "sequential: {:?}/chain ({:?}/op avg)",
+        seq_total / reps as u32,
+        seq_total / (reps as u32 * 2)
+    );
+    println!(
+        "chained:    {:?}/chain — submit-only between ops, one drain per chain",
+        chain_total / reps as u32
+    );
+    println!(
+        "speedup: {:.2}x",
+        seq_total.as_secs_f64() / chain_total.as_secs_f64()
+    );
+    if ulp_seq <= 1 && ulp_chain <= 1 {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
