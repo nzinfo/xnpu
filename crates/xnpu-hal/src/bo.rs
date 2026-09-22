@@ -19,6 +19,9 @@ pub enum BoType {
     Cmd = 4,
 }
 
+/// Device memory heap must sit inside one 64MB page; max size is 64MB.
+pub(crate) const DEV_HEAP_SIZE: usize = 64 << 20;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncDirection {
     ToDevice = 0,

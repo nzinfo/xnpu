@@ -5,6 +5,7 @@ use std::io;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 
+use crate::bo::DEV_HEAP_SIZE;
 use crate::ioctl::{amdxdna_ioctl, raw_ioctl, AmdxdnaCmd};
 
 /// enum amdxdna_drm_get_param (Linux 7.0 UAPI).
@@ -114,9 +115,6 @@ pub struct Device {
     dev_heap: Option<(crate::bo::BufferObject, crate::bo::Mapping)>,
 }
 
-/// Device memory heap must sit inside one 64MB page; max size is 64MB.
-const DEV_HEAP_SIZE: usize = 64 << 20;
-
 impl Device {
     /// Find the first /dev/accel/accel* node that answers the amdxdna
     /// AIE-metadata query (other accel devices, e.g. GPUs exposing accel
@@ -167,6 +165,67 @@ impl Device {
         self.fd.as_raw_fd()
     }
 
+    /// The heap mapping's base VA. DEV BOs are carved out of the heap and have
+    /// no mmap of their own; user space reaches them at
+    /// `heap_base + (bo.xdna_addr() - heap_xdna_base())`.
+    pub(crate) fn heap_base(&self) -> *mut u8 {
+        let (_, map) = self.dev_heap.as_ref().expect("device heap mapped");
+        map.as_mut_ptr()
+    }
+
+    /// The heap's device-side base address (dev_mem_base), i.e. the
+    /// `xdna_addr` GET_BO_INFO reports for the DEV_HEAP BO itself.
+    pub(crate) fn heap_xdna_base(&self) -> u64 {
+        let (heap, _) = self.dev_heap.as_ref().expect("device heap mapped");
+        heap.xdna_addr()
+    }
+
+    /// Copy `bytes` into a DEV BO's slice of the heap. The caller still needs
+    /// `bo.sync(ToDevice, ..)` afterwards: the NPU is not cache coherent, and
+    /// for a DEV BO the SYNC_BO ioctl clflushes the heap pages backing it.
+    pub fn write_dev_bo(&self, bo: &crate::bo::BufferObject, bytes: &[u8]) -> io::Result<()> {
+        let off = bo
+            .xdna_addr()
+            .checked_sub(self.heap_xdna_base())
+            .and_then(|o| usize::try_from(o).ok())
+            .ok_or_else(|| io::Error::other("dev bo xdna_addr below heap base"))?;
+        let heap_len = crate::bo::DEV_HEAP_SIZE;
+        if off + bytes.len() > heap_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "dev bo slice out of heap range",
+            ));
+        }
+        // SAFETY: [heap_base + off, +bytes.len()) is inside the live heap
+        // mapping (checked above) and exclusively ours for the Device lifetime.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.heap_base().add(off), bytes.len());
+        }
+        Ok(())
+    }
+
+    /// Copy `bytes` out of a DEV BO's slice of the heap (after a sync, to drop
+    /// stale cache lines).
+    pub fn read_dev_bo(&self, bo: &crate::bo::BufferObject, bytes: &mut [u8]) -> io::Result<()> {
+        let off = bo
+            .xdna_addr()
+            .checked_sub(self.heap_xdna_base())
+            .and_then(|o| usize::try_from(o).ok())
+            .ok_or_else(|| io::Error::other("dev bo xdna_addr below heap base"))?;
+        let heap_len = crate::bo::DEV_HEAP_SIZE;
+        if off + bytes.len() > heap_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "dev bo slice out of heap range",
+            ));
+        }
+        // SAFETY: see write_dev_bo.
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.heap_base().add(off), bytes.as_mut_ptr(), bytes.len());
+        }
+        Ok(())
+    }
+
     fn get_info(&self, param: u32, buf: &mut [u8]) -> io::Result<()> {
         #[repr(C)]
         #[derive(Debug, Clone, Copy)]
@@ -190,7 +249,7 @@ impl Device {
         let mut raw = AieMetadataRaw::default();
         // The driver updates buffer_size to the size it wrote; passing an
         // exact-sized struct for the query is the standard usage.
-        let mut bytes = unsafe {
+        let bytes = unsafe {
             std::slice::from_raw_parts_mut(
                 &mut raw as *mut AieMetadataRaw as *mut u8,
                 std::mem::size_of::<AieMetadataRaw>(),
@@ -210,7 +269,7 @@ impl Device {
 
     pub fn clock_metadata(&self) -> io::Result<((String, u32), (String, u32))> {
         let mut raw = ClockMetadataRaw::default();
-        let mut bytes = unsafe {
+        let bytes = unsafe {
             std::slice::from_raw_parts_mut(
                 &mut raw as *mut ClockMetadataRaw as *mut u8,
                 std::mem::size_of::<ClockMetadataRaw>(),
@@ -229,7 +288,7 @@ impl Device {
 
     pub fn firmware_version(&self) -> io::Result<(u32, u32, u32, u32)> {
         let mut raw = FirmwareVersionRaw::default();
-        let mut bytes = unsafe {
+        let bytes = unsafe {
             std::slice::from_raw_parts_mut(
                 &mut raw as *mut FirmwareVersionRaw as *mut u8,
                 std::mem::size_of::<FirmwareVersionRaw>(),
@@ -241,7 +300,7 @@ impl Device {
 
     pub fn power_mode(&self) -> io::Result<u8> {
         let mut raw = PowerModeRaw::default();
-        let mut bytes = unsafe {
+        let bytes = unsafe {
             std::slice::from_raw_parts_mut(
                 &mut raw as *mut PowerModeRaw as *mut u8,
                 std::mem::size_of::<PowerModeRaw>(),

@@ -2,7 +2,10 @@
 
 use std::process::ExitCode;
 
-use xnpu_hal::{Device, HwContext};
+use xnpu_hal::{
+    syncobj_timeline_wait, BoType, BufferObject, Device, HwContext, Mapping, StartNpuCmd,
+    SyncDirection, ERT_CMD_STATE_COMPLETED,
+};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -19,10 +22,272 @@ fn main() -> ExitCode {
                 .unwrap_or(1);
             cmd_ctx_probe(max, cols)
         }
+        Some("run-add") => {
+            let prj = args.get(1).cloned().unwrap_or_else(|| {
+                "/home/nzinfo/qwen/xnpu/build/add_1c_2ch_2048_2048t.mlir.prj".to_string()
+            });
+            cmd_run_add(&prj)
+        }
         _ => {
-            eprintln!("usage: xnpu-cli <info|ctx-probe [max] [cols]>");
+            eprintln!("usage: xnpu-cli <info|ctx-probe [max] [cols] | run-add [prj-dir]>");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// f32 -> bf16 bits, round-to-nearest-even.
+fn f32_to_bf16(x: f32) -> u16 {
+    let b = x.to_bits();
+    let bias = 0x7fff + ((b >> 16) & 1);
+    ((b.wrapping_add(bias)) >> 16) as u16
+}
+
+fn bf16_to_f32(v: u16) -> f32 {
+    f32::from_bits((v as u32) << 16)
+}
+
+/// End-to-end first operator: load the IRON add_1c_2ch fixture (1 core, 2048
+/// bf16 elements per buffer) over raw DRM and verify the AIE output.
+///
+/// Register-map ABI (main_kernels.json / mlir_aie DPU pseudo-kernel):
+/// opcode u64 = 3, instr u64 (ctrl-code VA), ninstr u32, then bo0.. u64 VAs.
+fn cmd_run_add(prj: &str) -> ExitCode {
+    let pdi_path = format!("{prj}/main.pdi");
+    // The ctrl-code .bin sits next to the .mlir.prj dir (both in the IRON
+    // build dir), named after the shared stem.
+    let stem = prj.trim_end_matches(".mlir.prj");
+    let instr_path = match stem.rsplit_once('/') {
+        Some((dir, name)) => format!("{dir}/{name}.bin"),
+        None => format!("{stem}.bin"),
+    };
+    let pdi = match std::fs::read(&pdi_path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("read {pdi_path}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let instr = match std::fs::read(&instr_path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("read {instr_path}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!(
+        "fixture: pdi {} B, ctrl-code {} B",
+        pdi.len(),
+        instr.len()
+    );
+
+    let dev = match Device::open_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("open amdxdna device: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let md = match dev.aie_metadata() {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("AIE metadata: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // The fixture's partition reserves the full array (column_width 8).
+    let cols: u32 = 8;
+    let num_tiles = cols * md.core.row_count as u32;
+
+    let mut ctx = match HwContext::create(&dev, num_tiles) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("create hwctx: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!(
+        "hwctx: handle={} syncobj={} ({} cols / {} tiles)",
+        ctx.handle, ctx.syncobj_handle, cols, num_tiles
+    );
+
+    if let Err(e) = ctx.configure_cu(&pdi, 0) {
+        eprintln!("configure_cu (PDI load): {e}");
+        return ExitCode::FAILURE;
+    }
+    println!("PDI loaded, CU configured");
+
+    // Ctrl-code and tensors as DEV BOs carved from the device heap: their
+    // xdna_addr values are firmware-visible through the heap's MAP_HOST_BUFFER
+    // registration, no PASID/SVM needed (this firmware does not dereference
+    // plain user VAs).
+    let n: usize = 2048;
+    let bytes = n * 2;
+
+    let ctrl_bo = match BufferObject::new(&dev, BoType::Dev, instr.len()) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("ctrl BO: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(e) = dev.write_dev_bo(&ctrl_bo, &instr) {
+        eprintln!("write ctrl BO: {e}");
+        return ExitCode::FAILURE;
+    }
+    if let Err(e) = ctrl_bo.sync(SyncDirection::ToDevice, 0, ctrl_bo.size() as u64) {
+        eprintln!("sync ctrl BO: {e}");
+        return ExitCode::FAILURE;
+    }
+    let ctrl_addr = ctrl_bo.xdna_addr();
+    println!(
+        "ctrl BO: hdl={} xdna=0x{:x}",
+        ctrl_bo.handle(),
+        ctrl_addr
+    );
+
+    // in1[i] = (i % 7) - 3, in2[i] = (i / 7) % 5 -> sums stay small integers,
+    // exact in bf16.
+    //
+    // Tensors must be SHMEM BOs whose regmap entries carry the *user VA*: the
+    // firmware dereferences them through SVM/PASID (it walks the host page
+    // tables of the pinned arg BOs). Heap device addresses here are silently
+    // ignored — the command completes but the AIE never writes, which is how
+    // the first all-DEV attempt failed. Only the ctrl code (instruction
+    // buffer) needs a heap xdna_addr.
+    let tensor =
+        |name: &str, f: &dyn Fn(usize) -> f32| -> Option<(BufferObject, Mapping)> {
+            let bo = BufferObject::new(&dev, BoType::Shmem, bytes).ok()?;
+            let mut map = bo.map_owned().ok()?;
+            let slice = map.as_mut_slice();
+            for i in 0..n {
+                let b = f32_to_bf16(f(i)).to_le_bytes();
+                slice[i * 2..i * 2 + 2].copy_from_slice(&b);
+            }
+            bo.sync(SyncDirection::ToDevice, 0, bo.size() as u64).ok()?;
+            println!(
+                "{} BO: hdl={} va=0x{:x}",
+                name,
+                bo.handle(),
+                map.as_ptr() as u64
+            );
+            Some((bo, map))
+        };
+    let (in1_bo, in1_map) = match tensor("in1", &|i| (i % 7) as f32 - 3.0) {
+        Some(t) => t,
+        None => {
+            eprintln!("in1 BO failed");
+            return ExitCode::FAILURE;
+        }
+    };
+    let (in2_bo, in2_map) = match tensor("in2", &|i| ((i / 7) % 5) as f32) {
+        Some(t) => t,
+        None => {
+            eprintln!("in2 BO failed");
+            return ExitCode::FAILURE;
+        }
+    };
+    let (out_bo, out_map) = match tensor("out", &|_| 0.0) {
+        Some(t) => t,
+        None => {
+            eprintln!("out BO failed");
+            return ExitCode::FAILURE;
+        }
+    };
+    let in1_addr = in1_map.as_ptr() as u64;
+    let in2_addr = in2_map.as_ptr() as u64;
+    let out_addr = out_map.as_ptr() as u64;
+
+    // ERT_START_NPU packet: regmap = opcode, instr, ninstr, bo0..bo2. All
+    // addresses are the DEV BOs' xdna_addr values.
+    let mut pkt = match StartNpuCmd::new(&dev) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("cmd BO: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    pkt.set_cu(0);
+    let build = pkt
+        .set_ctrl(ctrl_addr, instr.len() as u32)
+        .and_then(|_| pkt.arg64(3)) // opcode: DPU txn start
+        .and_then(|_| pkt.arg64(ctrl_addr))
+        .and_then(|_| pkt.arg32(instr.len() as u32))
+        .and_then(|_| pkt.arg64(in1_addr))
+        .and_then(|_| pkt.arg64(in2_addr))
+        .and_then(|_| pkt.arg64(out_addr));
+    if let Err(e) = build {
+        eprintln!("build packet: {e}");
+        return ExitCode::FAILURE;
+    }
+
+    // The driver pins every arg BO for the job's lifetime; XRT passes the
+    // ctrl BO in the arg list too.
+    let arg_handles = [
+        ctrl_bo.handle(),
+        in1_bo.handle(),
+        in2_bo.handle(),
+        out_bo.handle(),
+    ];
+    let t0 = std::time::Instant::now();
+    let seq = match pkt.submit(&dev, &ctx, &arg_handles) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("exec submit: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("submitted, seq={seq}");
+    if let Err(e) = syncobj_timeline_wait(&dev, ctx.syncobj_handle, seq, 10_000_000_000) {
+        eprintln!("wait seq {seq}: {e}");
+        return ExitCode::FAILURE;
+    }
+    let state = pkt.state();
+    println!("wait done in {:?}, packet state={}", t0.elapsed(), state);
+    if state != ERT_CMD_STATE_COMPLETED {
+        eprintln!("command did not complete (state {state})");
+        return ExitCode::FAILURE;
+    }
+
+    // Drop stale cache lines before reading the AIE's output. Direction 0
+    // (ToDevice) is deliberate: the ioctl clflushes regardless of direction,
+    // while direction 1 additionally takes the fw debug-BO path, which fails
+    // EINVAL without a debug BO registered.
+    if let Err(e) = out_bo.sync(SyncDirection::ToDevice, 0, out_bo.size() as u64) {
+        eprintln!("flush out: {e}");
+        return ExitCode::FAILURE;
+    }
+    let s: Vec<u8> = out_map.as_slice().to_vec();
+    let _ = std::fs::write("/tmp/out.bin", &s);
+    let _ = std::fs::write("/tmp/in1.bin", in1_map.as_slice());
+    let _ = std::fs::write("/tmp/in2.bin", in2_map.as_slice());
+    let mut mismatches = 0usize;
+    let mut first_bad: Option<(usize, u16, u16)> = None;
+    for i in 0..n {
+        let got = u16::from_le_bytes([s[i * 2], s[i * 2 + 1]]);
+        let v1 = (i % 7) as f32 - 3.0;
+        let v2 = ((i / 7) % 5) as f32;
+        let want = f32_to_bf16(v1 + v2);
+        if got != want {
+            mismatches += 1;
+            if first_bad.is_none() {
+                first_bad = Some((i, got, want));
+            }
+        }
+    }
+    match first_bad {
+        Some((i, got, want)) => println!(
+            "first mismatch @[{i}]: got bf16 0x{got:04x} ({}) want 0x{want:04x} ({})",
+            bf16_to_f32(got),
+            bf16_to_f32(want)
+        ),
+        None => println!("out[0..8] = {:?}", (0..8).map(|i| bf16_to_f32(u16::from_le_bytes([s[i*2], s[i*2+1]]))).collect::<Vec<_>>()),
+    }
+    if mismatches == 0 {
+        println!("VERIFY: PASS ({n} elements, bf16 exact)");
+        ExitCode::SUCCESS
+    } else {
+        eprintln!("VERIFY: FAIL ({mismatches}/{n} mismatches)");
+        ExitCode::FAILURE
     }
 }
 

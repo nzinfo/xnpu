@@ -75,22 +75,23 @@ impl<'a> HwContext<'a> {
     }
 
     /// Load a PDI (the xclbin's PDI section) as the context's CU and configure
-    /// it. Mirrors hw_ctx's CONFIG_CU flow: PDI bytes into a SHMEM BO, then
-    /// DRM_AMDXDNA_HWCTX_CONFIG_CU with the packed cu_configs array.
+    /// it. The kernel's aie2_config_cu only accepts a DEV BO carved out of the
+    /// client heap ("Invalid BO type" otherwise) and hands the firmware its
+    /// heap offset; the bytes reach it through the heap mapping plus a cache
+    /// flush. Then DRM_AMDXDNA_HWCTX_CONFIG_CU carries the packed cu_configs.
     pub fn configure_cu(&mut self, pdi: &[u8], cu_func: u8) -> io::Result<()> {
-        let pdi_bo = BufferObject::new(self.device, BoType::Shmem, pdi.len())?;
-        let mut pdi_map = pdi_bo.map_owned()?;
-        pdi_map.as_mut_slice().copy_from_slice(pdi);
-        drop(pdi_map);
-        pdi_bo.sync(crate::bo::SyncDirection::ToDevice, 0, pdi.len() as u64)?;
+        let pdi_bo = BufferObject::new(self.device, BoType::Dev, pdi.len())?;
+        self.device.write_dev_bo(&pdi_bo, pdi)?;
+        // The kernel clflushes the heap pages behind the DEV BO; size is the
+        // page-aligned BO size (pdi.len() is rounded up at CREATE_BO).
+        pdi_bo.sync(crate::bo::SyncDirection::ToDevice, 0, pdi_bo.size() as u64)?;
 
-        // amdxdna_hwctx_param_config_cu is a header + cu_configs[num_cus].
-        let hdr = 8; // u16 num_cus + u16 pad[3]
-        let mut param = vec![0u8; hdr + 8];
+        // amdxdna_hwctx_param_config_cu = { u16 num_cus; u16 rsvd[3] } followed
+        // by cu_configs[] = { u32 cu_bo; u8 cu_func; u8 pad[3] } each.
+        let mut param = [0u8; 16];
         param[0] = 1; // num_cus
-        param[1] = 0;
-        param[4..8].copy_from_slice(&pdi_bo.handle().to_le_bytes());
-        param[8] = cu_func;
+        param[8..12].copy_from_slice(&pdi_bo.handle().to_le_bytes());
+        param[12] = cu_func;
 
         #[repr(C)]
         #[derive(Debug, Clone, Copy)]

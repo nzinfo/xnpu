@@ -36,9 +36,19 @@ pub(crate) fn amdxdna_ioctl(cmd: AmdxdnaCmd, size: usize) -> u64 {
 pub(crate) const DRM_IOCTL_GEM_CLOSE: u64 =
     (DRM_IOC_WRITE as u64) | (8 << 16) | ((DRM_IOCTL_TYPE as u64) << 8) | 0x09;
 
-/// `DRM_IOCTL_SYNCOBJ_DESTROY` = _IOW('d', 0xb6, drm_syncobj_destroy{handle u32, pad u32}).
-pub(crate) const DRM_IOCTL_SYNCOBJ_DESTROY: u64 =
-    (DRM_IOC_WRITE as u64) | (8 << 16) | ((DRM_IOCTL_TYPE as u64) << 8) | 0xb6;
+/// `DRM_IOCTL_SYNCOBJ_DESTROY` = _IOWR('d', 0xc0, drm_syncobj_destroy{handle u32, pad u32}).
+pub(crate) const DRM_IOCTL_SYNCOBJ_DESTROY: u64 = ((DRM_IOC_READ | DRM_IOC_WRITE) as u64)
+    | (8 << 16)
+    | ((DRM_IOCTL_TYPE as u64) << 8)
+    | 0xc0;
+
+/// `DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT` = _IOWR('d', 0xca,
+/// drm_syncobj_timeline_wait{handles, points, timeout_nsec, count, flags,
+/// first_signaled, pad} = 40 bytes).
+pub(crate) const DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT: u64 = ((DRM_IOC_READ | DRM_IOC_WRITE) as u64)
+    | (40 << 16)
+    | ((DRM_IOCTL_TYPE as u64) << 8)
+    | 0xca;
 
 /// Perform a raw ioctl. `arg` must be a plain-old-data struct (or slice of
 /// u32s) matching `cmd`'s expected size exactly.

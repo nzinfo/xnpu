@@ -10,9 +10,11 @@
 
 pub mod accel;
 pub mod bo;
+pub mod ert;
 pub mod hwctx;
 pub mod ioctl;
 
 pub use accel::{AieMetadata, Device, TileMetadata};
-pub use bo::{BoType, BufferObject, SyncDirection};
+pub use bo::{BoType, BufferObject, Mapping, SyncDirection};
+pub use ert::{syncobj_timeline_wait, StartNpuCmd, ERT_CMD_STATE_COMPLETED};
 pub use hwctx::HwContext;
