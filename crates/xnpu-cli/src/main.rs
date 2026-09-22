@@ -47,9 +47,30 @@ fn main() -> ExitCode {
             };
             cmd_run_gemm(&prj, m, k, n)
         }
+        Some("run-multi") => {
+            let add_prj = args.get(1).cloned().unwrap_or_else(|| {
+                "/home/nzinfo/qwen/xnpu/build/add_1c_2ch_2048_2048t.mlir.prj".to_string()
+            });
+            let gemm_prj = args.get(2).cloned().unwrap_or_else(|| {
+                "/home/nzinfo/qwen/xnpu/build/gemm_192x384x64_48x96x16_0_0.mlir.prj".to_string()
+            });
+            let dims: Vec<usize> = args
+                .get(3..)
+                .map(|rest| rest.iter().filter_map(|s| s.parse().ok()).collect())
+                .unwrap_or_default();
+            let (m, k, n) = match dims.as_slice() {
+                [m, k, n] => (*m, *k, *n),
+                [] => (192, 384, 64),
+                _ => {
+                    eprintln!("run-multi: expected M K N");
+                    return ExitCode::FAILURE;
+                }
+            };
+            cmd_run_multi(&add_prj, &gemm_prj, m, k, n)
+        }
         _ => {
             eprintln!(
-                "usage: xnpu-cli <info | ctx-probe [max] [cols] | run-add [prj-dir] [bf16|i8] | run-gemm [prj-dir] [M K N]>"
+                "usage: xnpu-cli <info | ctx-probe [max] [cols] | run-add [prj-dir] [bf16|i8] | run-gemm [prj-dir] [M K N] | run-multi [add-prj] [gemm-prj] [M K N]>"
             );
             ExitCode::FAILURE
         }
@@ -356,19 +377,7 @@ fn cmd_run_add(prj: &str, dtype: &str) -> ExitCode {
     let _ = std::fs::write("/tmp/out.bin", &s);
     let _ = std::fs::write("/tmp/in1.bin", in1_map.as_slice());
     let _ = std::fs::write("/tmp/in2.bin", in2_map.as_slice());
-    let mut mismatches = 0usize;
-    let mut first_bad: Option<(usize, i64, i64)> = None;
-    for i in 0..n {
-        let v1 = (i % 7) as f32 - 3.0;
-        let v2 = ((i / 7) % 5) as f32;
-        let (got, want) = dt.unpack(&s, i, v1, v2);
-        if got != want {
-            mismatches += 1;
-            if first_bad.is_none() {
-                first_bad = Some((i, got, want));
-            }
-        }
-    }
+    let (mismatches, first_bad) = check_add(&s, dt, n);
     match first_bad {
         Some((i, got, want)) => println!(
             "first mismatch @[{i}]: got {} ({:#06x}) want {} ({:#06x})",
@@ -395,6 +404,74 @@ fn cmd_run_add(prj: &str, dtype: &str) -> ExitCode {
 
 fn bf16_to_f32(v: u16) -> f32 {
     f32::from_bits((v as u32) << 16)
+}
+
+/// Verify an add-fixture output against the CLI's fixed inputs
+/// (in1[i] = (i%7)-3, in2[i] = (i/7)%5 — small integers, exact in bf16 and
+/// int8, no wraparound). Returns (mismatch count, first diff).
+fn check_add(out: &[u8], dt: DType, n: usize) -> (usize, Option<(usize, i64, i64)>) {
+    let mut mismatches = 0usize;
+    let mut first: Option<(usize, i64, i64)> = None;
+    for i in 0..n {
+        let (got, want) = dt.unpack(out, i, (i % 7) as f32 - 3.0, ((i / 7) % 5) as f32);
+        if got != want {
+            mismatches += 1;
+            if first.is_none() {
+                first = Some((i, got, want));
+            }
+        }
+    }
+    (mismatches, first)
+}
+
+/// Host reference for the small-integer GEMM fixtures: decode A/B to f32,
+/// accumulate in f32, round once to bf16 — bit-exact for f32-accumulation
+/// fixtures (bf16_f32_ONLY), a few ULP off for bf16-accumulation ones.
+/// Returns (mismatch count, max ulp, first diff).
+fn check_gemm(
+    a: &[u8],
+    b: &[u8],
+    c: &[u8],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> (usize, i64, Option<(usize, usize, u16, u16, i64)>) {
+    let decode = |bytes: &[u8], elems: usize| -> Vec<f32> {
+        (0..elems)
+            .map(|e| bf16_to_f32(u16::from_le_bytes([bytes[e * 2], bytes[e * 2 + 1]])))
+            .collect()
+    };
+    let a_f = decode(a, m * k);
+    let b_f = decode(b, k * n);
+    let ulp = |g: u16, w: u16| -> i64 {
+        if (g >> 15) == (w >> 15) {
+            (g as i16 as i64 - w as i16 as i64).abs()
+        } else {
+            1 << 24
+        }
+    };
+    let mut mismatches = 0usize;
+    let mut max_ulp: i64 = 0;
+    let mut first: Option<(usize, usize, u16, u16, i64)> = None;
+    for i in 0..m {
+        for l in 0..n {
+            let mut acc: f32 = 0.0;
+            for j in 0..k {
+                acc += a_f[i * k + j] * b_f[j * n + l];
+            }
+            let want = f32_to_bf16(acc);
+            let got = u16::from_le_bytes([c[(i * n + l) * 2], c[(i * n + l) * 2 + 1]]);
+            if got != want {
+                let d = ulp(got, want);
+                mismatches += 1;
+                max_ulp = max_ulp.max(d);
+                if first.is_none() {
+                    first = Some((i, l, got, want, d));
+                }
+            }
+        }
+    }
+    (mismatches, max_ulp, first)
 }
 
 /// M2: first GEMM over raw DRM — the IRON gemm fixture computes
@@ -590,47 +667,11 @@ fn cmd_run_gemm(prj: &str, m: usize, k: usize, n: usize) -> ExitCode {
     }
     let c_bytes: Vec<u8> = c_map.as_slice().to_vec();
 
-    // Host reference: pre-decode A/B to f32 (values are exact integers), then
-    // integer-exact accumulation in f32 with one RNE round to bf16 — the
-    // bit-exact answer for fixtures built with f32 accumulation
-    // (bf16_f32_ONLY, e.g. gemm/test.py). Fixtures built with bf16
-    // accumulation (the R2 swiglu defaults) drift a few ULPs from this
-    // reference; those pass the ULP tier below.
-    let decode = |bytes: &[u8], elems: usize| -> Vec<f32> {
-        (0..elems)
-            .map(|e| bf16_to_f32(u16::from_le_bytes([bytes[e * 2], bytes[e * 2 + 1]])))
-            .collect()
-    };
-    let a_f = decode(&a_bytes, a_elems);
-    let b_f = decode(&b_bytes, b_elems);
-    let ulp = |g: u16, w: u16| -> i64 {
-        if (g >> 15) == (w >> 15) {
-            (g as i16 as i64 - w as i16 as i64).abs()
-        } else {
-            1 << 24
-        }
-    };
-    let mut mismatches = 0usize;
-    let mut max_ulp: i64 = 0;
-    let mut first_bad: Option<(usize, usize, u16, u16, i64)> = None;
-    for i in 0..m {
-        for l in 0..n {
-            let mut acc: f32 = 0.0;
-            for j in 0..k {
-                acc += a_f[i * k + j] * b_f[j * n + l];
-            }
-            let want = f32_to_bf16(acc);
-            let got = u16::from_le_bytes([c_bytes[(i * n + l) * 2], c_bytes[(i * n + l) * 2 + 1]]);
-            if got != want {
-                let d = ulp(got, want);
-                mismatches += 1;
-                max_ulp = max_ulp.max(d);
-                if first_bad.is_none() {
-                    first_bad = Some((i, l, got, want, d));
-                }
-            }
-        }
-    }
+    // Host reference: pre-decode A/B to f32, integer-exact accumulation in
+    // f32 with one RNE round to bf16 — bit-exact for f32-accum fixtures
+    // (bf16_f32_ONLY, e.g. gemm/test.py); the R2 swiglu-style bf16-accum
+    // fixtures drift a few ULPs and pass the ULP tier below.
+    let (mismatches, max_ulp, first_bad) = check_gemm(&a_bytes, &b_bytes, &c_bytes, m, k, n);
     if mismatches == 0 {
         println!(
             "C[0][0..4] = {:?}",
@@ -663,6 +704,317 @@ fn cmd_run_gemm(prj: &str, m: usize, k: usize, n: usize) -> ExitCode {
             );
             ExitCode::FAILURE
         }
+    }
+}
+
+/// One operator's exec state on a shared context: its ctrl-code BO (the
+/// instruction regmap slot takes the heap xdna_addr), SHMEM tensor BOs
+/// (regmap carries user VAs), and the ERT packet. Everything stays alive for
+/// the whole session so repeated submissions reuse identical addresses.
+struct OpState {
+    name: &'static str,
+    cu: u32,
+    instr_len: u32,
+    pkt: StartNpuCmd,
+    ctrl_bo: BufferObject,
+    bos: Vec<BufferObject>,
+    maps: Vec<Mapping>,
+}
+
+impl OpState {
+    fn new(dev: &Device, name: &'static str, cu: u32, instr: &[u8]) -> Result<OpState, String> {
+        let ctrl_bo = BufferObject::new(dev, BoType::Dev, instr.len())
+            .map_err(|e| format!("{name} ctrl BO: {e}"))?;
+        dev.write_dev_bo(&ctrl_bo, instr)
+            .map_err(|e| format!("{name} write ctrl: {e}"))?;
+        ctrl_bo
+            .sync(SyncDirection::ToDevice, 0, ctrl_bo.size() as u64)
+            .map_err(|e| format!("{name} sync ctrl: {e}"))?;
+        let pkt = StartNpuCmd::new(dev).map_err(|e| format!("{name} cmd BO: {e}"))?;
+        Ok(OpState {
+            name,
+            cu,
+            instr_len: instr.len() as u32,
+            pkt,
+            ctrl_bo,
+            bos: Vec::new(),
+            maps: Vec::new(),
+        })
+    }
+
+    /// Create one SHMEM tensor, fill it, sync it, park it; returns its VA.
+    fn add_tensor(
+        &mut self,
+        dev: &Device,
+        bytes: usize,
+        label: &str,
+        fill: impl FnOnce(&mut [u8]),
+    ) -> Result<u64, String> {
+        let bo = BufferObject::new(dev, BoType::Shmem, bytes)
+            .map_err(|e| format!("{label} BO: {e}"))?;
+        let mut map = bo.map_owned().map_err(|e| format!("{label} map: {e}"))?;
+        fill(map.as_mut_slice());
+        bo.sync(SyncDirection::ToDevice, 0, bo.size() as u64)
+            .map_err(|e| format!("{label} sync: {e}"))?;
+        println!("{label} BO: hdl={} va=0x{:x}", bo.handle(), map.as_ptr() as u64);
+        let va = map.as_ptr() as u64;
+        self.bos.push(bo);
+        self.maps.push(map);
+        Ok(va)
+    }
+
+    /// Emit the DPU regmap: [opcode=3][instr VA][ninstr][tensor VAs...].
+    fn build(&mut self, tensor_vas: &[u64]) -> Result<(), String> {
+        let ctrl_addr = self.ctrl_bo.xdna_addr();
+        println!(
+            "{} ctrl BO: hdl={} xdna=0x{:x}",
+            self.name,
+            self.ctrl_bo.handle(),
+            ctrl_addr
+        );
+        let pkt = &mut self.pkt;
+        pkt.set_cu(self.cu);
+        let mut r = pkt
+            .set_ctrl(ctrl_addr, self.instr_len)
+            .and_then(|_| pkt.arg64(3)) // opcode: DPU txn start
+            .and_then(|_| pkt.arg64(ctrl_addr))
+            .and_then(|_| pkt.arg32(self.instr_len));
+        for va in tensor_vas {
+            r = r.and_then(|_| pkt.arg64(*va));
+        }
+        r.map_err(|e| format!("{} packet: {e}", self.name))
+    }
+
+    /// Submit and wait; returns (packet state, wall time).
+    fn exec(&mut self, dev: &Device, ctx: &HwContext<'_>) -> Result<(u32, std::time::Duration), String> {
+        let mut handles = Vec::with_capacity(self.bos.len() + 1);
+        handles.push(self.ctrl_bo.handle());
+        handles.extend(self.bos.iter().map(|b| b.handle()));
+        let t0 = std::time::Instant::now();
+        let seq = self
+            .pkt
+            .submit(dev, ctx, &handles)
+            .map_err(|e| format!("{} submit: {e}", self.name))?;
+        syncobj_timeline_wait(dev, ctx.syncobj_handle, seq, 10_000_000_000)
+            .map_err(|e| format!("{} wait seq {seq}: {e}", self.name))?;
+        Ok((self.pkt.state(), t0.elapsed()))
+    }
+
+    /// Flush and snapshot the output tensor (always bos/maps index 2 here).
+    fn take_output(&self) -> Vec<u8> {
+        let bo = &self.bos[2];
+        let _ = bo.sync(SyncDirection::ToDevice, 0, bo.size() as u64);
+        self.maps[2].as_slice().to_vec()
+    }
+}
+
+/// Row-major bf16 grid of `rows*cols` cells holding small integers.
+fn pack_bf16(rows: usize, cols: usize, f: impl Fn(usize, usize) -> i32) -> Vec<u8> {
+    let mut v = Vec::with_capacity(rows * cols * 2);
+    for i in 0..rows {
+        for j in 0..cols {
+            v.extend_from_slice(&f32_to_bf16(f(i, j) as f32).to_le_bytes());
+        }
+    }
+    v
+}
+
+fn build_add_op(dev: &Device, instr: &[u8], cu: u32) -> Result<OpState, String> {
+    let mut op = OpState::new(dev, "add", cu, instr)?;
+    let n = 2048usize;
+    let in1 = op.add_tensor(dev, n * 2, "add.in1", |s| {
+        for i in 0..n {
+            DType::Bf16.pack_at(s, i, (i % 7) as f32 - 3.0);
+        }
+    })?;
+    let in2 = op.add_tensor(dev, n * 2, "add.in2", |s| {
+        for i in 0..n {
+            DType::Bf16.pack_at(s, i, ((i / 7) % 5) as f32);
+        }
+    })?;
+    let out = op.add_tensor(dev, n * 2, "add.out", |s| s.fill(0))?;
+    op.build(&[in1, in2, out])?;
+    Ok(op)
+}
+
+/// Returns the op plus the packed A/B bytes (kept for host-side reference).
+fn build_gemm_op(
+    dev: &Device,
+    instr: &[u8],
+    cu: u32,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<(OpState, Vec<u8>, Vec<u8>), String> {
+    let mut op = OpState::new(dev, "gemm", cu, instr)?;
+    let a_bytes = pack_bf16(m, k, |i, j| ((i + j) % 7) as i32 - 3);
+    let b_bytes = pack_bf16(k, n, |j, l| ((5 * j + 3 * l) % 7) as i32);
+    let a = op.add_tensor(dev, a_bytes.len(), "gemm.A", |s| s.copy_from_slice(&a_bytes))?;
+    let b = op.add_tensor(dev, b_bytes.len(), "gemm.B", |s| s.copy_from_slice(&b_bytes))?;
+    let c = op.add_tensor(dev, m * n * 2, "gemm.C", |s| s.fill(0))?;
+    op.build(&[a, b, c])?;
+    Ok((op, a_bytes, b_bytes))
+}
+
+/// M2 follow-up: two operators — the 2048-element bf16 add and an MxKxN GEMM
+/// — sharing ONE hardware context as two CUs, both PDIs attached in a single
+/// CONFIG_HWCTX (the driver refuses any re-config). Each exec packet picks
+/// its CU via the cu_mask bit.
+///
+/// Open question this answers: both fixtures program the full array, so does
+/// running one CU clobber the other's tiles? Schedule: add -> gemm -> add ->
+/// gemm; a broken round-2 op is the clobber signature.
+fn cmd_run_multi(add_prj: &str, gemm_prj: &str, m: usize, k: usize, n: usize) -> ExitCode {
+    let (add_pdi, add_instr, add_cols) = match load_fixture(add_prj) {
+        Some(f) => f,
+        None => {
+            eprintln!("load fixture {add_prj} failed");
+            return ExitCode::FAILURE;
+        }
+    };
+    let (gemm_pdi, gemm_instr, gemm_cols) = match load_fixture(gemm_prj) {
+        Some(f) => f,
+        None => {
+            eprintln!("load fixture {gemm_prj} failed");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!(
+        "fixtures: add pdi {} B / ctrl {} B ({} cols), gemm pdi {} B / ctrl {} B ({} cols)",
+        add_pdi.len(),
+        add_instr.len(),
+        add_cols,
+        gemm_pdi.len(),
+        gemm_instr.len(),
+        gemm_cols
+    );
+    println!("gemm problem: C[{m}x{n}] = A[{m}x{k}] @ B[{k}x{n}], bf16/f32-acc");
+
+    let dev = match Device::open_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("open amdxdna device: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let md = match dev.aie_metadata() {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("AIE metadata: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // IRON reserves the full array in every fixture (partition json always
+    // says column_width=8), so one full-width context serves both CUs.
+    let cols = add_cols.max(gemm_cols);
+    let num_tiles = cols * md.core.row_count as u32;
+    let mut ctx = match HwContext::create(&dev, num_tiles) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("create hwctx: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!(
+        "hwctx: handle={} syncobj={} ({} cols / {} tiles)",
+        ctx.handle, ctx.syncobj_handle, cols, num_tiles
+    );
+
+    // The experiment proper: CU 0 = add, CU 1 = gemm, in one CONFIG_HWCTX.
+    if let Err(e) = ctx.configure_cus(&[(&add_pdi, 0), (&gemm_pdi, 0)]) {
+        eprintln!("configure_cus (2 PDIs, one config): {e}");
+        return ExitCode::FAILURE;
+    }
+    println!("2 CUs attached in one CONFIG_HWCTX (cu 0 = add, cu 1 = gemm)");
+
+    let mut add_op = match build_add_op(&dev, &add_instr, 0) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let (mut gemm_op, a_bytes, b_bytes) = match build_gemm_op(&dev, &gemm_instr, 1, m, k, n) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let mut all_ok = true;
+    for round in 1..=8u32 {
+        println!("--- round {round} ---");
+        match add_op.exec(&dev, &ctx) {
+            Ok((state, dt)) if state == ERT_CMD_STATE_COMPLETED => {
+                println!("add  (cu 0): completed in {dt:?}");
+                let out = add_op.take_output();
+                let (mm, first) = check_add(&out, DType::Bf16, 2048);
+                match first {
+                    Some((i, got, want)) => println!(
+                        "add  (cu 0): first mismatch @[{i}]: got {got} ({:#06x}) want {want} ({:#06x})",
+                        got as u16,
+                        want as u16
+                    ),
+                    None => println!("add  (cu 0): VERIFY PASS (2048 elements, bf16 exact)"),
+                }
+                all_ok &= mm == 0;
+            }
+            Ok((state, _)) => {
+                eprintln!("add  (cu 0): did not complete (state {state})");
+                all_ok = false;
+            }
+            Err(e) => {
+                eprintln!("add  (cu 0): {e}");
+                all_ok = false;
+            }
+        }
+        match gemm_op.exec(&dev, &ctx) {
+            Ok((state, dt)) if state == ERT_CMD_STATE_COMPLETED => {
+                println!("gemm (cu 1): completed in {dt:?}");
+                let c = gemm_op.take_output();
+                let (mm, max_ulp, first) = check_gemm(&a_bytes, &b_bytes, &c, m, k, n);
+                if let Some((i, l, got, want, d)) = first {
+                    println!(
+                        "gemm (cu 1): first diff @C[{i}][{l}]: got 0x{got:04x} ({}) want 0x{want:04x} ({}) [{d} ulp]",
+                        bf16_to_f32(got),
+                        bf16_to_f32(want)
+                    );
+                }
+                if mm == 0 {
+                    println!(
+                        "gemm (cu 1): VERIFY PASS ({} elements, bit-exact vs f32-acc reference)",
+                        m * n
+                    );
+                } else if max_ulp <= 64 {
+                    println!(
+                        "gemm (cu 1): VERIFY PASS ({} elements, max {max_ulp} ulp — bf16-accum fixture)",
+                        m * n
+                    );
+                } else {
+                    eprintln!(
+                        "gemm (cu 1): VERIFY FAIL ({mm}/{} diffs, max {max_ulp} ulp)",
+                        m * n
+                    );
+                    all_ok = false;
+                }
+            }
+            Ok((state, _)) => {
+                eprintln!("gemm (cu 1): did not complete (state {state})");
+                all_ok = false;
+            }
+            Err(e) => {
+                eprintln!("gemm (cu 1): {e}");
+                all_ok = false;
+            }
+        }
+    }
+    if all_ok {
+        println!("MULTI-CU: PASS — add(cu0) and gemm(cu1) verified twice each on one context");
+        ExitCode::SUCCESS
+    } else {
+        eprintln!("MULTI-CU: FAIL — see per-op results above");
+        ExitCode::FAILURE
     }
 }
 
