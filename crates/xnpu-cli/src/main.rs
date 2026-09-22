@@ -30,13 +30,21 @@ fn main() -> ExitCode {
             cmd_run_add(&prj, &dtype)
         }
         Some("run-gemm") => {
+            // Trailing dtype token (bf16 default); everything numeric between
+            // the project dir and it is M K N.
+            let mut rest: Vec<String> = args.get(2..).map(|r| r.to_vec()).unwrap_or_default();
+            let dtype = match rest.last().map(String::as_str) {
+                Some("bf16") | Some("i8") => rest.pop().unwrap(),
+                _ => "bf16".to_string(),
+            };
             let prj = args.get(1).cloned().unwrap_or_else(|| {
-                "/home/nzinfo/qwen/xnpu/build/gemm_192x384x64_48x96x16_0_0.mlir.prj".to_string()
+                if dtype == "i8" {
+                    "/home/nzinfo/qwen/xnpu/IRON/build/gemm_192x384x64_48x96x16_0_0_i8_i32.mlir.prj".to_string()
+                } else {
+                    "/home/nzinfo/qwen/xnpu/build/gemm_192x384x64_48x96x16_0_0.mlir.prj".to_string()
+                }
             });
-            let dims: Vec<usize> = args
-                .get(2..)
-                .map(|rest| rest.iter().filter_map(|s| s.parse().ok()).collect())
-                .unwrap_or_default();
+            let dims: Vec<usize> = rest.iter().filter_map(|s| s.parse().ok()).collect();
             let (m, k, n) = match dims.as_slice() {
                 [m, k, n] => (*m, *k, *n),
                 [] => (192, 384, 64),
@@ -45,7 +53,7 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            cmd_run_gemm(&prj, m, k, n)
+            cmd_run_gemm(&prj, m, k, n, &dtype)
         }
         Some("run-multi") => {
             let add_prj = args.get(1).cloned().unwrap_or_else(|| {
@@ -475,14 +483,24 @@ fn check_gemm(
 }
 
 /// M2: first GEMM over raw DRM — the IRON gemm fixture computes
-/// C[M,N] = A[M,K] @ B[K,N], all row-major bf16 with f32 accumulation
-/// (the fixture's bf16_f32_ONLY build, per gemm/test.py).
+/// C[M,N] = A[M,K] @ B[K,N], all row-major, either bf16 inputs with f32
+/// accumulation (bf16_f32_ONLY, per gemm/test.py) or int8 inputs with an
+/// i32 accumulator (i8_i32_ONLY — the q8 route-A fixture).
 ///
-/// Input values are small integers, so every partial product and every f32
-/// partial sum is an exact integer well under 2^24 regardless of summation
-/// order, and the kernel's final conversion to bf16 is plain RNE — the
-/// reference is therefore reproducible host-side bit-exactly.
-fn cmd_run_gemm(prj: &str, m: usize, k: usize, n: usize) -> ExitCode {
+/// Input values are small integers: in the bf16 case every f32 partial sum
+/// is an exact integer well under 2^24 regardless of summation order and the
+/// final conversion is plain RNE; in the int8 case the i32 accumulator is
+/// exact integer math outright. Both references are host-reproducible
+/// bit-exactly.
+fn cmd_run_gemm(prj: &str, m: usize, k: usize, n: usize, dtype: &str) -> ExitCode {
+    let is_i8 = match dtype {
+        "bf16" => false,
+        "i8" => true,
+        _ => {
+            eprintln!("unknown gemm dtype '{dtype}' (expected bf16 or i8)");
+            return ExitCode::FAILURE;
+        }
+    };
     let (pdi, instr, cols) = match load_fixture(prj) {
         Some(f) => f,
         None => {
@@ -496,7 +514,10 @@ fn cmd_run_gemm(prj: &str, m: usize, k: usize, n: usize) -> ExitCode {
         instr.len(),
         cols
     );
-    println!("problem: C[{m}x{n}] = A[{m}x{k}] @ B[{k}x{n}], bf16/f32-acc");
+    println!(
+        "problem: C[{m}x{n}] = A[{m}x{k}] @ B[{k}x{n}], {}",
+        if is_i8 { "i8/i32-acc" } else { "bf16/f32-acc" }
+    );
 
     let dev = match Device::open_default() {
         Ok(d) => d,
@@ -550,21 +571,19 @@ fn cmd_run_gemm(prj: &str, m: usize, k: usize, n: usize) -> ExitCode {
     println!("ctrl BO: hdl={} xdna=0x{:x}", ctrl_bo.handle(), ctrl_addr);
 
     // A[i,j] = ((i+j)%7)-3, B[j,l] = ((5j+3l)%7): small integers, exact in
-    // bf16. Tensors are SHMEM BOs carrying user VAs in the regmap (same
-    // contract as run-add).
-    let a_elems = m * k;
-    let b_elems = k * n;
+    // bf16 and int8. Tensors are SHMEM BOs carrying user VAs in the regmap
+    // (same contract as run-add).
     let c_elems = m * n;
-    let pack = |elems: usize, f: &dyn Fn(usize, usize) -> i32, stride: usize| -> Vec<u8> {
-        let mut v = Vec::with_capacity(elems * 2);
-        for idx in 0..elems {
-            let bits = f32_to_bf16(f(idx / stride, idx % stride) as f32).to_le_bytes();
-            v.extend_from_slice(&bits);
-        }
-        v
+    let a_bytes = if is_i8 {
+        pack_i8(m, k, |i, j| ((i + j) % 7) as i32 - 3)
+    } else {
+        pack_bf16(m, k, |i, j| ((i + j) % 7) as i32 - 3)
     };
-    let a_bytes = pack(a_elems, &|i, j| ((i + j) % 7) as i32 - 3, k);
-    let b_bytes = pack(b_elems, &|j, l| ((5 * j + 3 * l) % 7) as i32, n);
+    let b_bytes = if is_i8 {
+        pack_i8(k, n, |j, l| ((5 * j + 3 * l) % 7) as i32)
+    } else {
+        pack_bf16(k, n, |j, l| ((5 * j + 3 * l) % 7) as i32)
+    };
 
     let tensor = |name: &str, data: &[u8]| -> Option<(BufferObject, Mapping)> {
         let bo = BufferObject::new(&dev, BoType::Shmem, data.len()).ok()?;
@@ -594,7 +613,7 @@ fn cmd_run_gemm(prj: &str, m: usize, k: usize, n: usize) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let (c_bo, c_map) = match tensor("C", &vec![0u8; c_elems * 2]) {
+    let (c_bo, c_map) = match tensor("C", &vec![0u8; c_elems * if is_i8 { 4 } else { 2 }]) {
         Some(t) => t,
         None => {
             eprintln!("C BO failed");
@@ -666,6 +685,27 @@ fn cmd_run_gemm(prj: &str, m: usize, k: usize, n: usize) -> ExitCode {
         return ExitCode::FAILURE;
     }
     let c_bytes: Vec<u8> = c_map.as_slice().to_vec();
+
+    if is_i8 {
+        let (mismatches, first_bad) = check_gemm_i8(&a_bytes, &b_bytes, &c_bytes, m, k, n);
+        if mismatches == 0 {
+            println!(
+                "C[0][0..4] = {:?}",
+                (0..4.min(n))
+                    .map(|l| i32::from_le_bytes(
+                        c_bytes[l * 4..l * 4 + 4].try_into().unwrap()
+                    ))
+                    .collect::<Vec<_>>()
+            );
+            println!("VERIFY: PASS ({c_elems} elements, i8/i32-acc bit-exact)");
+            return ExitCode::SUCCESS;
+        }
+        if let Some((i, l, got, want)) = first_bad {
+            println!("first diff @C[{i}][{l}]: got {got} want {want}");
+        }
+        eprintln!("VERIFY: FAIL ({mismatches}/{c_elems} mismatches)");
+        return ExitCode::FAILURE;
+    }
 
     // Host reference: pre-decode A/B to f32, integer-exact accumulation in
     // f32 with one RNE round to bf16 — bit-exact for f32-accum fixtures
@@ -817,6 +857,51 @@ fn pack_bf16(rows: usize, cols: usize, f: impl Fn(usize, usize) -> i32) -> Vec<u
         }
     }
     v
+}
+
+/// Row-major int8 grid — the q8-route-A GEMM fixture input format.
+fn pack_i8(rows: usize, cols: usize, f: impl Fn(usize, usize) -> i32) -> Vec<u8> {
+    let mut v = Vec::with_capacity(rows * cols);
+    for i in 0..rows {
+        for j in 0..cols {
+            v.push(f(i, j) as i8 as u8);
+        }
+    }
+    v
+}
+
+/// Reference for the int8 GEMM fixtures: exact i64 accumulation of i8*i8
+/// products, matching the kernel's i32 accumulator bit-for-bit (values are
+/// small enough that no i32 overflow is possible). Returns (mismatches,
+/// first diff as (i, l, got, want)).
+fn check_gemm_i8(
+    a: &[u8],
+    b: &[u8],
+    c: &[u8],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> (usize, Option<(usize, usize, i32, i32)>) {
+    let mut mismatches = 0usize;
+    let mut first: Option<(usize, usize, i32, i32)> = None;
+    for i in 0..m {
+        for l in 0..n {
+            let mut acc: i64 = 0;
+            for j in 0..k {
+                acc += (a[i * k + j] as i8 as i64) * (b[j * n + l] as i8 as i64);
+            }
+            let want = acc as i32;
+            let off = (i * n + l) * 4;
+            let got = i32::from_le_bytes([c[off], c[off + 1], c[off + 2], c[off + 3]]);
+            if got != want {
+                mismatches += 1;
+                if first.is_none() {
+                    first = Some((i, l, got, want));
+                }
+            }
+        }
+    }
+    (mismatches, first)
 }
 
 fn build_add_op(dev: &Device, instr: &[u8], cu: u32) -> Result<OpState, String> {
