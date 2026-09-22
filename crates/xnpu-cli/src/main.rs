@@ -149,21 +149,22 @@ fn main() -> ExitCode {
                 .get(2..)
                 .map(|rest| rest.iter().filter_map(|s| s.parse().ok()).collect())
                 .unwrap_or_default();
-            let (m, k, group, iters) = match nums.as_slice() {
-                [m, k, group, iters] => (*m, *k, *group, *iters),
-                [m, k, group] => (*m, *k, *group, 32),
-                [m, k] => (*m, *k, 32, 32),
-                [] => (2048, 2048, 32, 32),
+            let (m, k, group, tsi, iters) = match nums.as_slice() {
+                [m, k, group, tsi, iters] => (*m, *k, *group, *tsi, *iters),
+                [m, k, group, tsi] => (*m, *k, *group, *tsi, 32),
+                [m, k, group] => (*m, *k, *group, 1, 32),
+                [m, k] => (*m, *k, 32, 1, 32),
+                [] => (2048, 2048, 32, 1, 32),
                 _ => {
-                    eprintln!("run-w4gemv: expected [M K] [group] [iters]");
+                    eprintln!("run-w4gemv: expected [M K] [group] [tsi] [iters]");
                     return ExitCode::FAILURE;
                 }
             };
-            cmd_run_w4gemv(&prj, m, k, group, iters)
+            cmd_run_w4gemv(&prj, m, k, group, tsi, iters)
         }
         _ => {
             eprintln!(
-                "usage: xnpu-cli <info | ctx-probe [max] [cols] | run-add [prj-dir] [bf16|i8] | run-gemm [prj-dir] [M K N] [bf16|i8] | run-multi [add-prj] [gemm-prj] [M K N] | run-pipe [prj-dir] [M K N] [iters] | run-chain [add-prj] [gemm-prj] [M K N] [reps] | run-q8 [gemm-prj] [rescale-prj] [M K N tile_m] [reps] | run-w4gemv [prj-dir] [M K] [group] [iters]>"
+                "usage: xnpu-cli <info | ctx-probe [max] [cols] | run-add [prj-dir] [bf16|i8] | run-gemm [prj-dir] [M K N] [bf16|i8] | run-multi [add-prj] [gemm-prj] [M K N] | run-pipe [prj-dir] [M K N] [iters] | run-chain [add-prj] [gemm-prj] [M K N] [reps] | run-q8 [gemm-prj] [rescale-prj] [M K N tile_m] [reps] | run-w4gemv [prj-dir] [M K] [group] [tsi] [iters]>"
             );
             ExitCode::FAILURE
         }
@@ -1987,7 +1988,14 @@ fn cmd_run_q8(
 /// terms — exact in f32 regardless of the kernel's lane split and
 /// reduce_add order. The only rounding in flight is the final bf16
 /// narrowing, so host RNE must match bit-for-bit.
-fn cmd_run_w4gemv(prj: &str, m: usize, k: usize, group: usize, iters: usize) -> ExitCode {
+fn cmd_run_w4gemv(
+    prj: &str,
+    m: usize,
+    k: usize,
+    group: usize,
+    tsi: usize,
+    iters: usize,
+) -> ExitCode {
     let (pdi, instr, cols) = match load_fixture(prj) {
         Some(f) => f,
         None => {
@@ -1995,11 +2003,12 @@ fn cmd_run_w4gemv(prj: &str, m: usize, k: usize, group: usize, iters: usize) -> 
             return ExitCode::FAILURE;
         }
     };
-    // Fixture geometry: m_input=1 row per tile, `cols` AIE columns each
-    // owning M/cols rows; per tile [K/2 nibble bytes | K/group bf16 scales].
+    // Fixture geometry: `cols` AIE columns each owning M/cols rows; each
+    // tile covers tsi rows as [tsi*K/2 nibble bytes | tsi*(K/group) bf16
+    // scales], tiles stacked per column (column 0 first).
     let ncols = cols as usize;
-    let tile_bytes = k / 2 + (k / group) * 2;
-    let a_bytes_len = ncols * (m / ncols) * tile_bytes;
+    let tile_bytes = tsi * (k / 2) + tsi * (k / group) * 2;
+    let a_bytes_len = ncols * (m / ncols / tsi) * tile_bytes;
     println!(
         "w4 gemv: C[{m}] = W_packed[{m}x{k}] @ x[{k}], uint4/g{group} scales, {cols} cols, tile {tile_bytes} B, weights {} KB, {iters} iters",
         a_bytes_len / 1024
@@ -2039,16 +2048,22 @@ fn cmd_run_w4gemv(prj: &str, m: usize, k: usize, group: usize, iters: usize) -> 
     let scale = |g: usize| (((g % 4) + 1) as f32) / 16.0;
     let groups_per_row = k / group;
     let mut a_bytes = vec![0u8; a_bytes_len];
+    let rows_per_col = m / ncols;
+    let nibble_bytes = tsi * k / 2;
     for i in 0..m {
-        // Tile layout: col-major over columns, m_input=1 row per tile, so
-        // row i's tile index is exactly i and its byte offset i*tile_bytes.
-        let off = i * tile_bytes;
+        // Row i lives in column i/rows_per_col, tile (i%rows_per_col)/tsi,
+        // local row (i%rows_per_col)%tsi within the tile.
+        let col = i / rows_per_col;
+        let r = i % rows_per_col;
+        let off = (col * (rows_per_col / tsi) + r / tsi) * tile_bytes;
+        let rr = r % tsi;
         for p in 0..k / 2 {
-            a_bytes[off + p] = nibble(i, 2 * p) | (nibble(i, 2 * p + 1) << 4);
+            a_bytes[off + rr * (k / 2) + p] = nibble(i, 2 * p) | (nibble(i, 2 * p + 1) << 4);
         }
         for g in 0..groups_per_row {
             let bits = f32_to_bf16(scale(g));
-            a_bytes[off + k / 2 + g * 2..off + k / 2 + g * 2 + 2]
+            a_bytes[off + nibble_bytes + (rr * groups_per_row + g) * 2
+                ..off + nibble_bytes + (rr * groups_per_row + g) * 2 + 2]
                 .copy_from_slice(&bits.to_le_bytes());
         }
     }
