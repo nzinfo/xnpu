@@ -140,6 +140,25 @@ fn main() -> ExitCode {
             };
             cmd_run_q8(&gemm_prj, &rescale_prj, m, k, n, tile_m, reps)
         }
+        Some("run-w4layer") => {
+            let w4dir = args.get(1).cloned().unwrap_or_else(|| {
+                "/home/nzinfo/qwen/xnpu/build/w4".to_string()
+            });
+            let nums: Vec<usize> = args
+                .get(2..)
+                .map(|rest| rest.iter().filter_map(|s| s.parse().ok()).collect())
+                .unwrap_or_default();
+            let (layers, iters) = match nums.as_slice() {
+                [layers, iters] => (*layers, *iters),
+                [layers] => (*layers, 3),
+                [] => (42, 3),
+                _ => {
+                    eprintln!("run-w4layer: expected [layers] [iters]");
+                    return ExitCode::FAILURE;
+                }
+            };
+            cmd_run_w4layer(&w4dir, layers, iters)
+        }
         Some("run-w4gemv") => {
             let prj = args.get(1).cloned().unwrap_or_else(|| {
                 "/home/nzinfo/qwen/xnpu/build/fused_dequant_gemv_2048x2048_1tsi_512tso_4col_g32.mlir.prj"
@@ -164,7 +183,7 @@ fn main() -> ExitCode {
         }
         _ => {
             eprintln!(
-                "usage: xnpu-cli <info | ctx-probe [max] [cols] | run-add [prj-dir] [bf16|i8] | run-gemm [prj-dir] [M K N] [bf16|i8] | run-multi [add-prj] [gemm-prj] [M K N] | run-pipe [prj-dir] [M K N] [iters] | run-chain [add-prj] [gemm-prj] [M K N] [reps] | run-q8 [gemm-prj] [rescale-prj] [M K N tile_m] [reps] | run-w4gemv [prj-dir] [M K] [group] [tsi] [iters]>"
+                "usage: xnpu-cli <info | ctx-probe [max] [cols] | run-add [prj-dir] [bf16|i8] | run-gemm [prj-dir] [M K N] [bf16|i8] | run-multi [add-prj] [gemm-prj] [M K N] | run-pipe [prj-dir] [M K N] [iters] | run-chain [add-prj] [gemm-prj] [M K N] [reps] | run-q8 [gemm-prj] [rescale-prj] [M K N tile_m] [reps] | run-w4gemv [prj-dir] [M K] [group] [tsi] [iters] | run-w4layer [w4-dir] [layers] [iters]>"
             );
             ExitCode::FAILURE
         }
@@ -2265,6 +2284,383 @@ fn cmd_run_w4gemv(
     } else {
         ExitCode::FAILURE
     }
+}
+
+/// One MiniCPM5 decode projection shape: fixture stem + packed geometry.
+/// Mirrors tools/w4_import.py's SHAPES table (tsi per the 64 KB tile-memory
+/// budget; see notes §13).
+struct W4Shape {
+    name: &'static str,
+    m: usize,
+    k: usize,
+    tsi: usize,
+    fixture: &'static str,
+}
+
+const W4_SHAPES: [W4Shape; 4] = [
+    W4Shape { name: "qkv", m: 2560, k: 2048, tsi: 16, fixture: "w4gemv2_2560x2048_16tsi_320tso_8col_g32" },
+    W4Shape { name: "o", m: 2048, k: 2048, tsi: 16, fixture: "w4gemv2_2048x2048_16tsi_256tso_8col_g32" },
+    W4Shape { name: "gateup", m: 12288, k: 2048, tsi: 16, fixture: "w4gemv2_12288x2048_16tsi_1536tso_8col_g32" },
+    W4Shape { name: "down", m: 2048, k: 6144, tsi: 4, fixture: "w4gemv2_2048x6144_4tsi_256tso_8col_g32" },
+];
+
+/// Parse one golden_{shape}.bin written by the importer:
+/// u32 nrows, u32 K, rows u32[nrows], x bits u16[K], ref bits u16[nrows].
+fn read_golden(path: &std::path::Path) -> Option<(Vec<usize>, Vec<u16>, Vec<u16>)> {
+    let d = std::fs::read(path).ok()?;
+    let rd_u32 = |o: usize| u32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]]) as usize;
+    let nrows = rd_u32(0);
+    let k = rd_u32(4);
+    if d.len() != 8 + 4 * nrows + 2 * k + 2 * nrows {
+        return None;
+    }
+    let rows: Vec<usize> = (0..nrows).map(|i| rd_u32(8 + 4 * i)).collect();
+    let rd_u16 = |o: usize| u16::from_le_bytes([d[o], d[o + 1]]);
+    let x = (0..k).map(|i| rd_u16(8 + 4 * nrows + 2 * i)).collect();
+    let ref_bits = (0..nrows)
+        .map(|i| rd_u16(8 + 4 * nrows + 2 * k + 2 * i))
+        .collect();
+    Some((rows, x, ref_bits))
+}
+
+/// M3a: one full decode step's projection chain over REAL w4-imported
+/// weights — 42 layers x 4 GEMV shapes (qkv, o, gate_up, down) on 4 CUs of
+/// one context. The real dataflow has mha/swiglu between the GEMVs; here
+/// every GEMV reads a fixed activation, so the run measures exactly what
+/// the engine's projection stream costs (weight bandwidth + CU switching),
+/// which the four scheduling modes slice differently:
+///   per-op    — submit+wait each op (the R3 pattern, worst case);
+///   per-layer — 4 submits per layer, drain at layer end;
+///   pipelined — all 168 submits, one drain (graph-executor target);
+///   grouped   — same-CU runs batched (42 qkv, then 42 o, ...): breaks the
+///               layer dependency on paper, quantifies the PDI-reload cost
+///               the layer-order modes pay on every CU change.
+fn cmd_run_w4layer(w4dir: &str, nlayers: usize, iters: usize) -> ExitCode {
+    let build = "/home/nzinfo/qwen/xnpu/build";
+    println!(
+        "w4 layer chain: {nlayers} layers x 4 GEMV (qkv/o/gateup/down), {iters} iters/mode, weights {w4dir}"
+    );
+
+    // Fixtures: PDI + ctrl-code per shape.
+    let fixtures: Vec<(Vec<u8>, Vec<u8>, u32)> = W4_SHAPES
+        .iter()
+        .map(|s| match load_fixture(&format!("{build}/{}.mlir.prj", s.fixture)) {
+            Some(f) => f,
+            None => {
+                eprintln!("load fixture {} failed", s.fixture);
+                std::process::exit(2);
+            }
+        })
+        .collect();
+    for (s, f) in W4_SHAPES.iter().zip(&fixtures) {
+        println!(
+            "  {:>7}: pdi {} B, ctrl {} B (M={}, K={}, tsi={})",
+            s.name, f.0.len(), f.1.len(), s.m, s.k, s.tsi
+        );
+    }
+
+    let dev = match Device::open_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("open amdxdna device: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let md = match dev.aie_metadata() {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("AIE metadata: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let cols = fixtures.iter().map(|f| f.2).max().unwrap_or(8);
+    let num_tiles = cols * md.core.row_count as u32;
+    let mut ctx = match HwContext::create(&dev, num_tiles) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("create hwctx: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let pdis: Vec<(&[u8], u8)> = fixtures.iter().map(|f| (f.0.as_slice(), 0)).collect();
+    if let Err(e) = ctx.configure_cus(&pdis) {
+        eprintln!("configure_cus (4 PDIs): {e}");
+        return ExitCode::FAILURE;
+    }
+    println!("4 CUs attached (0=qkv 1=o 2=gateup 3=down), {} cols / {} tiles", cols, num_tiles);
+
+    // Activations (fixed) and outputs. x is shared per K; c is per shape.
+    let mut live: Vec<(BufferObject, Mapping)> = Vec::new();
+    let mut x_va: [u64; 2] = [0; 2]; // [K=2048, K=6144]
+    let x2048 = vec![0u8; 2048 * 2];
+    let x6144 = vec![0u8; 6144 * 2];
+    x_va[0] = match chain_tensor(&dev, &mut live, "x2048", &x2048) {
+        Some(v) => v,
+        None => {
+            eprintln!("x2048 BO failed");
+            return ExitCode::FAILURE;
+        }
+    };
+    x_va[1] = match chain_tensor(&dev, &mut live, "x6144", &x6144) {
+        Some(v) => v,
+        None => {
+            eprintln!("x6144 BO failed");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut c_va = [0u64; 4];
+    for (si, s) in W4_SHAPES.iter().enumerate() {
+        c_va[si] = match chain_tensor(&dev, &mut live, &format!("c_{}", s.name), &vec![0u8; s.m * 2]) {
+            Some(v) => v,
+            None => {
+                eprintln!("c_{} BO failed", s.name);
+                return ExitCode::FAILURE;
+            }
+        };
+    }
+
+    // Real weights: one SHMEM BO per (layer, shape), all preloaded so no
+    // host copy lands inside the timed loops. Ctrl BOs are shared per
+    // shape (the ctrl code is read-only; run-pipe validated the pattern).
+    let mut w_va = vec![0u64; nlayers * 4];
+    let mut total_w = 0usize;
+    for n in 0..nlayers {
+        for (si, s) in W4_SHAPES.iter().enumerate() {
+            let data = match std::fs::read(format!("{w4dir}/layer{n:02}_{}.bin", s.name)) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("read layer{n:02}_{}: {e}", s.name);
+                    return ExitCode::FAILURE;
+                }
+            };
+            let expect = 8 * (s.m / 8) * (s.tsi * (s.k / 2) + s.tsi * (s.k / 32) * 2) / s.tsi;
+            if data.len() != expect {
+                eprintln!(
+                    "layer{n:02}_{}: {} B, expected {expect} B (stale import?)",
+                    s.name,
+                    data.len()
+                );
+                return ExitCode::FAILURE;
+            }
+            total_w += data.len();
+            w_va[n * 4 + si] = match chain_tensor(&dev, &mut live, &format!("w{n:02}.{}", s.name), &data) {
+                Some(v) => v,
+                None => {
+                    eprintln!("w{n:02}.{} BO failed", s.name);
+                    return ExitCode::FAILURE;
+                }
+            };
+        }
+    }
+    println!("weights resident: {total_w}/1e6 MB in {} BOs", live.len() - 6);
+
+    let mut ops: Vec<ChainOp> = Vec::with_capacity(nlayers * 4);
+    for n in 0..nlayers {
+        for (si, s) in W4_SHAPES.iter().enumerate() {
+            let xv = x_va[if s.k == 6144 { 1 } else { 0 }];
+            let op = chain_op(
+                &dev,
+                &format!("{}L{n:02}", s.name),
+                &fixtures[si].1,
+                si as u32,
+                &[w_va[n * 4 + si], xv, c_va[si]],
+            );
+            match op {
+                Some(o) => ops.push(o),
+                None => {
+                    eprintln!("op setup layer{n:02} {} failed", s.name);
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+    }
+    // Per-op arg handles: [ctrl(shape), w(layer,shape), x, c]. live layout:
+    // [x2048, x6144, c_qkv, c_o, c_gateup, c_down, w00.qkv, w00.o, ...].
+    let x_hdl = [live[0].0.handle(), live[1].0.handle()];
+    let c_hdl: Vec<u32> = (2..6).map(|i| live[i].0.handle()).collect();
+    let mut op_handles: Vec<Vec<u32>> = Vec::with_capacity(ops.len());
+    for n in 0..nlayers {
+        for si in 0..4 {
+            let wi = 6 + n * 4 + si;
+            op_handles.push(vec![
+                ops[n * 4 + si].ctrl_bo.handle(),
+                live[wi].0.handle(),
+                x_hdl[if W4_SHAPES[si].k == 6144 { 1 } else { 0 }],
+                c_hdl[si],
+            ]);
+        }
+    }
+
+    // Warmup + golden verification on layer 0 (real weights, bf16 output,
+    // f32 accumulation order differs -> tolerance tier, not bit-exact).
+    let mut golden_ok = true;
+    {
+        for (si, s) in W4_SHAPES.iter().enumerate() {
+            let (rows, x_bits, ref_bits) = match read_golden(std::path::Path::new(&format!(
+                "{w4dir}/golden_{}.bin", s.name
+            ))) {
+                Some(g) => g,
+                None => {
+                    eprintln!("read golden_{} failed", s.name);
+                    return ExitCode::FAILURE;
+                }
+            };
+            {
+                let xi = if s.k == 6144 { 1 } else { 0 };
+                let (bo, map) = &mut live[xi];
+                for (i, b) in x_bits.iter().enumerate() {
+                    map.as_mut_slice()[i * 2..i * 2 + 2].copy_from_slice(&b.to_le_bytes());
+                }
+                bo.sync(SyncDirection::ToDevice, 0, bo.size() as u64).ok();
+            }
+            let op = &mut ops[si];
+            let seq = match op.pkt.submit(&dev, &ctx, &op_handles[si]) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("golden submit {}: {e}", s.name);
+                    return ExitCode::FAILURE;
+                }
+            };
+            if syncobj_timeline_wait(&dev, ctx.syncobj_handle, seq, 10_000_000_000).is_err()
+                || op.pkt.state() != ERT_CMD_STATE_COMPLETED
+            {
+                eprintln!("golden exec {} did not complete", s.name);
+                return ExitCode::FAILURE;
+            }
+            let (c_bo, c_map) = &live[2 + si];
+            let _ = c_bo.sync(SyncDirection::ToDevice, 0, c_bo.size() as u64);
+            let cs = c_map.as_slice();
+            let mut worst = 0f32;
+            let mut bad = 0usize;
+            for (ri, row) in rows.iter().enumerate() {
+                let got = u16::from_le_bytes([cs[row * 2], cs[row * 2 + 1]]);
+                let g = bf16_to_f32(got);
+                let w = bf16_to_f32(ref_bits[ri]);
+                let err = (g - w).abs();
+                if err > 0.01 + 0.01 * w.abs() {
+                    bad += 1;
+                }
+                worst = worst.max(err / (w.abs() + 1e-6));
+            }
+            println!(
+                "  golden {:>7}: {} bad rows (worst rel err {:.2e}) -> {}",
+                s.name,
+                bad,
+                worst,
+                if bad == 0 { "PASS" } else { "FAIL" }
+            );
+            golden_ok &= bad == 0;
+        }
+    }
+    if !golden_ok {
+        eprintln!("GOLDEN: FAIL — real-weight outputs disagree with the importer reference");
+        return ExitCode::FAILURE;
+    }
+    println!("GOLDEN: PASS — real-weight GEMV outputs match the importer reference (bf16 tolerance)");
+
+    // Timed scheduling modes. op index = layer*4 + shape.
+    let nops = nlayers * 4;
+    let wait_op = |ops: &mut [ChainOp], i: usize| -> bool {
+        let op = &mut ops[i];
+        let seq = match op.pkt.submit(&dev, &ctx, &op_handles[i]) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        syncobj_timeline_wait(&dev, ctx.syncobj_handle, seq, 10_000_000_000).is_ok()
+            && op.pkt.state() == ERT_CMD_STATE_COMPLETED
+    };
+    let drain = |ops: &[ChainOp]| -> bool {
+        let mut polls = 0u64;
+        loop {
+            if ops.iter().all(|o| o.pkt.state() == ERT_CMD_STATE_COMPLETED) {
+                return true;
+            }
+            polls += 1;
+            if polls > 4_000_000 {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(50));
+        }
+    };
+
+    let report = |label: &str, total: std::time::Duration| {
+        println!(
+            "  {label:>10}: {:>10.2?} /token ({:.1} tok/s, {:.1} GB/s weight stream)",
+            total / iters as u32,
+            1e3 / (total / iters as u32).as_secs_f64() / 1e3,
+            total_w as f64 / (total.as_secs_f64() / iters as f64) / 1e9
+        );
+    };
+
+    // per-op sync
+    let mut all_ok = true;
+    let mut t0 = std::time::Instant::now();
+    for _ in 0..iters {
+        for i in 0..nops {
+            all_ok &= wait_op(&mut ops, i);
+        }
+    }
+    if !all_ok {
+        eprintln!("per-op mode failure");
+        return ExitCode::FAILURE;
+    }
+    report("per-op", t0.elapsed());
+
+    // per-layer: 4 submits, drain, next layer.
+    t0 = std::time::Instant::now();
+    for _ in 0..iters {
+        for n in 0..nlayers {
+            for j in 0..4 {
+                let i = n * 4 + j;
+                if ops[i].pkt.submit(&dev, &ctx, &op_handles[i]).is_err() {
+                    eprintln!("per-layer submit failed");
+                    return ExitCode::FAILURE;
+                }
+            }
+            if !drain(&ops[n * 4..n * 4 + 4]) {
+                eprintln!("per-layer drain timeout");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    report("per-layer", t0.elapsed());
+
+    // pipelined: all submits, one drain.
+    t0 = std::time::Instant::now();
+    for _ in 0..iters {
+        for i in 0..nops {
+            if ops[i].pkt.submit(&dev, &ctx, &op_handles[i]).is_err() {
+                eprintln!("pipelined submit failed");
+                return ExitCode::FAILURE;
+            }
+        }
+        if !drain(&ops) {
+            eprintln!("pipelined drain timeout");
+            return ExitCode::FAILURE;
+        }
+    }
+    report("pipelined", t0.elapsed());
+
+    // grouped: all layers' ops of shape 0, then shape 1, ... one drain.
+    t0 = std::time::Instant::now();
+    for _ in 0..iters {
+        for si in 0..4 {
+            for n in 0..nlayers {
+                let i = n * 4 + si;
+                if ops[i].pkt.submit(&dev, &ctx, &op_handles[i]).is_err() {
+                    eprintln!("grouped submit failed");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        if !drain(&ops) {
+            eprintln!("grouped drain timeout");
+            return ExitCode::FAILURE;
+        }
+    }
+    report("grouped", t0.elapsed());
+
+    ExitCode::SUCCESS
 }
 
 fn cmd_info() -> ExitCode {
