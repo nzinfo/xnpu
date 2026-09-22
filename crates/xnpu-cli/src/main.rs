@@ -1975,18 +1975,18 @@ fn cmd_run_q8(
     }
 }
 
-/// W4 GEMV through the upstream fused INT4-dequant fixture: persistent
-/// workers (infinite fifo loop, no core restart between launches) stream
-/// packed uint4 weights + per-group-32 bf16 scales, dequantize in-register
-/// and produce C[i] = bf16(Σ_k w_dequant(i,k)·x[k]) with a conv_even
-/// narrowing.
+/// W4 GEMV through the w4gemv2 fixture: persistent workers (infinite fifo
+/// loop, no core restart between launches) stream packed SIGNED int4
+/// weights + per-group-32 bf16 scales, dequantize in-register (the int4
+/// unpack sign-extends; nibbles are two's-complement [-8,7]) and produce
+/// C[i] = bf16(Σ_k w_dequant(i,k)·x[k]) with a conv_even narrowing.
 ///
 /// Test data keeps every intermediate exact (the M1 recipe, now for the
-/// quantized-weight path): scales are dyadics ((g%4)+1)/16, nibbles ≤ 15,
-/// so w_dequant = nibble×scale is exact in bf16; x is small integers; each
-/// product is a multiple of 2⁻⁴ with ≤ 19 significant bits summed over K
-/// terms — exact in f32 regardless of the kernel's lane split and
-/// reduce_add order. The only rounding in flight is the final bf16
+/// quantized-weight path): scales are dyadics ((g%4)+1)/16, nibbles in
+/// [-8,7], so w_dequant = nibble×scale is exact in bf16; x is small
+/// integers; each product is a multiple of 2⁻⁴ with ≤ 19 significant bits
+/// summed over K terms — exact in f32 regardless of the kernel's lane split
+/// and reduce_add order. The only rounding in flight is the final bf16
 /// narrowing, so host RNE must match bit-for-bit.
 fn cmd_run_w4gemv(
     prj: &str,
@@ -2010,7 +2010,7 @@ fn cmd_run_w4gemv(
     let tile_bytes = tsi * (k / 2) + tsi * (k / group) * 2;
     let a_bytes_len = ncols * (m / ncols / tsi) * tile_bytes;
     println!(
-        "w4 gemv: C[{m}] = W_packed[{m}x{k}] @ x[{k}], uint4/g{group} scales, {cols} cols, tile {tile_bytes} B, weights {} KB, {iters} iters",
+        "w4 gemv: C[{m}] = W_packed[{m}x{k}] @ x[{k}], signed int4/g{group} scales, {cols} cols, tile {tile_bytes} B, weights {} KB, {iters} iters",
         a_bytes_len / 1024
     );
 
@@ -2042,9 +2042,10 @@ fn cmd_run_w4gemv(
     }
     println!("PDI loaded, CU configured ({cols} cols / {num_tiles} tiles)");
 
-    // Deterministic data: nibble(i,k) = (13i+7k)%16, scale(g) = ((g%4)+1)/16
+    // Deterministic data: nibble(i,k) = ((13i+7k)%16)-8 ∈ [-8,7] (signed
+    // two's-complement, exercising both signs), scale(g) = ((g%4)+1)/16
     // (exact bf16 dyadic), x[k] = (k%7)-3 (small integer).
-    let nibble = |i: usize, kk: usize| ((13 * i + 7 * kk) % 16) as u8;
+    let nibble = |i: usize, kk: usize| (((13 * i + 7 * kk) % 16) as i32 - 8) as i8;
     let scale = |g: usize| (((g % 4) + 1) as f32) / 16.0;
     let groups_per_row = k / group;
     let mut a_bytes = vec![0u8; a_bytes_len];
@@ -2058,7 +2059,9 @@ fn cmd_run_w4gemv(
         let off = (col * (rows_per_col / tsi) + r / tsi) * tile_bytes;
         let rr = r % tsi;
         for p in 0..k / 2 {
-            a_bytes[off + rr * (k / 2) + p] = nibble(i, 2 * p) | (nibble(i, 2 * p + 1) << 4);
+            // Low nibble first; & 0xF stores the two's-complement pattern.
+            a_bytes[off + rr * (k / 2) + p] =
+                (nibble(i, 2 * p) as u8 & 0x0F) | ((nibble(i, 2 * p + 1) as u8 & 0x0F) << 4);
         }
         for g in 0..groups_per_row {
             let bits = f32_to_bf16(scale(g));
@@ -2111,6 +2114,9 @@ fn cmd_run_w4gemv(
             f32_to_bf16(acc)
         })
         .collect();
+    // Note: w = nibble × scale is exact in bf16 (dyadic scale, small int),
+    // and the kernel multiplies bf16(nibble) × bf16(scale) in its mac — same
+    // exact product, so the reference needs no intermediate rounding.
 
     // Warmup.
     let t0 = std::time::Instant::now();
@@ -2250,9 +2256,9 @@ fn cmd_run_w4gemv(
         weight_bytes / pipe_per / 1e9
     );
     println!(
-        "per-token projection (MiniCPM5 42 layers ≈ 2.66 G weights → 0.70 GB w4): {:.2} ms sequential / {:.2} ms pipelined",
-        0.70e9 / (weight_bytes / seq_per) * 1e3,
-        0.70e9 / (weight_bytes / pipe_per) * 1e3
+        "per-token projection (MiniCPM5 42 layers: qkv+gate_up+down = 1.80 G weights → 1.02 GB w4 incl. scales): {:.2} ms sequential / {:.2} ms pipelined",
+        1.02e9 / (weight_bytes / seq_per) * 1e3,
+        1.02e9 / (weight_bytes / pipe_per) * 1e3
     );
     if mm_seq == 0 && mm_pipe == 0 {
         ExitCode::SUCCESS
