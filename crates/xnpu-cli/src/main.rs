@@ -76,9 +76,28 @@ fn main() -> ExitCode {
             };
             cmd_run_multi(&add_prj, &gemm_prj, m, k, n)
         }
+        Some("run-pipe") => {
+            let prj = args.get(1).cloned().unwrap_or_else(|| {
+                "/home/nzinfo/qwen/xnpu/build/gemm_192x384x64_48x96x16_0_0.mlir.prj".to_string()
+            });
+            let nums: Vec<usize> = args
+                .get(2..)
+                .map(|rest| rest.iter().filter_map(|s| s.parse().ok()).collect())
+                .unwrap_or_default();
+            let (m, k, n, iters) = match nums.as_slice() {
+                [m, k, n, iters] => (*m, *k, *n, *iters),
+                [m, k, n] => (*m, *k, *n, 32),
+                [] => (192, 384, 64, 32),
+                _ => {
+                    eprintln!("run-pipe: expected [M K N] [iters]");
+                    return ExitCode::FAILURE;
+                }
+            };
+            cmd_run_pipe(&prj, m, k, n, iters)
+        }
         _ => {
             eprintln!(
-                "usage: xnpu-cli <info | ctx-probe [max] [cols] | run-add [prj-dir] [bf16|i8] | run-gemm [prj-dir] [M K N] | run-multi [add-prj] [gemm-prj] [M K N]>"
+                "usage: xnpu-cli <info | ctx-probe [max] [cols] | run-add [prj-dir] [bf16|i8] | run-gemm [prj-dir] [M K N] [bf16|i8] | run-multi [add-prj] [gemm-prj] [M K N] | run-pipe [prj-dir] [M K N] [iters]>"
             );
             ExitCode::FAILURE
         }
@@ -1027,78 +1046,293 @@ fn cmd_run_multi(add_prj: &str, gemm_prj: &str, m: usize, k: usize, n: usize) ->
         }
     };
 
-    let mut all_ok = true;
-    for round in 1..=8u32 {
-        println!("--- round {round} ---");
-        match add_op.exec(&dev, &ctx) {
-            Ok((state, dt)) if state == ERT_CMD_STATE_COMPLETED => {
-                println!("add  (cu 0): completed in {dt:?}");
-                let out = add_op.take_output();
-                let (mm, first) = check_add(&out, DType::Bf16, 2048);
-                match first {
-                    Some((i, got, want)) => println!(
-                        "add  (cu 0): first mismatch @[{i}]: got {got} ({:#06x}) want {want} ({:#06x})",
-                        got as u16,
-                        want as u16
-                    ),
-                    None => println!("add  (cu 0): VERIFY PASS (2048 elements, bf16 exact)"),
-                }
-                all_ok &= mm == 0;
-            }
+    // Scheduling comparison, the run-pipe follow-up: the pipelined run showed
+    // this gemm takes ~36us of device time when executed back-to-back on its
+    // own CU, but ~1.2ms when alternating with the add CU — the firmware
+    // reloads a CU's PDI on every cu_mask change. Burst (same-CU runs) vs
+    // interleaved (alternating CUs) here quantifies that switch cost with the
+    // submit+wait overhead common to both sides.
+    let reps = 8usize;
+    let mut exec_ok = |op: &mut OpState| -> Option<std::time::Duration> {
+        match op.exec(&dev, &ctx) {
+            Ok((state, dt)) if state == ERT_CMD_STATE_COMPLETED => Some(dt),
             Ok((state, _)) => {
-                eprintln!("add  (cu 0): did not complete (state {state})");
-                all_ok = false;
+                eprintln!("{} did not complete (state {state})", op.name);
+                None
             }
             Err(e) => {
-                eprintln!("add  (cu 0): {e}");
-                all_ok = false;
+                eprintln!("{}: {e}", op.name);
+                None
             }
         }
-        match gemm_op.exec(&dev, &ctx) {
-            Ok((state, dt)) if state == ERT_CMD_STATE_COMPLETED => {
-                println!("gemm (cu 1): completed in {dt:?}");
-                let c = gemm_op.take_output();
-                let (mm, max_ulp, first) = check_gemm(&a_bytes, &b_bytes, &c, m, k, n);
-                if let Some((i, l, got, want, d)) = first {
-                    println!(
-                        "gemm (cu 1): first diff @C[{i}][{l}]: got 0x{got:04x} ({}) want 0x{want:04x} ({}) [{d} ulp]",
-                        bf16_to_f32(got),
-                        bf16_to_f32(want)
-                    );
-                }
-                if mm == 0 {
-                    println!(
-                        "gemm (cu 1): VERIFY PASS ({} elements, bit-exact vs f32-acc reference)",
-                        m * n
-                    );
-                } else if max_ulp <= 64 {
-                    println!(
-                        "gemm (cu 1): VERIFY PASS ({} elements, max {max_ulp} ulp — bf16-accum fixture)",
-                        m * n
-                    );
-                } else {
-                    eprintln!(
-                        "gemm (cu 1): VERIFY FAIL ({mm}/{} diffs, max {max_ulp} ulp)",
-                        m * n
-                    );
-                    all_ok = false;
-                }
-            }
-            Ok((state, _)) => {
-                eprintln!("gemm (cu 1): did not complete (state {state})");
-                all_ok = false;
-            }
-            Err(e) => {
-                eprintln!("gemm (cu 1): {e}");
-                all_ok = false;
-            }
+    };
+
+    // Burst: reps consecutive add execs, then reps consecutive gemm execs.
+    let mut all_ok = true;
+    let mut add_burst = std::time::Duration::ZERO;
+    let mut gemm_burst = std::time::Duration::ZERO;
+    for _ in 0..reps {
+        match exec_ok(&mut add_op) {
+            Some(dt) => add_burst += dt,
+            None => all_ok = false,
         }
     }
+    let out = add_op.take_output();
+    let (mm, _) = check_add(&out, DType::Bf16, 2048);
+    all_ok &= mm == 0;
+    for _ in 0..reps {
+        match exec_ok(&mut gemm_op) {
+            Some(dt) => gemm_burst += dt,
+            None => all_ok = false,
+        }
+    }
+    let c = gemm_op.take_output();
+    let (mm, max_ulp, _) = check_gemm(&a_bytes, &b_bytes, &c, m, k, n);
+    all_ok &= mm == 0 || max_ulp <= 64;
+    println!(
+        "burst:      add {:>10?}/op   gemm {:>10?}/op (verify {})",
+        add_burst / reps as u32,
+        gemm_burst / reps as u32,
+        if all_ok { "PASS" } else { "FAIL" }
+    );
+
+    // Interleaved: reps alternating add -> gemm pairs.
+    let mut add_alt = std::time::Duration::ZERO;
+    let mut gemm_alt = std::time::Duration::ZERO;
+    for _ in 0..reps {
+        match exec_ok(&mut add_op) {
+            Some(dt) => add_alt += dt,
+            None => all_ok = false,
+        }
+        match exec_ok(&mut gemm_op) {
+            Some(dt) => gemm_alt += dt,
+            None => all_ok = false,
+        }
+    }
+    let out = add_op.take_output();
+    let (mm, _) = check_add(&out, DType::Bf16, 2048);
+    all_ok &= mm == 0;
+    let c = gemm_op.take_output();
+    let (mm, max_ulp, _) = check_gemm(&a_bytes, &b_bytes, &c, m, k, n);
+    all_ok &= mm == 0 || max_ulp <= 64;
+    println!(
+        "interleaved: add {:>10?}/op   gemm {:>10?}/op (verify {})",
+        add_alt / reps as u32,
+        gemm_alt / reps as u32,
+        if mm == 0 || max_ulp <= 64 { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "CU-switch cost: add +{:?}, gemm +{:?} per alternation",
+        (add_alt - add_burst) / reps as u32,
+        (gemm_alt - gemm_burst) / reps as u32
+    );
     if all_ok {
-        println!("MULTI-CU: PASS — add(cu0) and gemm(cu1) verified twice each on one context");
+        println!("MULTI-CU: PASS — both operators verified under burst and interleaved scheduling");
         ExitCode::SUCCESS
     } else {
         eprintln!("MULTI-CU: FAIL — see per-op results above");
+        ExitCode::FAILURE
+    }
+}
+
+/// M2 finale: command-queue pipelining — the decode-bottleneck question.
+///
+/// The R3 Python stack lost to CPU (2.26 vs 4.55 tok/s) because every
+/// operator paid a submit+wait round trip (42 layers x ~8 ops per forward).
+/// Here N packets go to one CU back-to-back with no intervening waits; the
+/// queue executes them in order anyway, so only true device time remains.
+/// Sequential vs pipelined totals put a number on the recoverable overhead.
+///
+/// Every exec's returned timeline seq is also printed — the M1 "seq always 0"
+/// observation came from runs that only ever submitted once, so the first
+/// point 0 was also the last. A pipelined run should walk the timeline.
+fn cmd_run_pipe(gemm_prj: &str, m: usize, k: usize, n: usize, iters: usize) -> ExitCode {
+    let (pdi, instr, cols) = match load_fixture(gemm_prj) {
+        Some(f) => f,
+        None => {
+            eprintln!("load fixture {gemm_prj} failed");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!(
+        "fixture: pdi {} B, ctrl-code {} B, partition {} cols",
+        pdi.len(),
+        instr.len(),
+        cols
+    );
+    println!(
+        "problem: C[{m}x{n}] = A[{m}x{k}] @ B[{k}x{n}], {} iters",
+        iters
+    );
+
+    let dev = match Device::open_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("open amdxdna device: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let md = match dev.aie_metadata() {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("AIE metadata: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let num_tiles = cols * md.core.row_count as u32;
+    let mut ctx = match HwContext::create(&dev, num_tiles) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("create hwctx: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!(
+        "hwctx: handle={} syncobj={} ({} cols / {} tiles)",
+        ctx.handle, ctx.syncobj_handle, cols, num_tiles
+    );
+    if let Err(e) = ctx.configure_cu(&pdi, 0) {
+        eprintln!("configure_cu (PDI load): {e}");
+        return ExitCode::FAILURE;
+    }
+
+    let (mut op, a_bytes, b_bytes) = match build_gemm_op(&dev, &instr, 0, m, k, n) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Packet pool: every in-flight exec needs its own cmd BO (the firmware
+    // consumes them asynchronously); the regmap is identical across the pool
+    // since the tensors are shared.
+    let ctrl_addr = op.ctrl_bo.xdna_addr();
+    let tensor_vas: Vec<u64> = op.maps.iter().map(|mp| mp.as_ptr() as u64).collect();
+    let mut pkts: Vec<StartNpuCmd> = Vec::with_capacity(iters);
+    for _ in 0..iters {
+        let mut p = match StartNpuCmd::new(&dev) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("cmd BO: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        p.set_cu(0);
+        let mut r = p
+            .set_ctrl(ctrl_addr, instr.len() as u32)
+            .and_then(|_| p.arg64(3))
+            .and_then(|_| p.arg64(ctrl_addr))
+            .and_then(|_| p.arg32(instr.len() as u32));
+        for va in &tensor_vas {
+            r = r.and_then(|_| p.arg64(*va));
+        }
+        if let Err(e) = r {
+            eprintln!("build packet: {e}");
+            return ExitCode::FAILURE;
+        }
+        pkts.push(p);
+    }
+    let mut handles = Vec::with_capacity(op.bos.len() + 1);
+    handles.push(op.ctrl_bo.handle());
+    handles.extend(op.bos.iter().map(|b| b.handle()));
+
+    // One warm-up exec (firmware/queue setup) through the op's own packet.
+    match op.exec(&dev, &ctx) {
+        Ok((state, _)) if state == ERT_CMD_STATE_COMPLETED => {}
+        Ok((state, _)) => {
+            eprintln!("warmup did not complete (state {state})");
+            return ExitCode::FAILURE;
+        }
+        Err(e) => {
+            eprintln!("warmup: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+
+    // Phase 1 — sequential: the R3 pattern, submit+wait per op.
+    let mut seqs: Vec<u64> = Vec::with_capacity(iters);
+    let t0 = std::time::Instant::now();
+    for p in pkts.iter_mut() {
+        let seq = match p.submit(&dev, &ctx, &handles) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("submit (sequential): {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        seqs.push(seq);
+        if let Err(e) = syncobj_timeline_wait(&dev, ctx.syncobj_handle, seq, 10_000_000_000) {
+            eprintln!("wait seq {seq}: {e}");
+            return ExitCode::FAILURE;
+        }
+        let state = p.state();
+        if state != ERT_CMD_STATE_COMPLETED {
+            eprintln!("sequential exec did not complete (state {state})");
+            return ExitCode::FAILURE;
+        }
+    }
+    let seq_elapsed = t0.elapsed();
+    let c1 = op.take_output();
+    let (mm, _, _) = check_gemm(&a_bytes, &b_bytes, &c1, m, k, n);
+    println!(
+        "sequential: {:?} total, {:?}/op (verify {})",
+        seq_elapsed,
+        seq_elapsed / iters as u32,
+        if mm == 0 { "PASS" } else { "FAIL" }
+    );
+    println!("seqs walked: first={:?} last={:?}", seqs.first(), seqs.last());
+
+    // Phase 2 — pipelined: submit everything, then poll the cmd BOs' state
+    // fields for completion. Same tensors throughout, so the in-order queue
+    // leaves a correct result in C regardless of depth.
+    let mut seqs2: Vec<u64> = Vec::with_capacity(iters);
+    let t0 = std::time::Instant::now();
+    for p in pkts.iter_mut() {
+        match p.submit(&dev, &ctx, &handles) {
+            Ok(s) => seqs2.push(s),
+            Err(e) => {
+                eprintln!("submit (pipelined, depth {}): {e}", seqs2.len() + 1);
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    let submit_elapsed = t0.elapsed();
+    let t1 = std::time::Instant::now();
+    let mut spins = 0u64;
+    loop {
+        if pkts.iter().all(|p| p.state() == ERT_CMD_STATE_COMPLETED) {
+            break;
+        }
+        spins += 1;
+        if spins > 40_000_000 {
+            eprintln!("pipelined drain timed out");
+            return ExitCode::FAILURE;
+        }
+        std::thread::sleep(std::time::Duration::from_micros(50));
+    }
+    let drain_elapsed = t1.elapsed();
+    let pipe_elapsed = t0.elapsed();
+    let c2 = op.take_output();
+    let (mm2, _, _) = check_gemm(&a_bytes, &b_bytes, &c2, m, k, n);
+    println!(
+        "pipelined:  {:?} total, {:?}/op (submit loop {:?}, drain {:?}, {} polls, verify {})",
+        pipe_elapsed,
+        pipe_elapsed / iters as u32,
+        submit_elapsed,
+        drain_elapsed,
+        spins,
+        if mm2 == 0 { "PASS" } else { "FAIL" }
+    );
+    println!("seqs walked: first={:?} last={:?}", seqs2.first(), seqs2.last());
+    println!(
+        "speedup: {:.2}x (recoverable per-op overhead {:?})",
+        seq_elapsed.as_secs_f64() / pipe_elapsed.as_secs_f64(),
+        seq_elapsed.saturating_sub(pipe_elapsed) / iters as u32
+    );
+    if mm == 0 && mm2 == 0 {
+        ExitCode::SUCCESS
+    } else {
         ExitCode::FAILURE
     }
 }
