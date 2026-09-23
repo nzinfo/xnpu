@@ -1,0 +1,8 @@
+[package]
+name = "xnpu-perf"
+description = "Device-agnostic NPU performance measurement core: op timeline recording, machine model, roofline reports."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

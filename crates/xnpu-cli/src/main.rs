@@ -2,6 +2,8 @@
 
 use std::process::ExitCode;
 
+use xnpu_perf::{trace_json, MachineModel, Mode, OpMeta, Recorder};
+
 use xnpu_hal::{
     syncobj_timeline_wait, BoType, BufferObject, Device, HwContext, Mapping, StartNpuCmd,
     SyncDirection, ERT_CMD_STATE_COMPLETED,
@@ -2886,6 +2888,26 @@ fn cmd_run_w4ulayer(w4dir: &str, nlayers: usize, iters: usize) -> ExitCode {
         live.len() - 6
     );
 
+    // M5a xnpu-perf: per-shape 字节/FLOP 计数（roofline 分母来源）+ 全程
+    // 时间线记录器。metas 按形状聚合（跨层共享），event 名 = 形状名。
+    let metas: Vec<OpMeta> = W4U_SHAPES
+        .iter()
+        .map(|s| {
+            let mut m = OpMeta::new(
+                s.name,
+                "w4gemvu",
+                0,
+                (s.m * s.k / 2 + s.m * (s.k / 32) * 2 + s.k * 2) as u64, // w4 + scales + x
+                (s.m * 2) as u64, // c out
+                (2 * s.m * s.k) as u64,
+            );
+            m.bytes_stream = Some((8 * (s.m / 32) * W4U_ELEM) as u64); // padded slot 流
+            m
+        })
+        .collect();
+    let mut rec = Recorder::new();
+    let mut rec_seq = 0u64;
+
     let mut ops: Vec<ChainOp> = Vec::with_capacity(nlayers * 4);
     for n in 0..nlayers {
         for (si, s) in W4U_SHAPES.iter().enumerate() {
@@ -3101,10 +3123,13 @@ fn cmd_run_w4ulayer(w4dir: &str, nlayers: usize, iters: usize) -> ExitCode {
     // per-op sync (verified at each layer boundary)
     let mut all_ok = true;
     let mut t0 = std::time::Instant::now();
-    for _ in 0..iters {
+    for it in 0..iters {
         for n in 0..nlayers {
             for j in 0..4 {
+                let ts = std::time::Instant::now();
                 all_ok &= wait_op(&mut ops, n * 4 + j);
+                rec.solo(&metas[j], it as u32, ts, rec_seq);
+                rec_seq += 1;
             }
             all_ok &= verify_layer(n);
         }
@@ -3123,12 +3148,17 @@ fn cmd_run_w4ulayer(w4dir: &str, nlayers: usize, iters: usize) -> ExitCode {
     t0 = std::time::Instant::now();
     let mut pl_bad: Vec<String> = Vec::new();
     for it in 0..iters {
+        let tb = std::time::Instant::now();
         for n in 0..nlayers {
             let mut last_seq = 0u64;
             for j in 0..4 {
                 let i = n * 4 + j;
                 match ops[i].pkt.submit(&dev, &ctx, &op_handles[i]) {
-                    Ok(s) => last_seq = s,
+                    Ok(s) => {
+                        last_seq = s;
+                        rec.burst_submit(&metas[j], it as u32, rec_seq);
+                        rec_seq += 1;
+                    }
                     Err(_) => {
                         eprintln!("per-layer submit failed");
                         return ExitCode::FAILURE;
@@ -3145,6 +3175,7 @@ fn cmd_run_w4ulayer(w4dir: &str, nlayers: usize, iters: usize) -> ExitCode {
                 pl_bad.push(format!("{it}/{n:02}:{}", diagnose(n)));
             }
         }
+        rec.burst_done("per-layer", Mode::Burst, it as u32, tb, nops as u32, 1);
     }
     report("per-layer", t0.elapsed());
     println!(
@@ -3161,17 +3192,25 @@ fn cmd_run_w4ulayer(w4dir: &str, nlayers: usize, iters: usize) -> ExitCode {
     // pipelined: all submits, one drain. Intermediate outputs are
     // overwritten in flight, so only the final layer is verifiable.
     t0 = std::time::Instant::now();
-    for _ in 0..iters {
+    for it in 0..iters {
+        let tb = std::time::Instant::now();
         for i in 0..nops {
-            if ops[i].pkt.submit(&dev, &ctx, &op_handles[i]).is_err() {
-                eprintln!("pipelined submit failed");
-                return ExitCode::FAILURE;
+            match ops[i].pkt.submit(&dev, &ctx, &op_handles[i]) {
+                Ok(_) => {
+                    rec.burst_submit(&metas[i % 4], it as u32, rec_seq);
+                    rec_seq += 1;
+                }
+                Err(_) => {
+                    eprintln!("pipelined submit failed");
+                    return ExitCode::FAILURE;
+                }
             }
         }
         if !drain(&ops) {
             eprintln!("pipelined drain timeout");
             return ExitCode::FAILURE;
         }
+        rec.burst_done("pipelined", Mode::Burst, it as u32, tb, nops as u32, 1);
     }
     report("pipelined", t0.elapsed());
     if !verify_layer(nlayers - 1) {
@@ -3183,13 +3222,20 @@ fn cmd_run_w4ulayer(w4dir: &str, nlayers: usize, iters: usize) -> ExitCode {
     // grouped: same-CU batching is now the SAME order as per-layer — kept to
     // confirm the two coincide (zero switches means order no longer matters).
     t0 = std::time::Instant::now();
-    for _ in 0..iters {
+    for it in 0..iters {
+        let tb = std::time::Instant::now();
         for si in 0..4 {
             for n in 0..nlayers {
                 let i = n * 4 + si;
-                if ops[i].pkt.submit(&dev, &ctx, &op_handles[i]).is_err() {
-                    eprintln!("grouped submit failed");
-                    return ExitCode::FAILURE;
+                match ops[i].pkt.submit(&dev, &ctx, &op_handles[i]) {
+                    Ok(_) => {
+                        rec.burst_submit(&metas[si], it as u32, rec_seq);
+                        rec_seq += 1;
+                    }
+                    Err(_) => {
+                        eprintln!("grouped submit failed");
+                        return ExitCode::FAILURE;
+                    }
                 }
             }
         }
@@ -3197,6 +3243,7 @@ fn cmd_run_w4ulayer(w4dir: &str, nlayers: usize, iters: usize) -> ExitCode {
             eprintln!("grouped drain timeout");
             return ExitCode::FAILURE;
         }
+        rec.burst_done("grouped", Mode::Burst, it as u32, tb, nops as u32, 1);
     }
     report("grouped", t0.elapsed());
 
@@ -3220,7 +3267,11 @@ fn cmd_run_w4ulayer(w4dir: &str, nlayers: usize, iters: usize) -> ExitCode {
                 let mut last_seq = 0u64;
                 for i in start..end {
                     match ops[i].pkt.submit(&dev, &ctx, &op_handles[i]) {
-                        Ok(s) => last_seq = s,
+                        Ok(s) => {
+                            last_seq = s;
+                            rec.burst_submit(&metas[i % 4], it as u32, rec_seq);
+                            rec_seq += 1;
+                        }
                         Err(_) => {
                             eprintln!("chunk{chunk} submit failed");
                             return ExitCode::FAILURE;
@@ -3242,6 +3293,14 @@ fn cmd_run_w4ulayer(w4dir: &str, nlayers: usize, iters: usize) -> ExitCode {
             }
             iter_ms.push(t0.elapsed().as_secs_f64() * 1e3);
             exec_ok += ok as usize;
+            rec.burst_done(
+                &format!("chunk{chunk}"),
+                Mode::Burst,
+                it as u32,
+                t0,
+                nops as u32,
+                1,
+            );
         }
         iter_ms.sort_by(|a, b| a.total_cmp(b));
         let med = iter_ms[iter_ms.len() / 2];
@@ -3256,6 +3315,27 @@ fn cmd_run_w4ulayer(w4dir: &str, nlayers: usize, iters: usize) -> ExitCode {
             iters,
             &bad
         );
+    }
+
+    // ---- M5a xnpu-perf 报告：per-op 表 + 链式块对比 + roofline 判定 ----
+    let model = MachineModel::default();
+    let title = format!("run-w4ulayer: {nlayers} layers x 4 shapes, {iters} iters/mode");
+    let (md, summary) = xnpu_perf::render_markdown(&rec, &metas, &model, &title);
+    println!("\n{md}");
+    let dir = "/home/nzinfo/qwen/xnpu/build/perf";
+    if std::fs::create_dir_all(dir).is_ok() {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let stem = format!("{dir}/w4ulayer_{nlayers}L_{ts}");
+        let json = trace_json(&rec, &model, &title, &summary);
+        match std::fs::write(format!("{stem}.json"), json)
+            .and_then(|()| std::fs::write(format!("{stem}.md"), &md))
+        {
+            Ok(()) => println!("perf trace written: {stem}.json / .md"),
+            Err(e) => eprintln!("perf trace write failed: {e}"),
+        }
     }
 
     ExitCode::SUCCESS

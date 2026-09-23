@@ -7,3 +7,4 @@ license.workspace = true
 
 [dependencies]
 xnpu-hal = { path = "../xnpu-hal" }
+xnpu-perf = { path = "../xnpu-perf" }

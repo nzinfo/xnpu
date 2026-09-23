@@ -13,6 +13,7 @@ name = "xnpu-cli"
 version = "0.1.0"
 dependencies = [
  "xnpu-hal",
+ "xnpu-perf",
 ]
 
 [[package]]
@@ -21,3 +22,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
 ]
+
+[[package]]
+name = "xnpu-perf"
+version = "0.1.0"
