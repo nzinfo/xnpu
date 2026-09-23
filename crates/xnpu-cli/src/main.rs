@@ -178,6 +178,13 @@ fn main() -> ExitCode {
             };
             cmd_run_w4ulayer(&w4dir, layers, iters)
         }
+        Some("run-fkprobe") => {
+            let prj = args.get(1).cloned().unwrap_or_else(|| {
+                "/home/nzinfo/qwen/xnpu/build/flowkv_decode_16h_2kv_128d_1024s_32cs_2col.mlir.prj".to_string()
+            });
+            let iters = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(4);
+            cmd_run_fkprobe(&prj, iters)
+        }
         Some("run-decode") => {
             let decdir = args.get(1).cloned().unwrap_or_else(|| {
                 "/home/nzinfo/qwen/xnpu/build/dec".to_string()
@@ -189,7 +196,10 @@ fn main() -> ExitCode {
                 .get(3)
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(5);
-            cmd_run_decode(&decdir, &w4dir, iters)
+            // Trailing "cpu" keeps the Rust scalar attention (A/B path);
+            // default is the M4a NPU attention on the flowkv CU.
+            let npu_attn = args.get(4).map(String::as_str) != Some("cpu");
+            cmd_run_decode(&decdir, &w4dir, iters, npu_attn)
         }
         Some("run-w4gemv") => {
             let prj = args.get(1).cloned().unwrap_or_else(|| {
@@ -215,7 +225,7 @@ fn main() -> ExitCode {
         }
         _ => {
             eprintln!(
-                "usage: xnpu-cli <info | ctx-probe [max] [cols] | run-add [prj-dir] [bf16|i8] | run-gemm [prj-dir] [M K N] [bf16|i8] | run-multi [add-prj] [gemm-prj] [M K N] | run-pipe [prj-dir] [M K N] [iters] | run-chain [add-prj] [gemm-prj] [M K N] [reps] | run-q8 [gemm-prj] [rescale-prj] [M K N tile_m] [reps] | run-w4gemv [prj-dir] [M K] [group] [tsi] [iters] | run-w4layer [w4-dir] [layers] [iters] | run-w4ulayer [w4u-dir] [layers] [iters] | run-decode [dec-dir] [w4u-dir] [iters]>"
+                "usage: xnpu-cli <info | ctx-probe [max] [cols] | run-add [prj-dir] [bf16|i8] | run-gemm [prj-dir] [M K N] [bf16|i8] | run-multi [add-prj] [gemm-prj] [M K N] | run-pipe [prj-dir] [M K N] [iters] | run-chain [add-prj] [gemm-prj] [M K N] [reps] | run-q8 [gemm-prj] [rescale-prj] [M K N tile_m] [reps] | run-w4gemv [prj-dir] [M K] [group] [tsi] [iters] | run-w4layer [w4-dir] [layers] [iters] | run-w4ulayer [w4u-dir] [layers] [iters] | run-decode [dec-dir] [w4u-dir] [iters] [cpu]>"
             );
             ExitCode::FAILURE
         }
@@ -3348,19 +3358,22 @@ fn attention_bf16(
     }
 }
 
-/// M3b: one full 42-layer decode step over real weights — the engine
+/// M3b/M4a: one full 42-layer decode step over real weights — the engine
 /// skeleton. Projections run on the universal w4gemvu CU (run-w4ulayer
-/// machinery); rope, GQA attention, KV cache, rms-norm, swiglu and the
-/// residuals run in Rust (f32 math, bf16 boundaries — exactly what
-/// tools/decode_export.py's reference computes), so the final hidden must
-/// reproduce golden_hidden.bin to accumulation-order noise. The NPU MHA
-/// fixture is prefill-shaped (S_q tiles of 64); a universal decode-MHA
-/// (S_kv from a runtime header, the w4gemvu trick) is the M4 kernel that
-/// retires the CPU attention.
-fn cmd_run_decode(decdir: &str, w4dir: &str, iters: usize) -> ExitCode {
+/// machinery); rope, rms-norm, swiglu and the residuals run in Rust (f32
+/// math, bf16 boundaries — exactly what tools/decode_export.py's reference
+/// computes), so the final hidden must reproduce golden_hidden.bin to
+/// accumulation-order noise. M4a adds the NPU decode attention: the
+/// flowkv_decode CU (streaming online-softmax attention, runtime S from a
+/// Q element header — one compiled binary per cache slot) fed from
+/// per-layer interleaved KV cache BOs. Pass the trailing "cpu" arg to keep
+/// the Rust scalar attention as the A/B reference path.
+fn cmd_run_decode(decdir: &str, w4dir: &str, iters: usize, npu_attn: bool) -> ExitCode {
     let build = "/home/nzinfo/qwen/xnpu/build";
     println!(
-        "decode chain: 42 layers, w4gemvu projections on 1 CU + Rust glue, {iters} iters"
+        "decode chain: 42 layers, w4gemvu projections on CU0 + {} attention{}, {iters} iters",
+        if npu_attn { "flowkv NPU (CU1)" } else { "Rust scalar" },
+        if npu_attn { "" } else { " (cpu mode)" },
     );
 
     // Fixtures + PDI identity (same contract as run-w4ulayer).
@@ -3382,6 +3395,24 @@ fn cmd_run_decode(decdir: &str, w4dir: &str, iters: usize) -> ExitCode {
             return ExitCode::FAILURE;
         }
     }
+
+    // M4a flowkv fixture: same 8-col QoS partition, its own CU (func 1).
+    let fk_fixture = if npu_attn {
+        match load_fixture(&format!(
+            "{build}/flowkv_decode_16h_2kv_128d_1024s_32cs_2col.mlir.prj"
+        )) {
+            Some(f) => {
+                println!("flowkv: pdi {} B, ctrl-code {} B", f.0.len(), f.1.len());
+                f
+            }
+            None => {
+                eprintln!("load flowkv fixture failed (run the flowkv pytest first)");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        (Vec::new(), Vec::new(), 0)
+    };
 
     let dev = match Device::open_default() {
         Ok(d) => d,
@@ -3406,7 +3437,16 @@ fn cmd_run_decode(decdir: &str, w4dir: &str, iters: usize) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    if let Err(e) = ctx.configure_cus(&[(fixtures[0].0.as_slice(), 0)]) {
+    // Both PDIs take cu_func 0 — the CU slot is the index in this list and
+    // is selected per op via set_cu (the run-multi pattern; func != 0 makes
+    // the fw look up a DPU function the PDI doesn't have and the op never
+    // runs).
+    let cus: Vec<(&[u8], u8)> = if npu_attn {
+        vec![(fixtures[0].0.as_slice(), 0), (fk_fixture.0.as_slice(), 0)]
+    } else {
+        vec![(fixtures[0].0.as_slice(), 0)]
+    };
+    if let Err(e) = ctx.configure_cus(&cus) {
         eprintln!("configure_cus: {e}");
         return ExitCode::FAILURE;
     }
@@ -3525,6 +3565,145 @@ fn cmd_run_decode(decdir: &str, w4dir: &str, iters: usize) -> ExitCode {
     let pos = 100usize;
     let (rc, rs) = rope_table(pos);
 
+    // M4a NPU-attention state. Layouts must match
+    // iron/operators/flowkv_decode: KV cache = (2 heads, 1024 pos, [K|V],
+    // 128) interleaved per layer; Q element = [Q_group (1024) | angles
+    // (128 interleaved cos/sin) | hdr(16, runtime S u32 in the first two
+    // bf16 bit patterns)] per KV group. Angles/curve: the SAME rope_table
+    // the scalar path uses (kernel is angle-source agnostic), header at
+    // the element TAIL (peano anchor, notes §16).
+    const FK_CAP: usize = 1024;
+    const FK_STRIDE: usize = 8 * 128 + 128 + 16; // 1176 elems per group
+    struct FkState {
+        ops: Vec<ChainOp>,
+        handles: Vec<Vec<u32>>,
+        kv: Vec<(BufferObject, Mapping)>,
+        q: (BufferObject, Mapping),
+        o: (BufferObject, Mapping),
+    }
+    let mut fk: Option<FkState> = if npu_attn {
+        let q_bytes_total = 2 * FK_STRIDE * 2;
+        let o_bytes_total = 16 * 128 * 2;
+        let mut qdata = vec![0u16; 2 * FK_STRIDE];
+        for g in 0..2usize {
+            let abase = g * FK_STRIDE + 8 * 128;
+            for j in 0..64 {
+                qdata[abase + 2 * j] = f32_to_bf16(rc[j]);
+                qdata[abase + 2 * j + 1] = f32_to_bf16(rs[j]);
+            }
+            // hdr[0..2] = S as u32 (little-endian halves); rest stays 0.
+            qdata[abase + 128] = (pos + 1) as u16;
+        }
+        let q_bo = match BufferObject::new(&dev, BoType::Shmem, q_bytes_total) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("flowkv q BO: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let mut q_map = match q_bo.map_owned() {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("flowkv q map: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        q_map
+            .as_mut_slice()
+            .copy_from_slice(&qdata.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+        if let Err(e) = q_bo.sync(SyncDirection::ToDevice, 0, q_bytes_total as u64) {
+            eprintln!("flowkv q sync: {e}");
+            return ExitCode::FAILURE;
+        }
+        let o_bo = match BufferObject::new(&dev, BoType::Shmem, o_bytes_total) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("flowkv o BO: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let o_map = match o_bo.map_owned() {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("flowkv o map: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let q_va = q_map.as_ptr() as u64;
+        let o_va = o_map.as_ptr() as u64;
+
+        // Per-layer interleaved KV caches: history rows 0..pos from the
+        // exported kcache/vcache; the row at `pos` is written per step.
+        let mut kv = Vec::with_capacity(42);
+        for n in 0..42usize {
+            let mut inter = vec![0u16; 2 * FK_CAP * 2 * 128];
+            for kvh in 0..2usize {
+                for p in 0..pos {
+                    let src = (n * 2 + kvh) * cache_seq * 128 + p * 128;
+                    let dst = (kvh * FK_CAP * 2 + p * 2) * 128;
+                    inter[dst..dst + 128].copy_from_slice(&kcache[src..src + 128]);
+                    inter[dst + 128..dst + 256].copy_from_slice(&vcache[src..src + 128]);
+                }
+            }
+            let bo = match BufferObject::new(&dev, BoType::Shmem, inter.len() * 2) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("flowkv kv{n:02} BO: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let mut map = match bo.map_owned() {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("flowkv kv{n:02} map: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            map.as_mut_slice()
+                .copy_from_slice(&inter.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+            if let Err(e) = bo.sync(SyncDirection::ToDevice, 0, bo.size() as u64) {
+                eprintln!("flowkv kv{n:02} sync: {e}");
+                return ExitCode::FAILURE;
+            }
+            kv.push((bo, map));
+        }
+
+        let mut ops = Vec::with_capacity(42);
+        let mut handles = Vec::with_capacity(42);
+        for n in 0..42usize {
+            let h = kv[n].0.handle();
+            match chain_op(
+                &dev,
+                &format!("fkL{n:02}"),
+                &fk_fixture.1,
+                1,
+                &[kv[n].1.as_ptr() as u64, q_va, o_va],
+            ) {
+                Some(op) => {
+                    handles.push(vec![op.ctrl_bo.handle(), h, q_bo.handle(), o_bo.handle()]);
+                    ops.push(op);
+                }
+                None => {
+                    eprintln!("flowkv op layer{n} setup failed");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        println!(
+            "flowkv: 42 kv cache BOs (1 MiB each), q {} B, o {} B, 42 ops on CU1",
+            q_bytes_total, o_bytes_total
+        );
+        Some(FkState {
+            ops,
+            handles,
+            kv,
+            q: (q_bo, q_map),
+            o: (o_bo, o_map),
+        })
+    } else {
+        None
+    };
+
     // One w4gemvu call: replicate x into the vector BO, submit, wait, read c.
     let mut gemv = |ops: &mut [ChainOp], i: usize, si: usize, x: &[u16]| -> Option<Vec<u16>> {
         let k = W4U_SHAPES[si].k;
@@ -3590,6 +3769,7 @@ fn cmd_run_decode(decdir: &str, w4dir: &str, iters: usize) -> ExitCode {
                        vcache: &mut [u16],
                        x: &mut Vec<u16>,
                        sc: &mut Scratch,
+                       fk: &mut Option<FkState>,
                        check: bool|
      -> bool {
         for n in 0..42usize {
@@ -3607,8 +3787,75 @@ fn cmd_run_decode(decdir: &str, w4dir: &str, iters: usize) -> ExitCode {
                 vcache[off..off + 128]
                     .copy_from_slice(&qkv[2304 + kv * 128..2304 + (kv + 1) * 128]);
             }
-            let klo = n * 2 * cache_seq * 128;
-            attention_bf16(qr, &kcache[klo..], &vcache[klo..], pos, cache_seq, attn);
+            match fk.as_mut() {
+                Some(fk) => {
+                    // Append this step's rotated K row + raw V row into the
+                    // layer's interleaved device cache (K first, V next —
+                    // 512 contiguous bytes per KV head).
+                    {
+                        let (bo, map) = &mut fk.kv[n];
+                        let bytes = map.as_mut_slice();
+                        for kvh in 0..2usize {
+                            let off = ((kvh * FK_CAP * 2 + pos * 2) * 128) * 2;
+                            for j in 0..128 {
+                                bytes[off + j * 2..off + j * 2 + 2]
+                                    .copy_from_slice(&kr[kvh * 128 + j].to_le_bytes());
+                                bytes[off + 256 + j * 2..off + 256 + j * 2 + 2]
+                                    .copy_from_slice(&qkv[2304 + kvh * 128 + j].to_le_bytes());
+                            }
+                            if let Err(e) = bo.sync(SyncDirection::ToDevice, off as u64, 512) {
+                                eprintln!("kv{n:02} row sync: {e}");
+                                return false;
+                            }
+                        }
+                    }
+                    // Refresh the Q heads in the shared Q element (angles +
+                    // header were packed once at setup — only Q changes).
+                    {
+                        let (qbo, qmap) = &mut fk.q;
+                        let bytes = qmap.as_mut_slice();
+                        for g in 0..2usize {
+                            let base = g * FK_STRIDE * 2;
+                            for j in 0..1024 {
+                                bytes[base + j * 2..base + j * 2 + 2]
+                                    .copy_from_slice(&qr[g * 1024 + j].to_le_bytes());
+                            }
+                        }
+                        if let Err(e) = qbo.sync(SyncDirection::ToDevice, 0, qbo.size() as u64) {
+                            eprintln!("q sync (layer {n}): {e}");
+                            return false;
+                        }
+                    }
+                    let op = &mut fk.ops[n];
+                    // Same first-exec O-read-race guard as run-fkprobe: flush
+                    // the o BO's cache lines before submit so the post-wait
+                    // read sees the DMA writes.
+                    let _ = fk.o.0.sync(SyncDirection::ToDevice, 0, fk.o.0.size() as u64);
+                    let seq = match op.pkt.submit(&dev, &ctx, &fk.handles[n]) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("flowkv submit (layer {n}): {e}");
+                            return false;
+                        }
+                    };
+                    if let Err(e) =
+                        syncobj_timeline_wait(&dev, ctx.syncobj_handle, seq, 10_000_000_000)
+                    {
+                        eprintln!("flowkv wait (layer {n}, seq {seq}): {e}");
+                        return false;
+                    }
+                    // SHMEM is coherent; the direction-1 ioctl is best-effort.
+                    let _ = fk.o.0.sync(SyncDirection::FromDevice, 0, fk.o.0.size() as u64);
+                    let os = fk.o.1.as_slice();
+                    for i in 0..2048 {
+                        attn[i] = u16::from_le_bytes([os[i * 2], os[i * 2 + 1]]);
+                    }
+                }
+                None => {
+                    let klo = n * 2 * cache_seq * 128;
+                    attention_bf16(qr, &kcache[klo..], &vcache[klo..], pos, cache_seq, attn);
+                }
+            }
             let o = match gemv(ops, n * 4 + 1, 1, attn) {
                 Some(v) => v,
                 None => return false,
@@ -3658,7 +3905,7 @@ fn cmd_run_decode(decdir: &str, w4dir: &str, iters: usize) -> ExitCode {
     let mut t0 = std::time::Instant::now();
     {
         let mut ops2 = std::mem::take(&mut ops);
-        let ok = decode_step(&mut ops2, &mut kcache, &mut vcache, &mut x, &mut sc, true);
+        let ok = decode_step(&mut ops2, &mut kcache, &mut vcache, &mut x, &mut sc, &mut fk, true);
         ops = ops2;
         if !ok {
             eprintln!("decode step failed");
@@ -3712,7 +3959,7 @@ fn cmd_run_decode(decdir: &str, w4dir: &str, iters: usize) -> ExitCode {
     t0 = std::time::Instant::now();
     for _ in 0..iters {
         let mut ops2 = std::mem::take(&mut ops);
-        let ok = decode_step(&mut ops2, &mut kcache, &mut vcache, &mut x, &mut sc, false);
+        let ok = decode_step(&mut ops2, &mut kcache, &mut vcache, &mut x, &mut sc, &mut fk, false);
         ops = ops2;
         if !ok {
             eprintln!("timed decode step failed");
@@ -3726,8 +3973,314 @@ fn cmd_run_decode(decdir: &str, w4dir: &str, iters: usize) -> ExitCode {
         per,
         1e3 / per.as_secs_f64() / 1e3
     );
-    println!("  (CPU: rope+GQA attention+norms+swiglu; NPU: 168 w4gemvu on 1 CU)");
+    println!(
+        "  (CPU: rope+{}+norms+swiglu; NPU: 168 w4gemvu{})",
+        if npu_attn {
+            "kv-row-append"
+        } else {
+            "GQA-attention"
+        },
+        if npu_attn {
+            " on CU0 + 42 flowkv attention on CU1"
+        } else {
+            " on 1 CU"
+        },
+    );
 
+    ExitCode::SUCCESS
+}
+
+/// M4a probe: drive the flowkv_decode fixture STANDALONE over raw DRM —
+/// no w4gemvu CU, fresh context. Isolates "fixture vs raw submit path"
+/// from "persistent-kernel PDI switching" when the decode chain's flowkv
+/// op times out. Data is the M1 small-int recipe: Q/K constant, cos=1
+/// sin=0 (RoPE identity), zero header (full capacity) — every score is
+/// equal, so O must equal the per-column mean of V exactly (to bf16
+/// noise). Pass bar: op completes AND O matches the uniform-mix golden.
+fn cmd_run_fkprobe(prj: &str, iters: usize) -> ExitCode {
+    let (pdi, instr, cols) = match load_fixture(prj) {
+        Some(f) => {
+            println!(
+                "flowkv probe: pdi {} B, ctrl-code {} B, partition {} cols",
+                f.0.len(),
+                f.1.len(),
+                f.2
+            );
+            f
+        }
+        None => {
+            eprintln!("load fixture {prj} failed");
+            return ExitCode::FAILURE;
+        }
+    };
+    let dev = match Device::open_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("open amdxdna device: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let md = match dev.aie_metadata() {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("AIE metadata: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let num_tiles = cols * md.core.row_count as u32;
+    let mut ctx = match HwContext::create(&dev, num_tiles) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("create hwctx: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(e) = ctx.configure_cus(&[(pdi.as_slice(), 0)]) {
+        eprintln!("configure_cus: {e}");
+        return ExitCode::FAILURE;
+    }
+
+    // Buffers: KV interleaved (2, 1024, [K|V], 128); Q element
+    // [Q_group(1024) | angles(128) | hdr(16)] x 2, header zero = full S.
+    const CAP: usize = 1024;
+    const STRIDE: usize = 8 * 128 + 128 + 16;
+    let kv_elems = 2 * CAP * 2 * 128;
+    let q_elems = 2 * STRIDE;
+    let o_elems = 16 * 128;
+    let mut kv_data = vec![0u16; kv_elems];
+    let mut q_data = vec![0u16; q_elems];
+    // Sharp-random mode (the real decode fingerprint): LCG bf16 data, K
+    // scaled up so softmax is peaked — a stale C_c/F read then shows up as
+    // a shrunken implied weight sum (O = Y/l losing mass), which the
+    // uniform recipe is blind to (all corrections are 1 there).
+    let lcg = |s: &mut u64| -> f32 {
+        *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((*s >> 33) as f32 / (1u64 << 31) as f32) - 1.0
+    };
+    let mut seed = 0x1234_5678_9abc_def0u64;
+    let mut kr_rows = vec![0f32; 2 * CAP * 128];
+    for h in 0..2usize {
+        for t in 0..CAP {
+            let krow = (h * CAP * 2 + t * 2) * 128;
+            for j in 0..128 {
+                let v = 3.0 * lcg(&mut seed);
+                kr_rows[(h * CAP + t) * 128 + j] = v;
+                kv_data[krow + j] = f32_to_bf16(v);
+            }
+            let vrow = krow + 128;
+            for j in 0..128 {
+                let v = lcg(&mut seed);
+                kv_data[vrow + j] = f32_to_bf16(v);
+            }
+        }
+    }
+    let mut q_rows = vec![0f32; 16 * 128];
+    for h in 0..16usize {
+        for j in 0..128 {
+            q_rows[h * 128 + j] = lcg(&mut seed);
+        }
+    }
+    for g in 0..2usize {
+        let base = g * STRIDE;
+        for j in 0..1024 {
+            q_data[base + j] = f32_to_bf16(q_rows[g * 1024 + j]);
+        }
+        let abase = base + 1024;
+        for p in 0..64 {
+            q_data[abase + 2 * p] = f32_to_bf16(1.0); // cos = 1
+            q_data[abase + 2 * p + 1] = f32_to_bf16(0.0); // sin = 0
+        }
+        // header stays zero: full compiled capacity
+    }
+    // f32 golden per head over the same bf16-rounded inputs.
+    let b16 = |x: f32| -> f32 { bf16_to_f32(f32_to_bf16(x)) };
+    let mut golden = vec![0f32; o_elems];
+    for h in 0..16usize {
+        let kvh = h / 8;
+        let mut sc = vec![0f32; CAP];
+        let mut mx = f32::NEG_INFINITY;
+        for t in 0..CAP {
+            let mut d = 0f32;
+            for j in 0..128 {
+                d += b16(kr_rows[(kvh * CAP + t) * 128 + j]) * b16(q_rows[h * 128 + j]);
+            }
+            sc[t] = d / (128f32).sqrt();
+            mx = mx.max(sc[t]);
+        }
+        let mut sum = 0f32;
+        for v in sc.iter_mut() {
+            *v = (*v - mx).exp();
+            sum += *v;
+        }
+        for j in 0..128 {
+            let mut acc = 0f32;
+            for t in 0..CAP {
+                let vrow = (kvh * CAP * 2 + t * 2) * 128 + 128;
+                acc += sc[t] * bf16_to_f32(kv_data[vrow + j]);
+            }
+            golden[h * 128 + j] = acc / sum;
+        }
+    }
+
+    let kv_bo = match BufferObject::new(&dev, BoType::Shmem, kv_elems * 2) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("kv BO: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut kv_map = match kv_bo.map_owned() {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("kv map: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    kv_map.as_mut_slice()
+        .copy_from_slice(&kv_data.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+    if let Err(e) = kv_bo.sync(SyncDirection::ToDevice, 0, kv_bo.size() as u64) {
+        eprintln!("kv sync: {e}");
+        return ExitCode::FAILURE;
+    }
+    let q_bo = match BufferObject::new(&dev, BoType::Shmem, q_elems * 2) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("q BO: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut q_map = match q_bo.map_owned() {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("q map: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    q_map.as_mut_slice()
+        .copy_from_slice(&q_data.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+    if let Err(e) = q_bo.sync(SyncDirection::ToDevice, 0, q_bo.size() as u64) {
+        eprintln!("q sync: {e}");
+        return ExitCode::FAILURE;
+    }
+    let o_bo = match BufferObject::new(&dev, BoType::Shmem, o_elems * 2) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("o BO: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let o_map = match o_bo.map_owned() {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("o map: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let op = match chain_op(
+        &dev,
+        "fk",
+        &instr,
+        0,
+        &[kv_map.as_ptr() as u64, q_map.as_ptr() as u64, o_map.as_ptr() as u64],
+    ) {
+        Some(o) => o,
+        None => {
+            eprintln!("op setup failed");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut op = op;
+    let handles = vec![op.ctrl_bo.handle(), kv_bo.handle(), q_bo.handle(), o_bo.handle()];
+
+    let mut t0 = std::time::Instant::now();
+    let mut first = std::time::Duration::ZERO;
+    let mut bad_iters = 0usize;
+    for it in 0..iters {
+        // First-exec O read race (notes §17): the O drain can lag the
+        // completion syncobj on the very first exec after PDI load, leaving
+        // partial/zero output in host RAM. XRT masks this by syncing the
+        // output BO ToDevice (clflush) before every submit — mirror that.
+        let _ = o_bo.sync(SyncDirection::ToDevice, 0, o_bo.size() as u64);
+        let seq = match op.pkt.submit(&dev, &ctx, &handles) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("submit (iter {it}): {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        if let Err(e) = syncobj_timeline_wait(&dev, ctx.syncobj_handle, seq, 10_000_000_000) {
+            eprintln!("wait (iter {it}, seq {seq}): {e}");
+            return ExitCode::FAILURE;
+        }
+        if it == 0 {
+            first = t0.elapsed();
+            t0 = std::time::Instant::now();
+        }
+        // Per-iteration check: is EVERY op corrupted, or only some? The
+        // corruption fingerprint (O ≈ a·golden, a != 1) reduces to one number
+        // per head: the lstsq scale a. Print per-head a per iteration.
+        let _ = o_bo.sync(SyncDirection::FromDevice, 0, o_bo.size() as u64);
+        let os = o_map.as_slice();
+        let mut msg = String::new();
+        let mut iter_bad = false;
+        for h in 0..16usize {
+            let mut sxy = 0f64;
+            let mut sxx = 0f64;
+            for j in 0..128 {
+                let v = bf16_to_f32(u16::from_le_bytes([os[(h * 128 + j) * 2], os[(h * 128 + j) * 2 + 1]])) as f64;
+                let g = golden[h * 128 + j] as f64;
+                sxy += v * g;
+                sxx += g * g;
+            }
+            let a = sxy / sxx.max(1e-12);
+            if (a - 1.0).abs() > 0.02 {
+                iter_bad = true;
+            }
+            if h < 8 {
+                msg.push_str(&format!("{a:.2} "));
+            }
+        }
+        if iter_bad {
+            bad_iters += 1;
+        }
+        println!("iter {it}: group0 scales [{msg}]{}", if iter_bad { " BAD" } else { " ok" });
+    }
+    let per = t0.elapsed() / (iters - 1).max(1) as u32;
+    let _ = o_bo.sync(SyncDirection::FromDevice, 0, o_bo.size() as u64);
+    let os = o_map.as_slice();
+    // Per-head rms vs the f32 golden — the per-head view catches sporadic
+    // single-head corruption that a global max would average away.
+    let mut worst = 0f32;
+    let mut nonfinite = 0usize;
+    let mut head_rms = vec![0f32; 16];
+    for h in 0..16usize {
+        let mut s = 0f64;
+        for j in 0..128 {
+            let v = bf16_to_f32(u16::from_le_bytes([os[(h * 128 + j) * 2], os[(h * 128 + j) * 2 + 1]]));
+            if !v.is_finite() {
+                nonfinite += 1;
+            }
+            let e = (v - golden[h * 128 + j]).abs();
+            worst = worst.max(e);
+            s += (e * e) as f64;
+        }
+        head_rms[h] = (s / 128.0).sqrt() as f32;
+    }
+    println!(
+        "first op {first:?}, steady {per:?}/op over {iters} iters; worst |O-golden| {worst:.4}, nonfinite {nonfinite}, bad-scale iters {bad_iters}"
+    );
+    let _ = std::fs::write(
+        "/tmp/fkp_o.bin",
+        os.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect::<Vec<u16>>()
+            .iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(),
+    );
+    let _ = std::fs::write(
+        "/tmp/fkp_g.bin",
+        golden.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(),
+    );
+    println!("per-head rms: {:?}", head_rms);
+    let clean = nonfinite == 0 && bad_iters == 0 && head_rms.iter().all(|r| *r < 0.02);
+    println!("-> {}", if clean { "PASS" } else { "FAIL" });
     ExitCode::SUCCESS
 }
 
