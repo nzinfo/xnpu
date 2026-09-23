@@ -178,6 +178,19 @@ fn main() -> ExitCode {
             };
             cmd_run_w4ulayer(&w4dir, layers, iters)
         }
+        Some("run-decode") => {
+            let decdir = args.get(1).cloned().unwrap_or_else(|| {
+                "/home/nzinfo/qwen/xnpu/build/dec".to_string()
+            });
+            let w4dir = args.get(2).cloned().unwrap_or_else(|| {
+                "/home/nzinfo/qwen/xnpu/build/w4u".to_string()
+            });
+            let iters = args
+                .get(3)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(5);
+            cmd_run_decode(&decdir, &w4dir, iters)
+        }
         Some("run-w4gemv") => {
             let prj = args.get(1).cloned().unwrap_or_else(|| {
                 "/home/nzinfo/qwen/xnpu/build/fused_dequant_gemv_2048x2048_1tsi_512tso_4col_g32.mlir.prj"
@@ -202,7 +215,7 @@ fn main() -> ExitCode {
         }
         _ => {
             eprintln!(
-                "usage: xnpu-cli <info | ctx-probe [max] [cols] | run-add [prj-dir] [bf16|i8] | run-gemm [prj-dir] [M K N] [bf16|i8] | run-multi [add-prj] [gemm-prj] [M K N] | run-pipe [prj-dir] [M K N] [iters] | run-chain [add-prj] [gemm-prj] [M K N] [reps] | run-q8 [gemm-prj] [rescale-prj] [M K N tile_m] [reps] | run-w4gemv [prj-dir] [M K] [group] [tsi] [iters] | run-w4layer [w4-dir] [layers] [iters] | run-w4ulayer [w4u-dir] [layers] [iters]>"
+                "usage: xnpu-cli <info | ctx-probe [max] [cols] | run-add [prj-dir] [bf16|i8] | run-gemm [prj-dir] [M K N] [bf16|i8] | run-multi [add-prj] [gemm-prj] [M K N] | run-pipe [prj-dir] [M K N] [iters] | run-chain [add-prj] [gemm-prj] [M K N] [reps] | run-q8 [gemm-prj] [rescale-prj] [M K N tile_m] [reps] | run-w4gemv [prj-dir] [M K] [group] [tsi] [iters] | run-w4layer [w4-dir] [layers] [iters] | run-w4ulayer [w4u-dir] [layers] [iters] | run-decode [dec-dir] [w4u-dir] [iters]>"
             );
             ExitCode::FAILURE
         }
@@ -3234,6 +3247,486 @@ fn cmd_run_w4ulayer(w4dir: &str, nlayers: usize, iters: usize) -> ExitCode {
             &bad
         );
     }
+
+    ExitCode::SUCCESS
+}
+
+/// ---- M3b decode-chain CPU glue (mirrors tools/decode_export.py exactly:
+/// f32 compute, one bf16 rounding per op boundary) ----
+
+fn rms_norm_bf16(x: &[u16], w: &[u16], out: &mut [u16]) {
+    let mut sum = 0f32;
+    for b in x.iter() {
+        let v = bf16_to_f32(*b);
+        sum += v * v;
+    }
+    let inv = 1f32 / (sum / x.len() as f32 + 1e-5).sqrt();
+    for i in 0..x.len() {
+        out[i] = f32_to_bf16(bf16_to_f32(x[i]) * inv * bf16_to_f32(w[i]));
+    }
+}
+
+fn add_bf16(a: &[u16], b: &[u16], out: &mut [u16]) {
+    for i in 0..a.len() {
+        out[i] = f32_to_bf16(bf16_to_f32(a[i]) + bf16_to_f32(b[i]));
+    }
+}
+
+/// silu(gate)*up for a fused [gate | up] vector.
+fn swiglu_bf16(x: &[u16], out: &mut [u16]) {
+    let half = x.len() / 2;
+    for i in 0..half {
+        let g = bf16_to_f32(x[i]);
+        let u = bf16_to_f32(x[half + i]);
+        out[i] = f32_to_bf16(g * (1.0 / (1.0 + (-g).exp())) * u);
+    }
+}
+
+/// Llama rotate-half rope tables at one position (inv_freq = base^(-j/64)).
+fn rope_table(pos: usize) -> ([f32; 64], [f32; 64]) {
+    let mut c = [0f32; 64];
+    let mut s = [0f32; 64];
+    for j in 0..64 {
+        let inv = (5e6f32).powf(-(j as f32) / 64.0);
+        let a = pos as f32 * inv;
+        c[j] = a.cos();
+        s[j] = a.sin();
+    }
+    (c, s)
+}
+
+fn rope_apply(x: &[u16], c: &[f32; 64], s: &[f32; 64], heads: usize, out: &mut [u16]) {
+    for h in 0..heads {
+        let o = h * 128;
+        for j in 0..64 {
+            let x1 = bf16_to_f32(x[o + j]);
+            let x2 = bf16_to_f32(x[o + 64 + j]);
+            out[o + j] = f32_to_bf16(x1 * c[j] - x2 * s[j]);
+            out[o + 64 + j] = f32_to_bf16(x2 * c[j] + x1 * s[j]);
+        }
+    }
+}
+
+/// GQA decode attention: q (16 heads, roped) against a (2, CACHE_SEQ, 128)
+/// cache; q head h reads kv head h/8. Scores/softmax/PV in f32, one bf16
+/// rounding at the output.
+fn attention_bf16(
+    q: &[u16],
+    kc: &[u16],
+    vc: &[u16],
+    pos: usize,
+    cache_seq: usize,
+    out: &mut [u16],
+) {
+    let s = pos + 1;
+    let mut sc = vec![0f32; s];
+    for h in 0..16usize {
+        let kv = h / 8;
+        let mut mx = f32::NEG_INFINITY;
+        for t in 0..s {
+            let off = (kv * cache_seq + t) * 128;
+            let mut d = 0f32;
+            for j in 0..128 {
+                d += bf16_to_f32(kc[off + j]) * bf16_to_f32(q[h * 128 + j]);
+            }
+            sc[t] = d / (128f32).sqrt();
+            mx = mx.max(sc[t]);
+        }
+        let mut sum = 0f32;
+        for v in sc[..s].iter_mut() {
+            *v = (*v - mx).exp();
+            sum += *v;
+        }
+        for j in 0..128 {
+            let mut acc = 0f32;
+            for t in 0..s {
+                let off = (kv * cache_seq + t) * 128;
+                acc += sc[t] * bf16_to_f32(vc[off + j]);
+            }
+            out[h * 128 + j] = f32_to_bf16(acc / sum);
+        }
+    }
+}
+
+/// M3b: one full 42-layer decode step over real weights — the engine
+/// skeleton. Projections run on the universal w4gemvu CU (run-w4ulayer
+/// machinery); rope, GQA attention, KV cache, rms-norm, swiglu and the
+/// residuals run in Rust (f32 math, bf16 boundaries — exactly what
+/// tools/decode_export.py's reference computes), so the final hidden must
+/// reproduce golden_hidden.bin to accumulation-order noise. The NPU MHA
+/// fixture is prefill-shaped (S_q tiles of 64); a universal decode-MHA
+/// (S_kv from a runtime header, the w4gemvu trick) is the M4 kernel that
+/// retires the CPU attention.
+fn cmd_run_decode(decdir: &str, w4dir: &str, iters: usize) -> ExitCode {
+    let build = "/home/nzinfo/qwen/xnpu/build";
+    println!(
+        "decode chain: 42 layers, w4gemvu projections on 1 CU + Rust glue, {iters} iters"
+    );
+
+    // Fixtures + PDI identity (same contract as run-w4ulayer).
+    let fixtures: Vec<(Vec<u8>, Vec<u8>, u32)> = W4U_SHAPES
+        .iter()
+        .map(|s| {
+            match load_fixture(&format!("{build}/w4gemvu_{}x{}.mlir.prj", s.m, s.k)) {
+                Some(f) => f,
+                None => {
+                    eprintln!("load fixture w4gemvu_{}x{} failed", s.m, s.k);
+                    std::process::exit(2);
+                }
+            }
+        })
+        .collect();
+    for (s, f) in W4U_SHAPES.iter().zip(&fixtures).skip(1) {
+        if f.0 != fixtures[0].0 {
+            eprintln!("PDI for {} differs — stale fixtures", s.name);
+            return ExitCode::FAILURE;
+        }
+    }
+
+    let dev = match Device::open_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("open amdxdna device: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let md = match dev.aie_metadata() {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("AIE metadata: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let cols = 8u32;
+    let num_tiles = cols * md.core.row_count as u32;
+    let mut ctx = match HwContext::create(&dev, num_tiles) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("create hwctx: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(e) = ctx.configure_cus(&[(fixtures[0].0.as_slice(), 0)]) {
+        eprintln!("configure_cus: {e}");
+        return ExitCode::FAILURE;
+    }
+
+    // Device buffers: replicated-x BOs, per-shape outputs, per-(layer,shape)
+    // weights. live layout: [xu2048, xu6144, c_qkv, c_o, c_gateup, c_down,
+    // w00.qkv, w00.o, ...].
+    let mut live: Vec<(BufferObject, Mapping)> = Vec::new();
+    if chain_tensor(&dev, &mut live, "xu2048", &vec![0u8; 24 * W4U_K_MAX * 2]).is_none()
+        || chain_tensor(&dev, &mut live, "xu6144", &vec![0u8; 4 * W4U_K_MAX * 2]).is_none()
+    {
+        eprintln!("x BO failed");
+        return ExitCode::FAILURE;
+    }
+    for s in W4U_SHAPES.iter() {
+        if chain_tensor(&dev, &mut live, &format!("c_{}", s.name), &vec![0u8; s.m * 2])
+            .is_none()
+        {
+            eprintln!("c_{} BO failed", s.name);
+            return ExitCode::FAILURE;
+        }
+    }
+    for n in 0..42usize {
+        for s in W4U_SHAPES.iter() {
+            let data = match std::fs::read(format!("{w4dir}/layer{n:02}_{}.bin", s.name)) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("read layer{n:02}_{}: {e}", s.name);
+                    return ExitCode::FAILURE;
+                }
+            };
+            if data.len() != 8 * (s.m / 32) * W4U_ELEM {
+                eprintln!("layer{n:02}_{}: stale import (use --layout v2)", s.name);
+                return ExitCode::FAILURE;
+            }
+            if chain_tensor(&dev, &mut live, &format!("w{n:02}.{}", s.name), &data).is_none() {
+                eprintln!("w{n:02}.{} BO failed", s.name);
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    let mut ops: Vec<ChainOp> = Vec::with_capacity(168);
+    for n in 0..42usize {
+        for (si, s) in W4U_SHAPES.iter().enumerate() {
+            let xv = live[if s.k == 6144 { 1 } else { 0 }].1.as_ptr() as u64;
+            match chain_op(
+                &dev,
+                &format!("{}L{n:02}", s.name),
+                &fixtures[si].1,
+                0,
+                &[live[6 + n * 4 + si].1.as_ptr() as u64, xv, live[2 + si].1.as_ptr() as u64],
+            ) {
+                Some(o) => ops.push(o),
+                None => {
+                    eprintln!("op setup layer{n:02} {} failed", s.name);
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+    }
+    let x_hdl = [live[0].0.handle(), live[1].0.handle()];
+    let c_hdl: Vec<u32> = (2..6).map(|i| live[i].0.handle()).collect();
+    let mut op_handles: Vec<Vec<u32>> = Vec::with_capacity(168);
+    for n in 0..42usize {
+        for si in 0..4 {
+            op_handles.push(vec![
+                ops[n * 4 + si].ctrl_bo.handle(),
+                live[6 + n * 4 + si].0.handle(),
+                x_hdl[if W4U_SHAPES[si].k == 6144 { 1 } else { 0 }],
+                c_hdl[si],
+            ]);
+        }
+    }
+
+    // Host state: norms, caches, x0, goldens.
+    let rd_u16file = |p: &str| -> Option<Vec<u16>> {
+        let d = std::fs::read(p).ok()?;
+        Some(d.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect())
+    };
+    let norms = match rd_u16file(&format!("{decdir}/norms.bin")) {
+        Some(v) if v.len() == 85 * 2048 => v,
+        _ => {
+            eprintln!("read {decdir}/norms.bin failed");
+            return ExitCode::FAILURE;
+        }
+    };
+    let x0 = match rd_u16file(&format!("{decdir}/x0.bin")) {
+        Some(v) if v.len() == 2048 => v,
+        _ => {
+            eprintln!("read {decdir}/x0.bin failed");
+            return ExitCode::FAILURE;
+        }
+    };
+    let cache_seq = 1024usize;
+    let mut kcache = match rd_u16file(&format!("{decdir}/kcache.bin")) {
+        Some(v) if v.len() == 42 * 2 * cache_seq * 128 => v,
+        _ => {
+            eprintln!("read kcache failed");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut vcache = match rd_u16file(&format!("{decdir}/vcache.bin")) {
+        Some(v) if v.len() == 42 * 2 * cache_seq * 128 => v,
+        _ => {
+            eprintln!("read vcache failed");
+            return ExitCode::FAILURE;
+        }
+    };
+    let golden_hidden = match rd_u16file(&format!("{decdir}/golden_hidden.bin")) {
+        Some(v) if v.len() == 2048 => v,
+        _ => {
+            eprintln!("read golden_hidden failed");
+            return ExitCode::FAILURE;
+        }
+    };
+    let pos = 100usize;
+    let (rc, rs) = rope_table(pos);
+
+    // One w4gemvu call: replicate x into the vector BO, submit, wait, read c.
+    let mut gemv = |ops: &mut [ChainOp], i: usize, si: usize, x: &[u16]| -> Option<Vec<u16>> {
+        let k = W4U_SHAPES[si].k;
+        let m = W4U_SHAPES[si].m;
+        let vi = if k == 6144 { 1 } else { 0 };
+        let slots = if vi == 0 { 24 } else { 4 };
+        {
+            let (bo, map) = &mut live[vi];
+            let bytes = map.as_mut_slice();
+            for s in 0..slots {
+                let base = s * W4U_K_MAX * 2;
+                for (j, b) in x.iter().enumerate() {
+                    bytes[base + j * 2..base + j * 2 + 2].copy_from_slice(&b.to_le_bytes());
+                }
+            }
+            if let Err(e) = bo.sync(SyncDirection::ToDevice, 0, bo.size() as u64) {
+                eprintln!("gemv x sync (op {i}): {e}");
+                return None;
+            }
+        }
+        let op = &mut ops[i];
+        let seq = match op.pkt.submit(&dev, &ctx, &op_handles[i]) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("gemv submit (op {i}): {e}");
+                return None;
+            }
+        };
+        if let Err(e) = syncobj_timeline_wait(&dev, ctx.syncobj_handle, seq, 10_000_000_000) {
+            eprintln!("gemv wait (op {i}, seq {seq}): {e}");
+            return None;
+        }
+        let (c_bo, c_map) = &live[2 + si];
+        // SHMEM is coherent; the direction-1 ioctl needs a debug BO (M1) —
+        // best-effort only, like every other read path here.
+        let _ = c_bo.sync(SyncDirection::FromDevice, 0, c_bo.size() as u64);
+        let cs = c_map.as_slice();
+        Some((0..m).map(|r| u16::from_le_bytes([cs[r * 2], cs[r * 2 + 1]])).collect())
+    };
+
+    // The decode step. Scratch lives outside the closure (passed per call)
+    // so the final-norm block can reuse xn after the last call.
+    struct Scratch {
+        xn: Vec<u16>,
+        qr: Vec<u16>,
+        kr: Vec<u16>,
+        attn: Vec<u16>,
+        gu: Vec<u16>,
+        sw: Vec<u16>,
+    }
+    let mut sc = Scratch {
+        xn: vec![0u16; 2048],
+        qr: vec![0u16; 2048],
+        kr: vec![0u16; 256],
+        attn: vec![0u16; 2048],
+        gu: vec![0u16; 12288],
+        sw: vec![0u16; 6144],
+    };
+    let mut x = x0.clone();
+    let mut first_bad: Option<usize> = None;
+    let mut decode_step = |ops: &mut [ChainOp],
+                       kcache: &mut [u16],
+                       vcache: &mut [u16],
+                       x: &mut Vec<u16>,
+                       sc: &mut Scratch,
+                       check: bool|
+     -> bool {
+        for n in 0..42usize {
+            let Scratch { xn, qr, kr, attn, gu, sw } = sc;
+            rms_norm_bf16(x, &norms[n * 2 * 2048..][..2048], xn);
+            let qkv = match gemv(ops, n * 4, 0, xn) {
+                Some(v) => v,
+                None => return false,
+            };
+            rope_apply(&qkv[..2048], &rc, &rs, 16, qr);
+            rope_apply(&qkv[2048..2304], &rc, &rs, 2, kr);
+            for kv in 0..2usize {
+                let off = (n * 2 + kv) * cache_seq * 128 + pos * 128;
+                kcache[off..off + 128].copy_from_slice(&kr[kv * 128..(kv + 1) * 128]);
+                vcache[off..off + 128]
+                    .copy_from_slice(&qkv[2304 + kv * 128..2304 + (kv + 1) * 128]);
+            }
+            let klo = n * 2 * cache_seq * 128;
+            attention_bf16(qr, &kcache[klo..], &vcache[klo..], pos, cache_seq, attn);
+            let o = match gemv(ops, n * 4 + 1, 1, attn) {
+                Some(v) => v,
+                None => return false,
+            };
+            add_bf16(x, &o, xn); // x = x + o (reuse xn as scratch)
+            std::mem::swap(x, xn);
+            rms_norm_bf16(x, &norms[(n * 2 + 1) * 2048..][..2048], xn);
+            *gu = match gemv(ops, n * 4 + 2, 2, xn) {
+                Some(v) => v,
+                None => return false,
+            };
+            swiglu_bf16(gu, sw);
+            let d = match gemv(ops, n * 4 + 3, 3, sw) {
+                Some(v) => v,
+                None => return false,
+            };
+            add_bf16(x, &d, xn);
+            std::mem::swap(x, xn);
+            if check {
+                let g = match rd_u16file(&format!("{decdir}/golden_L{n:02}.bin")) {
+                    Some(v) => v,
+                    None => return false,
+                };
+                // Same tolerance form as the gemv golden tier (plain rel err
+                // explodes on near-zero goldens).
+                let mut bad = 0usize;
+                let mut worst_rel = 0f32;
+                for i in 0..2048 {
+                    let gv = bf16_to_f32(x[i]);
+                    let e = (gv - bf16_to_f32(g[i])).abs();
+                    if e > 0.01 + 0.02 * gv.abs() {
+                        bad += 1;
+                    }
+                    worst_rel = worst_rel.max(e / (gv.abs() + 1e-6));
+                }
+                if bad > 16 && first_bad.is_none() {
+                    first_bad = Some(n);
+                    println!(
+                        "  first divergence at layer {n}: {bad}/2048 outside tolerance (worst rel {worst_rel:.3})"
+                    );
+                }
+            }
+        }
+        true
+    };
+
+    let mut t0 = std::time::Instant::now();
+    {
+        let mut ops2 = std::mem::take(&mut ops);
+        let ok = decode_step(&mut ops2, &mut kcache, &mut vcache, &mut x, &mut sc, true);
+        ops = ops2;
+        if !ok {
+            eprintln!("decode step failed");
+            return ExitCode::FAILURE;
+        }
+    }
+    let step1 = t0.elapsed();
+
+    // Final norm + verification.
+    rms_norm_bf16(&x, &norms[84 * 2048..][..2048], &mut sc.xn);
+    let _ = std::fs::write(
+        "/tmp/dec_hidden.bin",
+        (0..2048).flat_map(|i| sc.xn[i].to_le_bytes()).collect::<Vec<u8>>(),
+    );
+    let mut worst_abs = 0f32;
+    let mut sum_sq = 0f32;
+    let mut g_sq = 0f32;
+    let mut top: Vec<(usize, f32, f32)> = (0..2048)
+        .map(|i| {
+            let g = bf16_to_f32(sc.xn[i]);
+            let w = bf16_to_f32(golden_hidden[i]);
+            (i, (g - w).abs(), w)
+        })
+        .collect();
+    for i in 0..2048 {
+        let g = bf16_to_f32(sc.xn[i]);
+        let w = bf16_to_f32(golden_hidden[i]);
+        let e = (g - w).abs();
+        worst_abs = worst_abs.max(e);
+        sum_sq += e * e;
+        g_sq += w * w;
+    }
+    top.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let rms = (sum_sq / 2048.0).sqrt();
+    let grms = (g_sq / 2048.0).sqrt();
+    println!(
+        "final hidden vs reference: rms {:.4} ({:.1}% of golden rms {:.3}), max abs {:.4} -> {}",
+        rms,
+        100.0 * rms / grms,
+        grms,
+        worst_abs,
+        // Gate on rms relative to the reference's own magnitude — the honest
+        // drift metric (max-rel is meaningless on near-zero goldens).
+        if rms < 0.05 * grms { "PASS" } else { "FAIL" }
+    );
+    for (i, e, w) in top.iter().take(3) {
+        println!("  largest diff @[{i}]: |err| {e:.4} on golden {w:.4} ({:.1}%)", 100.0 * e / w.abs().max(1e-9));
+    }
+
+    // Timed iterations (steady state; caches are idempotent at fixed pos).
+    t0 = std::time::Instant::now();
+    for _ in 0..iters {
+        let mut ops2 = std::mem::take(&mut ops);
+        let ok = decode_step(&mut ops2, &mut kcache, &mut vcache, &mut x, &mut sc, false);
+        ops = ops2;
+        if !ok {
+            eprintln!("timed decode step failed");
+            return ExitCode::FAILURE;
+        }
+    }
+    let per = t0.elapsed() / iters as u32;
+    println!(
+        "decode step: first (checked) {:?}, steady {:.2?} /token ({:.1} tok/s)",
+        step1,
+        per,
+        1e3 / per.as_secs_f64() / 1e3
+    );
+    println!("  (CPU: rope+GQA attention+norms+swiglu; NPU: 168 w4gemvu on 1 CU)");
 
     ExitCode::SUCCESS
 }
