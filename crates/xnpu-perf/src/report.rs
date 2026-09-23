@@ -4,9 +4,10 @@
 //! 判定规则（P1 阈值，校准后可调）：
 //! - `overhead-dominated`：solo ≥ 2×burst —— 一半以上墙钟花在 submit/wait 往返
 //! - `compute-bound`：GFLOP/s ≥ 50% peak（peak 未知则跳过该维度）
-//! - `memory-bound`：stream GB/s ≥ 50% bw_stream
+//! - `memory-bound`：stream GB/s ≥ 50% bw_stream（无替代口径时按 useful 算）
 //! - `latency-bound`：stream GB/s < 10% bw_stream 且 burst 已剥离 overhead
 //! - `n/a-bytes`：没给 OpMeta，只有时间没有分母
+//! - `no-timing`：有字节计数但没有任何 solo/burst 计时
 //! - 其余 `mixed`
 //!
 //! 块归属规则：块窗口 `[t_start, t_complete]` 内的 burst 事件若只有唯一
@@ -43,9 +44,11 @@ impl OpStats {
         Some(self.useful_bytes as f64 / (1000.0 * self.device_time_us()?))
     }
 
-    /// 设备实际流量的口径（如 w4 padded slot 流）。
+    /// 设备实际流量的口径（如 w4 padded slot 流）；无替代口径时退回
+    /// useful（无 padding 的 op 两者同义）。
     pub fn achieved_stream_gbps(&self) -> Option<f64> {
-        Some(self.stream_bytes? as f64 / (1000.0 * self.device_time_us()?))
+        let b = self.stream_bytes.unwrap_or(self.useful_bytes);
+        Some(b as f64 / (1000.0 * self.device_time_us()?))
     }
 
     pub fn gflops(&self) -> Option<f64> {
@@ -61,16 +64,17 @@ impl OpStats {
         if self.n_solo == 0 && self.n_burst == 0 {
             return "no-data".into();
         }
-        if let (Some(s), Some(b)) = (self.solo_med_us, self.burst_us_per_op) {
-            if b > 0.0 && s >= 2.0 * b {
+        if self.useful_bytes == 0 {
+            return "n/a-bytes".into();
+        }
+        if let (Some(s), Some(b)) = (self.solo_med_us, self.burst_us_per_op)
+            && b > 0.0 && s >= 2.0 * b {
                 return "overhead-dominated".into();
             }
-        }
-        if let Some(peak) = m.peak_gflops {
-            if self.gflops().is_some_and(|f| f >= 0.5 * peak) {
+        if let Some(peak) = m.peak_gflops
+            && self.gflops().is_some_and(|f| f >= 0.5 * peak) {
                 return "compute-bound".into();
             }
-        }
         if let Some(g) = self.achieved_stream_gbps() {
             if g >= 0.5 * m.bw_stream_gbps {
                 return "memory-bound".into();
@@ -80,7 +84,8 @@ impl OpStats {
             }
             return "mixed".into();
         }
-        "n/a-bytes".into()
+        // 有字节计数但没有任何可用计时（如链式块里的 op 只进了链统计）
+        "no-timing".into()
     }
 
     pub fn to_json_value(&self, m: &MachineModel) -> String {
@@ -315,7 +320,7 @@ pub fn render_markdown(
     }
 
     md.push_str("\n## 判定规则\n\n");
-    md.push_str("overhead-dominated: solo ≥ 2×burst；compute-bound: GF/s ≥ 50% peak；memory-bound: stream GB/s ≥ 50% bw_stream；latency-bound: stream GB/s < 10% bw_stream（burst 口径）；无 OpMeta → n/a-bytes。\n\n");
+    md.push_str("overhead-dominated: solo ≥ 2×burst；compute-bound: GF/s ≥ 50% peak；memory-bound: stream GB/s ≥ 50% bw_stream；latency-bound: stream GB/s < 10% bw_stream（burst 口径）；无 OpMeta → n/a-bytes；有字节无计时 → no-timing。\n\n");
     md.push_str("时间语义：t_complete = syncobj timeline wait 返回时刻（notes §17）；solo = submit+wait 墙钟上界，burst = 同 op 连发块 drain/n。\n");
 
     (md, summary)

@@ -4272,6 +4272,21 @@ fn cmd_run_fkprobe(prj: &str, iters: usize) -> ExitCode {
     let mut op = op;
     let handles = vec![op.ctrl_bo.handle(), kv_bo.handle(), q_bo.handle(), o_bo.handle()];
 
+    // M5a xnpu-perf: flowkv 单 op 的字节/FLOP 计数（S header=0 → 满编译
+    // 容量，KV 全量 1MB 流量）。flops = 16 头 × 1024 pos × (QK+PV 各 128) × 2。
+    let mut fk_meta = OpMeta::new(
+        "flowkv",
+        "attn",
+        0,
+        (kv_elems + q_elems) as u64 * 2, // kv + q 输入字节
+        (o_elems * 2) as u64,            // O 输出（字节）
+        (16 * CAP * 128 * 2 * 2) as u64,
+    );
+    fk_meta.bytes_stream = None; // 无 slot padding，stream 与 useful 同口径
+    let metas = [fk_meta.clone()];
+    let mut rec = Recorder::new();
+    let mut rec_seq = 0u64;
+
     let mut t0 = std::time::Instant::now();
     let mut first = std::time::Duration::ZERO;
     let mut bad_iters = 0usize;
@@ -4281,6 +4296,7 @@ fn cmd_run_fkprobe(prj: &str, iters: usize) -> ExitCode {
         // partial/zero output in host RAM. XRT masks this by syncing the
         // output BO ToDevice (clflush) before every submit — mirror that.
         let _ = o_bo.sync(SyncDirection::ToDevice, 0, o_bo.size() as u64);
+        let ts = std::time::Instant::now();
         let seq = match op.pkt.submit(&dev, &ctx, &handles) {
             Ok(s) => s,
             Err(e) => {
@@ -4292,6 +4308,8 @@ fn cmd_run_fkprobe(prj: &str, iters: usize) -> ExitCode {
             eprintln!("wait (iter {it}, seq {seq}): {e}");
             return ExitCode::FAILURE;
         }
+        rec.solo(&fk_meta, it as u32, ts, rec_seq);
+        rec_seq += 1;
         if it == 0 {
             first = t0.elapsed();
             t0 = std::time::Instant::now();
@@ -4361,6 +4379,53 @@ fn cmd_run_fkprobe(prj: &str, iters: usize) -> ExitCode {
     println!("per-head rms: {:?}", head_rms);
     let clean = nonfinite == 0 && bad_iters == 0 && head_rms.iter().all(|r| *r < 0.02);
     println!("-> {}", if clean { "PASS" } else { "FAIL" });
+
+    // M5a burst 相位：同 op 连发不等待，drain 于最后一个 syncobj——纯设备
+    // 时间口径（solo 含 submit/wait 往返，两者差 = overhead 判定输入）。
+    const BURST_N: usize = 24;
+    let tb = std::time::Instant::now();
+    let mut last_seq = 0u64;
+    for _ in 0..BURST_N {
+        let _ = o_bo.sync(SyncDirection::ToDevice, 0, o_bo.size() as u64);
+        match op.pkt.submit(&dev, &ctx, &handles) {
+            Ok(s) => {
+                last_seq = s;
+                rec.burst_submit(&fk_meta, 0, rec_seq);
+                rec_seq += 1;
+            }
+            Err(e) => {
+                eprintln!("burst submit: {e}");
+                break;
+            }
+        }
+    }
+    if last_seq > 0 {
+        if let Err(e) = syncobj_timeline_wait(&dev, ctx.syncobj_handle, last_seq, 10_000_000_000) {
+            eprintln!("burst wait: {e}");
+        } else {
+            rec.burst_done("flowkv", Mode::Burst, 0, tb, BURST_N as u32, BURST_N as u32);
+        }
+    }
+
+    let model = MachineModel::default();
+    let title = format!("run-fkprobe: flowkv 16h/2kv d128 S=1024, {iters} solo + {BURST_N} burst");
+    let (md, summary) = xnpu_perf::render_markdown(&rec, &metas, &model, &title);
+    println!("\n{md}");
+    let dir = "/home/nzinfo/qwen/xnpu/build/perf";
+    if std::fs::create_dir_all(dir).is_ok() {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let stem = format!("{dir}/fkprobe_{ts}");
+        let json = trace_json(&rec, &model, &title, &summary);
+        match std::fs::write(format!("{stem}.json"), json)
+            .and_then(|()| std::fs::write(format!("{stem}.md"), &md))
+        {
+            Ok(()) => println!("perf trace written: {stem}.json / .md"),
+            Err(e) => eprintln!("perf trace write failed: {e}"),
+        }
+    }
     ExitCode::SUCCESS
 }
 
