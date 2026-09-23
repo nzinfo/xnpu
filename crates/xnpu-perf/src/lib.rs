@@ -16,7 +16,7 @@
 pub mod model;
 pub mod report;
 
-pub use model::MachineModel;
+pub use model::{tier, MachineModel};
 pub use report::{render_markdown, OpStats, ReportSummary};
 
 use std::time::Instant;
@@ -37,6 +37,10 @@ pub struct OpMeta {
     pub flops: u64,
     /// 设备侧实际流量的替代口径（None = 与有用流量同）。
     pub bytes_stream: Option<u64>,
+    /// 带宽分档标签（[`crate::model::tier`]；None = 机器模型 default_tier）。
+    /// 同一台机器上不同访问粒度的天花板差 40×（seq-dma 52 vs strided
+    /// 1.2 GB/s），op 必须认领自己的档，%bw 才有意义（P6）。
+    pub tier: Option<String>,
 }
 
 impl OpMeta {
@@ -56,7 +60,14 @@ impl OpMeta {
             bytes_out,
             flops,
             bytes_stream: None,
+            tier: None,
         }
+    }
+
+    /// 认领带宽分档（builder：`OpMeta::new(..).with_tier(tier::STRIDED)`）。
+    pub fn with_tier(mut self, tier: impl Into<String>) -> Self {
+        self.tier = Some(tier.into());
+        self
     }
 
     pub fn useful_bytes(&self) -> u64 {
@@ -192,7 +203,7 @@ impl Default for Recorder {
 
 // ---- 手写 JSON（保持 workspace 零外部依赖） ----
 
-fn jstr(s: &str) -> String {
+pub fn jstr(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for c in s.chars() {

@@ -17,6 +17,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "xnpu-ftrace"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "xnpu-hal"
 version = "0.1.0"
 dependencies = [

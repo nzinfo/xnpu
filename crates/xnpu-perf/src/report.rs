@@ -1,11 +1,11 @@
 //! 报告层：把 Recorder 的原始时间线与 OpMeta 的字节/FLOP 计数合成
 //! per-op 对比表 + roofline 判定。
 //!
-//! 判定规则（P1 阈值，校准后可调）：
+//! 判定规则（P1 阈值，校准后可调；P6 起带宽按 op 认领的 tier 取分母）：
 //! - `overhead-dominated`：solo ≥ 2×burst —— 一半以上墙钟花在 submit/wait 往返
 //! - `compute-bound`：GFLOP/s ≥ 50% peak（peak 未知则跳过该维度）
-//! - `memory-bound`：stream GB/s ≥ 50% bw_stream（无替代口径时按 useful 算）
-//! - `latency-bound`：stream GB/s < 10% bw_stream 且 burst 已剥离 overhead
+//! - `memory-bound`：stream GB/s ≥ 50% 所认领 tier 的天花板（无替代口径时按 useful 算）
+//! - `latency-bound`：stream GB/s < 10% 该档天花板 且 burst 已剥离 overhead
 //! - `n/a-bytes`：没给 OpMeta，只有时间没有分母
 //! - `no-timing`：有字节计数但没有任何 solo/burst 计时
 //! - 其余 `mixed`
@@ -23,6 +23,8 @@ pub struct OpStats {
     pub name: String,
     pub family: String,
     pub cu: u32,
+    /// 认领的带宽分档（OpMeta.tier；None = default_tier）。
+    pub tier: Option<String>,
     pub n_solo: u32,
     pub solo_min_us: Option<f64>,
     pub solo_med_us: Option<f64>,
@@ -76,10 +78,11 @@ impl OpStats {
                 return "compute-bound".into();
             }
         if let Some(g) = self.achieved_stream_gbps() {
-            if g >= 0.5 * m.bw_stream_gbps {
+            let ceiling = self.bw_ceiling_gbps(m); // 分档天花板（P6）
+            if g >= 0.5 * ceiling {
                 return "memory-bound".into();
             }
-            if g < 0.1 * m.bw_stream_gbps && self.burst_us_per_op.is_some() {
+            if g < 0.1 * ceiling && self.burst_us_per_op.is_some() {
                 return "latency-bound".into();
             }
             return "mixed".into();
@@ -88,12 +91,25 @@ impl OpStats {
         "no-timing".into()
     }
 
+    /// 该 op 认领档位的天花板（tier 缺失 → default_tier，P6）。
+    pub fn bw_ceiling_gbps(&self, m: &MachineModel) -> f64 {
+        m.bw_for(self.tier.as_deref())
+    }
+
     pub fn to_json_value(&self, m: &MachineModel) -> String {
         let opt = |v: Option<f64>| v.map(crate::jnum).unwrap_or_else(|| "null".into());
         json_obj(&[
             ("name", crate::jstr(&self.name)),
             ("family", crate::jstr(&self.family)),
             ("cu", self.cu.to_string()),
+            (
+                "tier",
+                self.tier
+                    .as_deref()
+                    .map(crate::jstr)
+                    .unwrap_or_else(|| "null".into()),
+            ),
+            ("bw_ceiling_gbps", crate::jnum(self.bw_ceiling_gbps(m))),
             ("n_solo", self.n_solo.to_string()),
             ("solo_min_us", opt(self.solo_min_us)),
             ("solo_med_us", opt(self.solo_med_us)),
@@ -125,6 +141,11 @@ pub struct ChainStats {
     pub wall_us: f64,
     /// 块窗口内出现过的不同 op 名集合（Δ 串行估计与覆盖倍数用）。
     pub names: Vec<String>,
+    /// 跨块 per-iter 墙钟分布（min/med/max；P6：均值会被单个慢 iter
+    /// 拉偏，min 才是设备极限的口径）。
+    pub per_iter_min_us: Option<f64>,
+    pub per_iter_med_us: Option<f64>,
+    pub per_iter_max_us: Option<f64>,
 }
 
 impl ChainStats {
@@ -164,6 +185,7 @@ impl ReportSummary {
             .chains
             .iter()
             .map(|c| {
+                let opt = |v: Option<f64>| v.map(crate::jnum).unwrap_or_else(|| "null".into());
                 json_obj(&[
                     ("label", crate::jstr(&c.label)),
                     ("mode", crate::jstr(c.mode.as_str())),
@@ -171,6 +193,9 @@ impl ReportSummary {
                     ("iters", c.iters.to_string()),
                     ("wall_us", crate::jnum(c.wall_us)),
                     ("per_iter_us", crate::jnum(c.per_iter_us())),
+                    ("per_iter_min_us", opt(c.per_iter_min_us)),
+                    ("per_iter_med_us", opt(c.per_iter_med_us)),
+                    ("per_iter_max_us", opt(c.per_iter_max_us)),
                     ("per_submit_us", crate::jnum(c.per_submit_us())),
                     ("coverage", crate::jnum(c.coverage())),
                 ])
@@ -210,9 +235,8 @@ pub fn render_markdown(
     let mut md = String::new();
     md.push_str(&format!("# {title}\n\n"));
     md.push_str(&format!(
-        "机器模型 **{}**：bw_stream {:.1} GB/s，cu_switch {:.0} µs，submit_overhead {:.0} µs，peak_gflops {}\n\n",
+        "机器模型 **{}**：cu_switch {:.0} µs，submit_overhead {:.0} µs，peak_gflops {}\n\n",
         model.name,
-        model.bw_stream_gbps,
         model.cu_switch_reload_us,
         model.submit_overhead_us,
         model
@@ -220,12 +244,21 @@ pub fn render_markdown(
             .map(|p| format!("{p:.0}"))
             .unwrap_or_else(|| "未知".into())
     ));
+    md.push_str(&format!(
+        "带宽分档（default_tier = **{}**；遗留单锚 {:.1} GB/s 仅兜底）：\n\n",
+        model.default_tier, model.bw_stream_gbps
+    ));
+    md.push_str("| tier | 天花板 GB/s |\n|---|---|\n");
+    for (t, v) in &model.bw_tiers {
+        md.push_str(&format!("| {}{} | {:.1} |\n", t, if *t == model.default_tier { " (default)" } else { "" }, v));
+    }
+    md.push('\n');
     md.push_str(&format!("常数来源：{}\n\n", model.provenance));
 
     // ---- per-op 表 ----
     md.push_str("## Per-op\n\n");
-    md.push_str("| op | cu | solo µs (n) | burst/op µs (n) | ovh µs | useful B | stream B | GB/s use | GB/s str | %bw | GF/s | verdict |\n");
-    md.push_str("|---|---|---|---|---|---|---|---|---|---|---|---|\n");
+    md.push_str("| op | cu | tier | solo µs (n) | burst/op µs (n) | ovh µs | useful B | stream B | GB/s use | GB/s str | %bw | GF/s | verdict |\n");
+    md.push_str("|---|---|---|---|---|---|---|---|---|---|---|---|---|\n");
     for o in &summary.ops {
         let dash = || "–".to_string();
         let solo = o.solo_med_us.map(|v| format!("{v:.1}")).unwrap_or_else(dash);
@@ -234,6 +267,7 @@ pub fn render_markdown(
             .map(|v| format!("{v:.1}"))
             .unwrap_or_else(dash);
         let ovh = o.overhead_us().map(|v| format!("{v:.1}")).unwrap_or_else(dash);
+        let tier = o.tier.clone().unwrap_or_else(|| "·".into());
         let useful = if o.useful_bytes > 0 {
             crate::ju64(o.useful_bytes)
         } else {
@@ -253,13 +287,15 @@ pub fn render_markdown(
             .unwrap_or_else(dash);
         let bw_pct = o
             .achieved_stream_gbps()
-            .map(|g| format!("{:.0}", 100.0 * g / model.bw_stream_gbps))
+            .zip(Some(o.bw_ceiling_gbps(model)))
+            .map(|(g, ceil)| format!("{:.0}", 100.0 * g / ceil))
             .unwrap_or_else(dash);
         let gfs = o.gflops().map(|v| format!("{v:.1}")).unwrap_or_else(dash);
         md.push_str(&format!(
-            "| {} | {} | {} ({}) | {} ({}) | {} | {} | {} | {} | {} | {}% | {} | {} |\n",
+            "| {} | {} | {} | {} ({}) | {} ({}) | {} | {} | {} | {} | {} | {}% | {} | {} |\n",
             o.name,
             o.cu,
+            tier,
             solo,
             o.n_solo,
             burst,
@@ -275,6 +311,51 @@ pub fn render_markdown(
         ));
     }
 
+    // ---- submit 开销分档（solo−burst 按流大小桶；P6） ----
+    // 单一 55µs 常数把两件事混在一起：纯 host 往返（小 op）与
+    // solo 排队时撞上的 CU 切换/PDI 重载（大 op 更显）。按 op 的
+    // 设备侧流量分桶后，各桶的 solo−burst 中位数才是可用的常数。
+    {
+        const BUCKETS: [(&str, u64, u64); 4] = [
+            ("<1MiB", 0, 1 << 20),
+            ("1-4MiB", 1 << 20, 4 << 20),
+            ("4-16MiB", 4 << 20, 16 << 20),
+            (">=16MiB", 16 << 20, u64::MAX),
+        ];
+        let mut rows: Vec<(&str, usize, Option<f64>)> = Vec::new();
+        for (label, lo, hi) in BUCKETS {
+            let mut ovhs: Vec<f64> = summary
+                .ops
+                .iter()
+                .filter(|o| {
+                    let b = o.stream_bytes.unwrap_or(o.useful_bytes);
+                    b >= lo && b < hi
+                })
+                .filter_map(|o| o.overhead_us())
+                .collect();
+            if ovhs.is_empty() {
+                continue;
+            }
+            ovhs.sort_by(|a, b| a.total_cmp(b));
+            rows.push((label, ovhs.len(), median(&ovhs)));
+        }
+        if !rows.is_empty() {
+            md.push_str("\n## submit 开销分档（solo − burst，按设备侧流量）\n\n");
+            md.push_str(&format!(
+                "| 流量桶 | n ops | 中位 ovh µs | vs 常数 {:.0}µs |\n|---|---|---|---|\n",
+                model.submit_overhead_us
+            ));
+            for (label, n, med) in &rows {
+                let med_s = med.map(|v| format!("{v:.1}")).unwrap_or_else(|| "–".into());
+                let ratio = med
+                    .map(|v| format!("{:+.0}%", 100.0 * (v / model.submit_overhead_us - 1.0)))
+                    .unwrap_or_else(|| "–".into());
+                md.push_str(&format!("| {} | {} | {} | {} |\n", label, n, med_s, ratio));
+            }
+            md.push_str("\n显著高于常数的桶 = solo 里混进了 CU 切换/其他排队效应，不只是 host 往返。\n");
+        }
+    }
+
     // ---- 链式块 ----
     if !summary.chains.is_empty() {
         // 名字 → solo_med 查表（串行估计用；Δ 需要链内每个 op 都有 solo 数据）
@@ -284,11 +365,15 @@ pub fn render_markdown(
             .filter_map(|o| o.solo_med_us.map(|v| (o.name.as_str(), v)))
             .collect();
         md.push_str("\n## 链式块\n\n");
-        md.push_str("| label | mode | subm/iter | iters | wall µs | µs/iter | µs/submit | cov | serial est µs | Δ(iter−serial) |\n");
-        md.push_str("|---|---|---|---|---|---|---|---|---|---|\n");
+        md.push_str("| label | mode | subm/iter | iters | wall µs | µs/iter mean | µs/iter min/med/max | µs/submit | cov | serial est µs | Δ(iter−serial) |\n");
+        md.push_str("|---|---|---|---|---|---|---|---|---|---|---|\n");
         for c in &summary.chains {
             let per_iter = c.per_iter_us();
             let cov = c.coverage();
+            let mmm = match (c.per_iter_min_us, c.per_iter_med_us, c.per_iter_max_us) {
+                (Some(lo), Some(me), Some(hi)) => format!("{lo:.1}/{me:.1}/{hi:.1}"),
+                _ => "–".into(),
+            };
             let serial: Option<f64> = if c.names.is_empty() {
                 None
             } else {
@@ -305,13 +390,14 @@ pub fn render_markdown(
                 .map(|s| format!("{:+.1}", per_iter - s))
                 .unwrap_or_else(|| "–".into());
             md.push_str(&format!(
-                "| {} | {} | {:.0} | {} | {:.1} | {:.1} | {:.2} | {:.1} | {} | {} |\n",
+                "| {} | {} | {:.0} | {} | {:.1} | {:.1} | {} | {:.2} | {:.1} | {} | {} |\n",
                 c.label,
                 c.mode.as_str(),
                 c.n_submits as f64 / c.iters.max(1) as f64,
                 c.iters,
                 c.wall_us,
                 per_iter,
+                mmm,
                 c.per_submit_us(),
                 cov,
                 serial_s,
@@ -320,10 +406,11 @@ pub fn render_markdown(
         }
         md.push_str("\nserial est = Σ solo_med(链内各 op) × cov（cov = 每 iter 每 op 覆盖次数）。\n");
         md.push_str("Δ < 0 = 流水重叠收益；Δ > 0 = 每 iter 多出的调度/host 开销（含 CU 切换 PDI 重载、syncobj 等待）。\n");
+        md.push_str("min/med/max = 跨块 per-iter 墙钟分布（min ≈ 设备极限口径，mean 会被慢 iter 拉偏）。\n");
     }
 
     md.push_str("\n## 判定规则\n\n");
-    md.push_str("overhead-dominated: solo ≥ 2×burst；compute-bound: GF/s ≥ 50% peak；memory-bound: stream GB/s ≥ 50% bw_stream；latency-bound: stream GB/s < 10% bw_stream（burst 口径）；无 OpMeta → n/a-bytes；有字节无计时 → no-timing。\n\n");
+    md.push_str("overhead-dominated: solo ≥ 2×burst；compute-bound: GF/s ≥ 50% peak；memory-bound: stream GB/s ≥ 50% 所认领 tier 的天花板；latency-bound: stream GB/s < 10% 该档天花板（burst 口径）；无 OpMeta → n/a-bytes；有字节无计时 → no-timing。\n\n");
     md.push_str("时间语义：t_complete = syncobj timeline wait 返回时刻（notes §17）；solo = submit+wait 墙钟上界，burst = 同 op 连发块 drain/n。\n");
 
     (md, summary)
@@ -338,12 +425,19 @@ fn summarize(rec: &Recorder, metas: &[OpMeta]) -> ReportSummary {
 
     // 块归属：窗口内事件（任意模式）的 op 名集合
     let mut per_op_burst: BTreeMap<&str, (f64, u32)> = BTreeMap::new(); // (wall_sum, submits)
+    // 同标签链式块的 per-iter 墙钟样本（min/med/max 分布用）
+    let mut chain_walls: BTreeMap<(String, Mode), Vec<f64>> = BTreeMap::new();
     let mut chain_map: BTreeMap<(String, Mode), ChainStats> = BTreeMap::new();
     for b in &rec.blocks {
+        // 半开区间 [t_start, t_complete)：µs 分辨率下，块完成时刻可能与
+        // 紧随其后的下一 op 首个 submit 同微秒（wait 返回 → 打戳 → 立即
+        // submit），闭区间会把外来事件吞进来（P6 实测踩中：gateup 块吞了
+        // down 的首个 solo，被误判成链式块）。块自己的最后一个 submit
+        // 至少早完成一个设备 op，不会撞上界。
         let names: BTreeSet<&str> = rec
             .events
             .iter()
-            .filter(|e| e.t_submit_us >= b.t_start_us && e.t_submit_us <= b.t_complete_us)
+            .filter(|e| e.t_submit_us >= b.t_start_us && e.t_submit_us < b.t_complete_us)
             .map(|e| e.name.as_str())
             .collect();
         let wall = (b.t_complete_us - b.t_start_us) as f64;
@@ -362,10 +456,17 @@ fn summarize(rec: &Recorder, metas: &[OpMeta]) -> ReportSummary {
                     iters: 0,
                     wall_us: 0.0,
                     names: Vec::new(),
+                    per_iter_min_us: None,
+                    per_iter_med_us: None,
+                    per_iter_max_us: None,
                 });
             e.n_submits += b.n_submits;
             e.iters += b.iters;
             e.wall_us += wall;
+            chain_walls
+                .entry((b.label.clone(), b.mode))
+                .or_default()
+                .push(wall / b.iters.max(1) as f64);
             for n in &names {
                 if !e.names.iter().any(|x| x == n) {
                     e.names.push(n.to_string());
@@ -373,7 +474,15 @@ fn summarize(rec: &Recorder, metas: &[OpMeta]) -> ReportSummary {
             }
         }
     }
-    let chains: Vec<ChainStats> = chain_map.into_values().collect();
+    let mut chains: Vec<ChainStats> = chain_map.into_values().collect();
+    for c in &mut chains {
+        if let Some(w) = chain_walls.get_mut(&(c.label.clone(), c.mode)) {
+            w.sort_by(|a, b| a.total_cmp(b));
+            c.per_iter_min_us = w.first().copied();
+            c.per_iter_med_us = median(w);
+            c.per_iter_max_us = w.last().copied();
+        }
+    }
 
     let mut ops: Vec<OpStats> = Vec::new();
     for (name, ev_list) in &evs {
@@ -387,14 +496,22 @@ fn summarize(rec: &Recorder, metas: &[OpMeta]) -> ReportSummary {
         let n_burst = ev_list.iter().filter(|e| e.mode == Mode::Burst).count() as u32;
         let burst_us_per_op = per_op_burst.get(name).map(|(w, n)| w / (*n as f64));
         let meta = metas.iter().find(|m| m.name == *name);
-        let (family, cu, useful, stream, flops) = match meta {
-            Some(m) => (m.family.clone(), m.cu, m.useful_bytes(), m.bytes_stream, m.flops),
-            None => (ev_list[0].family.clone(), ev_list[0].cu, 0, None, 0),
+        let (family, cu, useful, stream, flops, tier) = match meta {
+            Some(m) => (
+                m.family.clone(),
+                m.cu,
+                m.useful_bytes(),
+                m.bytes_stream,
+                m.flops,
+                m.tier.clone(),
+            ),
+            None => (ev_list[0].family.clone(), ev_list[0].cu, 0, None, 0, None),
         };
         ops.push(OpStats {
             name: name.to_string(),
             family,
             cu,
+            tier,
             n_solo,
             solo_min_us: solo_d.first().copied(),
             solo_med_us: median(&solo_d),
@@ -495,6 +612,84 @@ mod tests {
         for o in &summary.ops {
             assert!(o.burst_us_per_op.is_none());
         }
+    }
+
+    /// P6：tier 认领决定 verdict 分母 —— 同样的 achieved GB/s，认领
+    /// slot-stream（43）是 memory-bound，认领 strided（1.2）是 latency
+    /// 越档（>100% 也允许，报告如实呈现）。
+    #[test]
+    fn tier_tag_selects_verdict_denominator() {
+        let mut rec = Recorder::new();
+        // 20 MB 流 / 500 µs burst = 40 GB/s
+        let meta = OpMeta::new("slotop", "w4gemvu", 0, 20_000_000, 0, 0)
+            .with_tier(crate::tier::SLOT_STREAM);
+        for i in 0..4u32 {
+            let ts = Instant::now();
+            sleep(Duration::from_micros(600));
+            rec.solo(&meta, i, ts, i as u64);
+        }
+        let t0 = Instant::now(); // 块窗口锚点在 solo 之后，只覆盖 burst
+        for i in 0..8u32 {
+            rec.burst_submit(&meta, i, i as u64);
+            sleep(Duration::from_micros(500));
+        }
+        rec.burst_done("slotop", Mode::Burst, 0, t0, 8, 8);
+        let (_, summary) = render_markdown(&rec, &[meta.clone()], &MachineModel::default(), "t");
+        let st = summary.ops.iter().find(|o| o.name == "slotop").unwrap();
+        assert_eq!(st.tier.as_deref(), Some(crate::tier::SLOT_STREAM));
+        // 40 GB/s vs slot 43 天花板 = 93% ≥ 50% → memory-bound
+        assert_eq!(st.verdict(&MachineModel::default()), "memory-bound");
+
+        // 同带宽认领 seq-dma（52）：40/52 = 77% 仍 memory-bound；但 30 GB/s
+        // 时 30/52 = 58% memory-bound 而 30/43 = 70% 也 memory-bound —— 用
+        // 真正分界的数据：24 GB/s：24/43 = 56% mb，24/52 = 46% → mixed。
+        let meta2 = OpMeta::new("seqop", "x", 0, 24_000_000, 0, 0).with_tier(crate::tier::SEQ_DMA);
+        let mut rec2 = Recorder::new();
+        for i in 0..4u32 {
+            let ts = Instant::now();
+            sleep(Duration::from_micros(1100));
+            rec2.solo(&meta2, i, ts, i as u64);
+        }
+        let t0b = Instant::now(); // 块窗口锚点必须在 burst 循环之前
+        for i in 0..10u32 {
+            rec2.burst_submit(&meta2, i, i as u64);
+            sleep(Duration::from_micros(1000));
+        }
+        rec2.burst_done("seqop", Mode::Burst, 0, t0b, 10, 10);
+        let (_, s2) = render_markdown(&rec2, &[meta2], &MachineModel::default(), "t");
+        let st2 = s2.ops.iter().find(|o| o.name == "seqop").unwrap();
+        // 24 GB/s / 1000 µs：24/52 < 50% 且 > 10% → mixed（若无 tier 会拿
+        // 43 比 → 56% → memory-bound，本测试钉住分档确实生效）
+        assert_eq!(st2.verdict(&MachineModel::default()), "mixed");
+    }
+
+    /// P6：链式块跨 iter 的 per-iter 墙钟 min/med/max 必须来自各块自身，
+    /// 而不是只给 Σwall/Σiters 的均值。
+    #[test]
+    fn chain_min_med_max_distribution() {
+        let mut rec = Recorder::new();
+        let a = OpMeta::new("opA", "f", 0, 100, 10, 0);
+        let b_ = OpMeta::new("opB", "f", 1, 100, 10, 0);
+        // 3 个 iter，目标墙钟 200 / 400 / 800 µs（sleep 有 ~50µs 级松弛，
+        // 界限按 ±100µs 余量放）
+        for (it, us) in [(0u32, 200u64), (1, 400), (2, 800)] {
+            let tb = Instant::now();
+            rec.burst_submit(&a, it, 0);
+            sleep(Duration::from_micros(us));
+            rec.burst_submit(&b_, it, 1);
+            sleep(Duration::from_micros(50));
+            rec.burst_done("chain", Mode::Burst, it, tb, 2, 1);
+        }
+        let (_, summary) = render_markdown(&rec, &[a, b_], &MachineModel::default(), "t");
+        assert_eq!(summary.chains.len(), 1);
+        let c = &summary.chains[0];
+        let lo = c.per_iter_min_us.expect("min");
+        let me = c.per_iter_med_us.expect("med");
+        let hi = c.per_iter_max_us.expect("max");
+        assert!(lo >= 200.0 && lo < 400.0, "min {lo}");
+        assert!(me >= 400.0 && me < 650.0, "med {me}");
+        assert!(hi >= 800.0 && hi < 1100.0, "max {hi}");
+        assert!(lo <= me && me <= hi);
     }
 
     /// run-decode 模式：链块窗口内全是 solo 事件（每 op submit+wait 的链），

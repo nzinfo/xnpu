@@ -2,7 +2,7 @@
 
 use std::process::ExitCode;
 
-use xnpu_perf::{trace_json, MachineModel, Mode, OpMeta, Recorder};
+use xnpu_perf::{tier, trace_json, MachineModel, Mode, OpMeta, Recorder};
 
 use xnpu_hal::{
     syncobj_timeline_wait, BoType, BufferObject, Device, HwContext, Mapping, StartNpuCmd,
@@ -212,6 +212,18 @@ fn main() -> ExitCode {
             let npu_attn = !args.iter().any(|s| s.as_str() == "cpu");
             cmd_run_decode(arch, &decdir, &w4dir, iters, npu_attn)
         }
+        Some("perf-calibrate") => {
+            // M5a P6: measure machine-model ceilings (slot-stream per shape,
+            // strided via flowkv) and emit the overlay JSON.
+            let is_hy = args.iter().any(|s| matches!(s.as_str(), "hy" | "hy-mt2"));
+            let arch: &DecArch = if is_hy { &DEC_HY } else { &DEC_MINICPM };
+            let iters = args
+                .iter()
+                .filter_map(|s| s.parse::<usize>().ok())
+                .next()
+                .unwrap_or(6);
+            cmd_perf_calibrate(arch, iters)
+        }
         Some("run-w4gemv") => {
             let prj = args.get(1).cloned().unwrap_or_else(|| {
                 "/home/nzinfo/qwen/xnpu/build/fused_dequant_gemv_2048x2048_1tsi_512tso_4col_g32.mlir.prj"
@@ -236,7 +248,7 @@ fn main() -> ExitCode {
         }
         _ => {
             eprintln!(
-                "usage: xnpu-cli <info | ctx-probe [max] [cols] | run-add [prj-dir] [bf16|i8] | run-gemm [prj-dir] [M K N] [bf16|i8] | run-multi [add-prj] [gemm-prj] [M K N] | run-pipe [prj-dir] [M K N] [iters] | run-chain [add-prj] [gemm-prj] [M K N] [reps] | run-q8 [gemm-prj] [rescale-prj] [M K N tile_m] [reps] | run-w4gemv [prj-dir] [M K] [group] [tsi] [iters] | run-w4layer [w4-dir] [layers] [iters] | run-w4ulayer [w4u-dir] [layers] [iters] | run-decode [dec-dir] [w4u-dir] [iters] [hy] [cpu]>"
+                "usage: xnpu-cli <info | ctx-probe [max] [cols] | run-add [prj-dir] [bf16|i8] | run-gemm [prj-dir] [M K N] [bf16|i8] | run-multi [add-prj] [gemm-prj] [M K N] | run-pipe [prj-dir] [M K N] [iters] | run-chain [add-prj] [gemm-prj] [M K N] [reps] | run-q8 [gemm-prj] [rescale-prj] [M K N tile_m] [reps] | run-w4gemv [prj-dir] [M K] [group] [tsi] [iters] | run-w4layer [w4-dir] [layers] [iters] | run-w4ulayer [w4u-dir] [layers] [iters] | run-decode [dec-dir] [w4u-dir] [iters] [hy] [cpu] | perf-calibrate [hy] [iters]>"
             );
             ExitCode::FAILURE
         }
@@ -2970,7 +2982,8 @@ fn cmd_run_w4ulayer(w4dir: &str, nlayers: usize, iters: usize) -> ExitCode {
                 (s.m * s.k / 2 + s.m * (s.k / 32) * 2 + s.k * 2) as u64, // w4 + scales + x
                 (s.m * 2) as u64, // c out
                 (2 * s.m * s.k) as u64,
-            );
+            )
+            .with_tier(tier::SLOT_STREAM); // x 复制进 F 槽的 slot 流形态
             m.bytes_stream = Some((8 * (s.m / 32) * W4U_ELEM) as u64); // padded slot 流
             m
         })
@@ -3405,6 +3418,457 @@ fn cmd_run_w4ulayer(w4dir: &str, nlayers: usize, iters: usize) -> ExitCode {
         {
             Ok(()) => println!("perf trace written: {stem}.json / .md"),
             Err(e) => eprintln!("perf trace write failed: {e}"),
+        }
+    }
+
+    ExitCode::SUCCESS
+}
+
+/// M5a P6: measure the machine-model ceilings on-device and emit the overlay
+/// JSON. Per shape (layer-00 real weights, ONE universal w4gemvu CU):
+/// solo xN then a same-op burst block — the FIRST per-shape burst/op numbers
+/// in the repo (run-w4ulayer's burst blocks are all mixed-op chains, so
+/// per-op burst has never been isolated). slot-stream tier ceiling = max
+/// burst GB/s across shapes; strided tier = flowkv burst (fixture optional);
+/// seq-dma has no self-test kernel in our stack and keeps the FLM lower
+/// bound (52 GB/s, M5c P5) — recorded, not measured. Output doubles as a
+/// machine_model.json overlay consumed by MachineModel::overlay_json.
+fn cmd_perf_calibrate(arch: &DecArch, iters: usize) -> ExitCode {
+    let build = "/home/nzinfo/qwen/xnpu/build";
+    let shapes = arch.shapes();
+    let w4dir = arch.w4dir;
+    let burst_n = (iters * 8).max(16);
+    println!(
+        "perf-calibrate: {} shapes, layer00 weights, {} solo + {} burst/op",
+        arch.name, iters, burst_n
+    );
+
+    let fixtures: Vec<(Vec<u8>, Vec<u8>, u32)> = shapes
+        .iter()
+        .map(|s| {
+            match load_fixture(&format!("{build}/w4gemvu_{}x{}.mlir.prj", s.m, s.k)) {
+                Some(f) => f,
+                None => {
+                    eprintln!(
+                        "load fixture w4gemvu_{}x{} failed (run the w4gemvu pytest first)",
+                        s.m, s.k
+                    );
+                    std::process::exit(2);
+                }
+            }
+        })
+        .collect();
+    for (s, f) in shapes.iter().zip(&fixtures).skip(1) {
+        if f.0 != fixtures[0].0 {
+            eprintln!("PDI for {} differs — stale fixtures, rebuild", s.name);
+            return ExitCode::FAILURE;
+        }
+    }
+    // flowkv fixture is optional: without it the strided tier keeps its default.
+    let fk = load_fixture(&format!("{build}/{}.mlir.prj", arch.fk_fixture));
+    if fk.is_none() {
+        println!("flowkv fixture absent — strided tier keeps default (1.2 GB/s)");
+    }
+
+    let dev = match Device::open_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("open amdxdna device: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let md = match dev.aie_metadata() {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("AIE metadata: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let cols = fixtures.iter().map(|f| f.2).max().unwrap_or(8);
+    let num_tiles = cols * md.core.row_count as u32;
+    let mut ctx = match HwContext::create(&dev, num_tiles) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("create hwctx: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // Both PDIs take cu_func 0（DPU 函数号；CU 槽位 = 本列表下标，由
+    // chain_op 的 cu 参数选择 —— func != 0 固件查不到函数，op 永不执行，
+    // run-decode 4080 行注释同款陷阱）。
+    let cus: Vec<(&[u8], u8)> = match &fk {
+        Some(f) => vec![(fixtures[0].0.as_slice(), 0), (f.0.as_slice(), 0)],
+        None => vec![(fixtures[0].0.as_slice(), 0)],
+    };
+    if let Err(e) = ctx.configure_cus(&cus) {
+        eprintln!("configure_cus: {e}");
+        return ExitCode::FAILURE;
+    }
+
+    // Buffers: two replicated-x BOs + one c per shape + layer00 weights.
+    // Content is zeros — calibration is timing, and the kernel has no
+    // data-dependent control flow.
+    let mut live: Vec<(BufferObject, Mapping)> = Vec::new();
+    let mut x_va = [0u64; 2];
+    for (i, data) in [(0usize, 24usize * W4U_K_MAX * 2), (1, 4 * W4U_K_MAX * 2)] {
+        x_va[i] = match chain_tensor(&dev, &mut live, &format!("x{i}"), &vec![0u8; data]) {
+            Some(v) => v,
+            None => {
+                eprintln!("x{i} BO failed");
+                return ExitCode::FAILURE;
+            }
+        };
+    }
+    let mut c_va = [0u64; 4];
+    for (si, s) in shapes.iter().enumerate() {
+        c_va[si] = match chain_tensor(&dev, &mut live, &format!("c_{}", s.name), &vec![0u8; s.m * 2])
+        {
+            Some(v) => v,
+            None => {
+                eprintln!("c_{} BO failed", s.name);
+                return ExitCode::FAILURE;
+            }
+        };
+    }
+    let mut w_va = [0u64; 4];
+    for (si, s) in shapes.iter().enumerate() {
+        let data = match std::fs::read(format!("{w4dir}/layer00_{}.bin", s.name)) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("read layer00_{}: {e} (stale import?)", s.name);
+                return ExitCode::FAILURE;
+            }
+        };
+        let expect = 8 * (s.m / 32) * W4U_ELEM;
+        if data.len() != expect {
+            eprintln!("layer00_{}: {} B, expected {expect} B", s.name, data.len());
+            return ExitCode::FAILURE;
+        }
+        w_va[si] = match chain_tensor(&dev, &mut live, &format!("w.{}", s.name), &data) {
+            Some(v) => v,
+            None => {
+                eprintln!("w.{} BO failed", s.name);
+                return ExitCode::FAILURE;
+            }
+        };
+    }
+
+    let metas: Vec<OpMeta> = shapes
+        .iter()
+        .map(|s| {
+            let mut m = OpMeta::new(
+                s.name,
+                "w4gemvu",
+                0,
+                (s.m * s.k / 2 + s.m * (s.k / 32) * 2 + s.k * 2) as u64,
+                (s.m * 2) as u64,
+                (2 * s.m * s.k) as u64,
+            )
+            .with_tier(tier::SLOT_STREAM);
+            m.bytes_stream = Some((8 * (s.m / 32) * W4U_ELEM) as u64);
+            m
+        })
+        .collect();
+    let mut rec = Recorder::new();
+    let mut rec_seq = 0u64;
+
+    // One op per shape on cu0; layer00 weights.
+    // live layout: [x0, x1, c_qkv, c_o, c_gateup, c_down, w.qkv, w.o, w.gateup, w.down]
+    let mut ops: Vec<ChainOp> = Vec::with_capacity(4);
+    let mut op_handles: Vec<Vec<u32>> = Vec::with_capacity(4);
+    for (si, s) in shapes.iter().enumerate() {
+        let xv = x_va[if s.k == 6144 { 1 } else { 0 }];
+        let op = match chain_op(&dev, &s.name, &fixtures[si].1, 0, &[w_va[si], xv, c_va[si]]) {
+            Some(o) => o,
+            None => {
+                eprintln!("op setup {} failed", s.name);
+                return ExitCode::FAILURE;
+            }
+        };
+        op_handles.push(vec![
+            op.ctrl_bo.handle(),
+            live[6 + si].0.handle(),
+            live[if s.k == 6144 { 1 } else { 0 }].0.handle(),
+            live[2 + si].0.handle(),
+        ]);
+        ops.push(op);
+    }
+
+    // Per shape: solo xN (submit+wait), then ONE same-op burst block.
+    println!("\n== slot-stream tier（每形状 solo + 同 op 连发） ==");
+    for si in 0..4 {
+        for it in 0..iters {
+            let ts = std::time::Instant::now();
+            let seq = match ops[si].pkt.submit(&dev, &ctx, &op_handles[si]) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("solo submit {}: {e}", shapes[si].name);
+                    return ExitCode::FAILURE;
+                }
+            };
+            if syncobj_timeline_wait(&dev, ctx.syncobj_handle, seq, 10_000_000_000).is_err() {
+                eprintln!("solo wait {} timed out", shapes[si].name);
+                return ExitCode::FAILURE;
+            }
+            rec.solo(&metas[si], it as u32, ts, rec_seq);
+            rec_seq += 1;
+        }
+        let t0 = std::time::Instant::now();
+        let mut last_seq = 0u64;
+        for it in 0..burst_n {
+            match ops[si].pkt.submit(&dev, &ctx, &op_handles[si]) {
+                Ok(s) => {
+                    last_seq = s;
+                    rec.burst_submit(&metas[si], it as u32, rec_seq);
+                    rec_seq += 1;
+                }
+                Err(e) => {
+                    eprintln!("burst submit {}: {e}", shapes[si].name);
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        if syncobj_timeline_wait(&dev, ctx.syncobj_handle, last_seq, 10_000_000_000).is_err() {
+            eprintln!("burst wait {} timed out", shapes[si].name);
+            return ExitCode::FAILURE;
+        }
+        rec.burst_done(
+            shapes[si].name,
+            Mode::Burst,
+            0,
+            t0,
+            burst_n as u32,
+            burst_n as u32,
+        );
+    }
+
+    // flowkv (cu1): zeros are fine — S header 0 = full compiled capacity, and
+    // the kernel streams CAP rows regardless of values. The o-BO ToDevice
+    // sync before each submit is the first-exec race guard (notes §17).
+    let mut fk_op: Option<(ChainOp, Vec<u32>, (BufferObject, Mapping), (BufferObject, Mapping), (BufferObject, Mapping))> =
+        None;
+    // (owning tuple: op + arg handles + the three BOs whose mappings must
+    // outlive every submit)
+    if let Some(fk) = &fk {
+        const FK_CAP: usize = 1024;
+        let fk_group = arch.heads / arch.kv;
+        let fk_stride = fk_group * 128 + 128 + 16;
+        let kv_elems = arch.kv * FK_CAP * 2 * 128;
+        let q_elems = arch.kv * fk_stride;
+        let o_elems = arch.heads * 128;
+        let kv_bo = match BufferObject::new(&dev, BoType::Shmem, kv_elems * 2) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("kv BO: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let _kv_map = match kv_bo.map_owned() {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("kv map: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let q_bo = match BufferObject::new(&dev, BoType::Shmem, q_elems * 2) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("q BO: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let mut q_map = match q_bo.map_owned() {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("q map: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        // identity angles（数值无关紧要，但保持与 run-decode 相同的布局）
+        let q_bytes = q_map.as_mut_slice();
+        for g in 0..arch.kv {
+            let abase = g * fk_stride + fk_group * 128;
+            for p in 0..64 {
+                q_bytes[(abase + 2 * p) * 2..(abase + 2 * p) * 2 + 2]
+                    .copy_from_slice(&f32_to_bf16(1.0).to_le_bytes());
+                q_bytes[(abase + 2 * p + 1) * 2..(abase + 2 * p + 1) * 2 + 2]
+                    .copy_from_slice(&f32_to_bf16(0.0).to_le_bytes());
+            }
+        }
+        let _ = q_bo.sync(SyncDirection::ToDevice, 0, q_bo.size() as u64);
+        let _ = kv_bo.sync(SyncDirection::ToDevice, 0, kv_bo.size() as u64);
+        let o_bo = match BufferObject::new(&dev, BoType::Shmem, o_elems * 2) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("o BO: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let o_map = match o_bo.map_owned() {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("o map: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let op = match chain_op(
+            &dev,
+            "flowkv",
+            &fk.1,
+            1,
+            &[_kv_map.as_ptr() as u64, q_map.as_ptr() as u64, o_map.as_ptr() as u64],
+        ) {
+            Some(o) => o,
+            None => {
+                eprintln!("flowkv op setup failed");
+                return ExitCode::FAILURE;
+            }
+        };
+        let handles = vec![op.ctrl_bo.handle(), kv_bo.handle(), q_bo.handle(), o_bo.handle()];
+        fk_op = Some((op, handles, (kv_bo, _kv_map), (q_bo, q_map), (o_bo, o_map)));
+    }
+
+    let mut all_metas = metas.clone();
+    if let Some((op, handles, (_kv_bo, _), (_q_bo, _), (o_bo, _))) = fk_op.as_mut() {
+        println!("\n== strided tier（flowkv 容量流，S=0） ==");
+        const FK_CAP_U: u64 = 1024;
+        let fk_group = (arch.heads / arch.kv) as u64;
+        let fk_stride = (fk_group as usize * 128 + 128 + 16) as u64;
+        let mut m = OpMeta::new(
+            "flowkv",
+            "attn",
+            1,
+            arch.kv as u64 * FK_CAP_U * 2 * 128 * 2 + arch.kv as u64 * fk_stride * 2,
+            (arch.heads * 128 * 2) as u64,
+            arch.heads as u64 * FK_CAP_U * 128 * 2 * 2,
+        )
+        .with_tier(tier::STRIDED);
+        m.bytes_stream = Some(arch.kv as u64 * FK_CAP_U * 2 * 128 * 2 + arch.kv as u64 * fk_stride * 2);
+        for it in 0..iters {
+            let _ = o_bo.sync(SyncDirection::ToDevice, 0, o_bo.size() as u64);
+            let ts = std::time::Instant::now();
+            let seq = match op.pkt.submit(&dev, &ctx, handles) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("flowkv solo submit: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            if syncobj_timeline_wait(&dev, ctx.syncobj_handle, seq, 10_000_000_000).is_err() {
+                eprintln!("flowkv solo wait timed out");
+                return ExitCode::FAILURE;
+            }
+            rec.solo(&m, it as u32, ts, rec_seq);
+            rec_seq += 1;
+        }
+        let t0 = std::time::Instant::now();
+        let mut last_seq = 0u64;
+        for it in 0..burst_n / 2 {
+            let _ = o_bo.sync(SyncDirection::ToDevice, 0, o_bo.size() as u64);
+            match op.pkt.submit(&dev, &ctx, handles) {
+                Ok(s) => {
+                    last_seq = s;
+                    rec.burst_submit(&m, it as u32, rec_seq);
+                    rec_seq += 1;
+                }
+                Err(e) => {
+                    eprintln!("flowkv burst submit: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        if syncobj_timeline_wait(&dev, ctx.syncobj_handle, last_seq, 10_000_000_000).is_err() {
+            eprintln!("flowkv burst wait timed out");
+            return ExitCode::FAILURE;
+        }
+        rec.burst_done("flowkv", Mode::Burst, 0, t0, (burst_n / 2) as u32, (burst_n / 2) as u32);
+        all_metas.push(m);
+    }
+
+    // ---- report + overlay JSON ----
+    let model = MachineModel::default();
+    let title = format!("perf-calibrate: {} shapes, layer00, {iters} solo + {burst_n} burst", arch.name);
+    let (md, summary) = xnpu_perf::render_markdown(&rec, &all_metas, &model, &title);
+    println!("\n{md}");
+
+    let by_name = |n: &str| summary.ops.iter().find(|o| o.name == n);
+    let mut slot_ceiling = 0f64;
+    let mut ovhs: Vec<f64> = Vec::new();
+    for s in shapes.iter() {
+        if let Some(o) = by_name(s.name)
+            && let (Some(b), Some(sb)) = (o.burst_us_per_op, o.stream_bytes)
+        {
+            let g = sb as f64 / (1000.0 * b);
+            slot_ceiling = slot_ceiling.max(g);
+            if let Some(ovh) = o.overhead_us() {
+                ovhs.push(ovh);
+            }
+            println!(
+                "  {:>7} (F={}): burst {:>6.1} µs -> {:>5.1} GB/s slot stream (ovh {})",
+                s.name,
+                s.f,
+                b,
+                g,
+                o.overhead_us().map(|v| format!("{v:.1} µs")).unwrap_or_else(|| "–".into())
+            );
+        }
+    }
+    let strided = by_name("flowkv")
+        .and_then(|o| o.burst_us_per_op.zip(o.stream_bytes).map(|(b, sb)| sb as f64 / (1000.0 * b)));
+    ovhs.sort_by(|a, b| a.total_cmp(b));
+    let submit_ovh = if ovhs.is_empty() {
+        model.submit_overhead_us // 无 burst 数据时保留默认
+    } else {
+        ovhs[ovhs.len() / 2]
+    };
+
+    println!("\n== 校准结果 ==");
+    println!("slot-stream ceiling = {:.1} GB/s", slot_ceiling);
+    if let Some(g) = strided {
+        println!("strided            = {:.2} GB/s", g);
+    }
+    println!("seq-dma            = 52 GB/s（保留 FLM 下界，M5c P5；无自测内核）");
+    println!("submit_overhead    = {:.1} µs（per-shape solo−burst 中位）", submit_ovh);
+
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let prov = format!(
+        "perf-calibrate {}: slot-stream={:.1} GB/s（burst 上界），strided={}，seq-dma=52 FLM 下界（M5c P5，未自测），submit={:.1}µs solo−burst 中位",
+        arch.name,
+        slot_ceiling,
+        strided.map(|g| format!("{g:.2}")).unwrap_or_else(|| "默认1.2".into()),
+        submit_ovh
+    );
+    let mut tier_body = format!("\"{}\": {}", tier::SLOT_STREAM, slot_ceiling);
+    if let Some(g) = strided {
+        tier_body.push_str(&format!(", \"{}\": {:.3}", tier::STRIDED, g));
+    }
+    let overlay = format!(
+        "{{\n  \"name\": \"xdna2-npu2-cal-{}-{}\",\n  \"bw_tiers\": {{ {} }},\n  \"default_tier\": \"{}\",\n  \"submit_overhead_us\": {:.1},\n  \"provenance\": {}\n}}\n",
+        arch.name, ts, tier_body, tier::SLOT_STREAM, submit_ovh, xnpu_perf::jstr(&prov)
+    );
+    // Self-check: the overlay we emit must parse back (that's how future
+    // runs will consume it).
+    match MachineModel::default().overlay_json(&overlay) {
+        Ok(m) => println!("\noverlay round-trip OK: slot={} seq-dma={} strided={:.2}", m.bw_for(Some(tier::SLOT_STREAM)), m.bw_for(Some(tier::SEQ_DMA)), m.bw_for(Some(tier::STRIDED))),
+        Err(e) => {
+            eprintln!("overlay does not parse ({e}) — bug in emitter");
+            return ExitCode::FAILURE;
+        }
+    }
+    println!("{overlay}");
+    let dir = "/home/nzinfo/qwen/xnpu/build/perf";
+    if std::fs::create_dir_all(dir).is_ok() {
+        let stem = format!("{dir}/calibrate_{}_{}", arch.name, ts);
+        let json = trace_json(&rec, &model, &title, &summary);
+        match std::fs::write(format!("{stem}.md"), &md)
+            .and_then(|()| std::fs::write(format!("{stem}.json"), json))
+            .and_then(|()| std::fs::write(format!("{dir}/machine_model.json"), &overlay))
+        {
+            Ok(()) => println!("calibration written: {stem}.md/.json + {dir}/machine_model.json"),
+            Err(e) => eprintln!("calibration write failed: {e}"),
         }
     }
 
@@ -3921,7 +4385,8 @@ fn cmd_run_decode(
                 (s.m * s.k / 2 + s.m * (s.k / 32) * 2 + s.k * 2) as u64,
                 (s.m * 2) as u64,
                 (2 * s.m * s.k) as u64,
-            );
+            )
+            .with_tier(tier::SLOT_STREAM);
             m.bytes_stream = Some((8 * (s.m / 32) * W4U_ELEM) as u64);
             m
         })
@@ -3936,7 +4401,8 @@ fn cmd_run_decode(
                     nkv * s_pos * 2 * 128 * 2 + nkv * fk_stride as u64 * 2, // S 行 KV + q
                     (16 * 128 * 2) as u64,
                     (16 * s_pos * 128 * 2 * 2) as u64,
-                );
+                )
+                .with_tier(tier::STRIDED); // 2D stride KV 容量流
                 // 内核按编译容量流 KV（S 是运行时 header）；stream 口径给全量
                 m.bytes_stream =
                     Some(nkv * FK_CAP as u64 * 2 * 128 * 2 + nkv * fk_stride as u64 * 2);
@@ -4539,7 +5005,8 @@ fn cmd_run_fkprobe(prj: &str, iters: usize) -> ExitCode {
         (kv_elems + q_elems) as u64 * 2, // kv + q 输入字节
         (o_elems * 2) as u64,            // O 输出（字节）
         (16 * CAP * 128 * 2 * 2) as u64,
-    );
+    )
+    .with_tier(tier::STRIDED); // 2D stride KV 容量流
     fk_meta.bytes_stream = None; // 无 slot padding，stream 与 useful 同口径
     let metas = [fk_meta.clone()];
     let mut rec = Recorder::new();
