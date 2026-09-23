@@ -388,3 +388,46 @@ Fix2Float/Float2Fix/Inv/InvSqrt/Tanh/Exp2）。
 flowkv 4col 1819 µs/层 ×32 = 58 ms/token，按容量 1024 流 KV（1.15 GB/s）
 而非 runtime S——attention 上 NPU 前必须先修容量流（S-感知 DMA），否则
 数值修好也慢于 CPU。
+
+### P4 收尾（2026-09-24 凌晨）：修复落地 + 第二只 bug（E2E 独立）
+
+**修法 = 选项 1**（用户授权 C++ 例外，vectorization 拆后项）：flowkv.cc 增
+`flowkv_exp2_accurate`（[0,1) 上 5 阶 f32 Taylor，系数 = ln2 级数；r∈[1,2)
+经 union 指数位 +n<<23 精确乘 2^n；x≤−126 clamp 0；x≤0 truncate+fix 求 floor），
+f/C_c 三处调用替换，文档化的 bf16-arg 量化链保持不变。
+
+三层验证（全绿）：
+- pytest 10/10；
+- 隔离曲线（fk_exp2_iso 重跑）：mean +3.25%→**+0.03%**、max +5.67%→**+0.5%**
+  （= p 的 bf16 粒度）；
+- 真实数据（fk_hy_check）：npu-vs-ref 0.00285→**0.00046**（文档化舍入噪声底）、
+  EXACT-sim 拟合 0.00009、逐头 scale 0.988–1.057→0.989–1.011、最坏头
+  rms 0.00088。
+
+**但 E2E hy npu 仍 12.3% FAIL（12.1%→12.3%，exp2 修复只挪了 0.2pp）** →
+独立 op 干净 + 集成仍坏 = E2E 路径自己的 bug，此前被"32 层复利 3.6% op 误差"
+的归因掩盖。排查 main.rs 逐 token 路径（Q refresh/KV append/O 读）：
+
+- **根因 = main.rs:4076 V 行源偏移硬编码 2304**（= 2048+2·128，MiniCPM kv=2
+  常量）。hy kv=4 的 V 在 2048+kdim+kvh·128=2560+…。每层最新 token 的 V 行
+  实际写入的是 K-head-2/3 与 V-head-0/1 的数据；CPU 路径（:4058）用对
+  2048+kdim —— 这就是 cpu 1.0% / npu 12.3% 分野的全部。单行修复
+  （`qkv[2048 + kdim + kvh*128 + j]`）。
+- 判别信息复盘：standalone 真数据干净（python 打包）+ E2E 坏（Rust 打包）
+  → bug 必在 Rust 打包/搬运层；it=0 即 layer-0 发散（S=101 新鲜、无跨步
+  状态）→ 排除 stale header/跨 iter 累积；同一 qkv 里 K 行源（kr）对而 V
+  行源错 —— 唯一 arch 相关常量就是 2304。
+
+**E2E 终态（hy npu attention，IRON 43dd37e + xnpu b14b3b4）**：final hidden
+rms **0.0226 = 0.9% golden**（门槛 5%，与 CPU 路径 1.0% 同噪声底）；
+first divergence layer 0→20（19/2048，worst rel 落在近零 golden 上，仅信息
+性）。**双 bug 故事定案：kernel exp2 偏差 + Rust V 偏移，各自把对方藏在
+12.1% 的复合误差里** —— 修第一个不动第二个只挪 0.2pp 的教训：复合归因
+（"32 层复利"）在两个独立 bug 叠加时会给出貌似自洽的错误解释。
+
+**性能现状（M5a 口径）**：steady **5.5 tok/s**（181ms/token；CPU attention
+12.8 tok/s / 78.4ms）——flowkv solo 1986.5µs ×32 ≈ 64ms/token 容量流 +
+CU 切换。flowkv 表现：0.11 GB/s use / 1.06 GB/s stream / 3% bw → 判定
+mixed，即 S 感知 DMA 之前的预期状态。数值与性能两条线就此分离：
+数值线关闭，性能线（S-aware DMA / exp2 chunk 向量化 / CU 融合）转入
+待办。
