@@ -188,20 +188,29 @@ fn main() -> ExitCode {
             cmd_run_fkprobe(&prj, iters)
         }
         Some("run-decode") => {
-            let decdir = args.get(1).cloned().unwrap_or_else(|| {
-                "/home/nzinfo/qwen/xnpu/build/dec".to_string()
-            });
-            let w4dir = args.get(2).cloned().unwrap_or_else(|| {
-                "/home/nzinfo/qwen/xnpu/build/w4u".to_string()
-            });
-            let iters = args
-                .get(3)
+            // Positional [dec-dir] [w4-dir] [iters] plus flag tokens anywhere:
+            // "hy" selects the hy-mt2 arch profile (M5c), "cpu" keeps the
+            // Rust scalar attention (A/B path; default is NPU attention).
+            let is_hy = args.iter().any(|s| matches!(s.as_str(), "hy" | "hy-mt2"));
+            let arch: &DecArch = if is_hy { &DEC_HY } else { &DEC_MINICPM };
+            let pos_args: Vec<&String> = args[1..]
+                .iter()
+                .filter(|s| !matches!(s.as_str(), "cpu" | "hy" | "hy-mt2"))
+                .collect();
+            let decdir = pos_args
+                .first()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| arch.decdir.to_string());
+            let w4dir = pos_args
+                .get(1)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| arch.w4dir.to_string());
+            let iters = pos_args
+                .get(2)
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(5);
-            // Trailing "cpu" keeps the Rust scalar attention (A/B path);
-            // default is the M4a NPU attention on the flowkv CU.
-            let npu_attn = args.get(4).map(String::as_str) != Some("cpu");
-            cmd_run_decode(&decdir, &w4dir, iters, npu_attn)
+            let npu_attn = !args.iter().any(|s| s.as_str() == "cpu");
+            cmd_run_decode(arch, &decdir, &w4dir, iters, npu_attn)
         }
         Some("run-w4gemv") => {
             let prj = args.get(1).cloned().unwrap_or_else(|| {
@@ -227,7 +236,7 @@ fn main() -> ExitCode {
         }
         _ => {
             eprintln!(
-                "usage: xnpu-cli <info | ctx-probe [max] [cols] | run-add [prj-dir] [bf16|i8] | run-gemm [prj-dir] [M K N] [bf16|i8] | run-multi [add-prj] [gemm-prj] [M K N] | run-pipe [prj-dir] [M K N] [iters] | run-chain [add-prj] [gemm-prj] [M K N] [reps] | run-q8 [gemm-prj] [rescale-prj] [M K N tile_m] [reps] | run-w4gemv [prj-dir] [M K] [group] [tsi] [iters] | run-w4layer [w4-dir] [layers] [iters] | run-w4ulayer [w4u-dir] [layers] [iters] | run-decode [dec-dir] [w4u-dir] [iters] [cpu]>"
+                "usage: xnpu-cli <info | ctx-probe [max] [cols] | run-add [prj-dir] [bf16|i8] | run-gemm [prj-dir] [M K N] [bf16|i8] | run-multi [add-prj] [gemm-prj] [M K N] | run-pipe [prj-dir] [M K N] [iters] | run-chain [add-prj] [gemm-prj] [M K N] [reps] | run-q8 [gemm-prj] [rescale-prj] [M K N tile_m] [reps] | run-w4gemv [prj-dir] [M K] [group] [tsi] [iters] | run-w4layer [w4-dir] [layers] [iters] | run-w4ulayer [w4u-dir] [layers] [iters] | run-decode [dec-dir] [w4u-dir] [iters] [hy] [cpu]>"
             );
             ExitCode::FAILURE
         }
@@ -2725,6 +2734,63 @@ const W4U_SHAPES: [W4UShape; 4] = [
     W4UShape { name: "down", m: 2048, k: 6144, f: 4 },
 ];
 
+/// Decode-chain architecture profile (run-decode): everything the glue
+/// needs beyond the shared w4gemvu shapes. hy rope base = theta·alpha^
+/// (d/(d−2)) — FLM's "dynamic" scaling is a STATIC alpha rescale of the
+/// base (libhunyuan_npu.so disasm; beta_fast/beta_slow never parsed).
+struct DecArch {
+    name: &'static str,
+    layers: usize,
+    heads: usize,
+    kv: usize,
+    qk_norm: bool,
+    rope_base: f32,
+    /// qkv fused shape: (M, F). o/gateup/down are shared with MiniCPM5.
+    qkv_m: usize,
+    qkv_f: usize,
+    decdir: &'static str,
+    w4dir: &'static str,
+}
+
+const DEC_MINICPM: DecArch = DecArch {
+    name: "minicpm",
+    layers: 42,
+    heads: 16,
+    kv: 2,
+    qk_norm: false,
+    rope_base: 5e6,
+    qkv_m: 2560,
+    qkv_f: 5,
+    decdir: "/home/nzinfo/qwen/xnpu/build/dec",
+    w4dir: "/home/nzinfo/qwen/xnpu/build/w4u",
+};
+
+const DEC_HY: DecArch = DecArch {
+    name: "hy-mt2",
+    layers: 32,
+    heads: 16,
+    kv: 4,
+    qk_norm: true, // per-head q/k rms AFTER rope (hunyuan_npu.hpp)
+    // theta·alpha^(d/(d−2)) = 10000·1000^(128/126) = 11158839.925 — f32
+    // rounding shifts it 7e-9 relative, far below rope-angle noise.
+    rope_base: 11158840.0,
+    qkv_m: 3072, // cat(q 2048, k 512, v 512), 16Q/4KV GQA
+    qkv_f: 6,
+    decdir: "/home/nzinfo/qwen/xnpu/build/dec_hy",
+    w4dir: "/home/nzinfo/qwen/xnpu/build/w4u_hy",
+};
+
+impl DecArch {
+    fn shapes(&self) -> [W4UShape; 4] {
+        [
+            W4UShape { name: "qkv", m: self.qkv_m, k: 2048, f: self.qkv_f },
+            W4UShape { name: "o", m: 2048, k: 2048, f: 4 },
+            W4UShape { name: "gateup", m: 12288, k: 2048, f: 24 },
+            W4UShape { name: "down", m: 2048, k: 6144, f: 4 },
+        ]
+    }
+}
+
 /// One padded max-K layout-v2 slot (nibbles + hole + scales + K at the tail).
 const W4U_ELEM: usize = 13840;
 const W4U_K_MAX: usize = 6144;
@@ -3373,11 +3439,11 @@ fn swiglu_bf16(x: &[u16], out: &mut [u16]) {
 }
 
 /// Llama rotate-half rope tables at one position (inv_freq = base^(-j/64)).
-fn rope_table(pos: usize) -> ([f32; 64], [f32; 64]) {
+fn rope_table(pos: usize, base: f32) -> ([f32; 64], [f32; 64]) {
     let mut c = [0f32; 64];
     let mut s = [0f32; 64];
     for j in 0..64 {
-        let inv = (5e6f32).powf(-(j as f32) / 64.0);
+        let inv = base.powf(-(j as f32) / 64.0);
         let a = pos as f32 * inv;
         c[j] = a.cos();
         s[j] = a.sin();
@@ -3397,9 +3463,27 @@ fn rope_apply(x: &[u16], c: &[f32; 64], s: &[f32; 64], heads: usize, out: &mut [
     }
 }
 
-/// GQA decode attention: q (16 heads, roped) against a (2, CACHE_SEQ, 128)
-/// cache; q head h reads kv head h/8. Scores/softmax/PV in f32, one bf16
-/// rounding at the output.
+/// Per-head RMS norm over head_dim (hy qk-norm, applied AFTER rope):
+/// bf16(x_f32 * rsqrt(mean(x^2)+1e-5) * w_f32), weights [128] shared by
+/// all heads (mirrors decode_export.py's qk_rms).
+fn qk_rms_bf16(x: &[u16], w: &[u16], out: &mut [u16]) {
+    for h in 0..x.len() / 128 {
+        let o = h * 128;
+        let mut sum = 0f32;
+        for j in 0..128 {
+            let v = bf16_to_f32(x[o + j]);
+            sum += v * v;
+        }
+        let inv = 1f32 / (sum / 128.0 + 1e-5).sqrt();
+        for j in 0..128 {
+            out[o + j] = f32_to_bf16(bf16_to_f32(x[o + j]) * inv * bf16_to_f32(w[j]));
+        }
+    }
+}
+
+/// GQA decode attention: q (heads, roped) against a (kv, CACHE_SEQ, 128)
+/// cache; q head h reads kv head h/(heads/kv). Scores/softmax/PV in f32,
+/// one bf16 rounding at the output.
 fn attention_bf16(
     q: &[u16],
     kc: &[u16],
@@ -3407,11 +3491,14 @@ fn attention_bf16(
     pos: usize,
     cache_seq: usize,
     out: &mut [u16],
+    heads: usize,
+    nkv: usize,
 ) {
     let s = pos + 1;
+    let group = heads / nkv;
     let mut sc = vec![0f32; s];
-    for h in 0..16usize {
-        let kv = h / 8;
+    for h in 0..heads {
+        let kv = h / group;
         let mut mx = f32::NEG_INFINITY;
         for t in 0..s {
             let off = (kv * cache_seq + t) * 128;
@@ -3448,16 +3535,31 @@ fn attention_bf16(
 /// Q element header — one compiled binary per cache slot) fed from
 /// per-layer interleaved KV cache BOs. Pass the trailing "cpu" arg to keep
 /// the Rust scalar attention as the A/B reference path.
-fn cmd_run_decode(decdir: &str, w4dir: &str, iters: usize, npu_attn: bool) -> ExitCode {
+fn cmd_run_decode(
+    arch: &DecArch,
+    decdir: &str,
+    w4dir: &str,
+    iters: usize,
+    npu_attn_req: bool,
+) -> ExitCode {
     let build = "/home/nzinfo/qwen/xnpu/build";
+    let layers = arch.layers;
+    let shapes = arch.shapes();
+    // flowkv fixture is 16h_2kv (MiniCPM5); the hy 16h_4kv variant is not
+    // compiled yet — fall back to the scalar A/B path.
+    let npu_attn = npu_attn_req && arch.name == "minicpm";
+    if npu_attn_req && !npu_attn {
+        println!("note: NPU attention needs the 16h_4kv flowkv fixture for {name} — using Rust scalar attention", name = arch.name);
+    }
     println!(
-        "decode chain: 42 layers, w4gemvu projections on CU0 + {} attention{}, {iters} iters",
+        "decode chain: {name} {layers} layers, w4gemvu projections on CU0 + {} attention{}, {iters} iters",
         if npu_attn { "flowkv NPU (CU1)" } else { "Rust scalar" },
         if npu_attn { "" } else { " (cpu mode)" },
+        name = arch.name,
     );
 
     // Fixtures + PDI identity (same contract as run-w4ulayer).
-    let fixtures: Vec<(Vec<u8>, Vec<u8>, u32)> = W4U_SHAPES
+    let fixtures: Vec<(Vec<u8>, Vec<u8>, u32)> = shapes
         .iter()
         .map(|s| {
             match load_fixture(&format!("{build}/w4gemvu_{}x{}.mlir.prj", s.m, s.k)) {
@@ -3469,7 +3571,7 @@ fn cmd_run_decode(decdir: &str, w4dir: &str, iters: usize, npu_attn: bool) -> Ex
             }
         })
         .collect();
-    for (s, f) in W4U_SHAPES.iter().zip(&fixtures).skip(1) {
+    for (s, f) in shapes.iter().zip(&fixtures).skip(1) {
         if f.0 != fixtures[0].0 {
             eprintln!("PDI for {} differs — stale fixtures", s.name);
             return ExitCode::FAILURE;
@@ -3541,7 +3643,7 @@ fn cmd_run_decode(decdir: &str, w4dir: &str, iters: usize, npu_attn: bool) -> Ex
         eprintln!("x BO failed");
         return ExitCode::FAILURE;
     }
-    for s in W4U_SHAPES.iter() {
+    for s in shapes.iter() {
         if chain_tensor(&dev, &mut live, &format!("c_{}", s.name), &vec![0u8; s.m * 2])
             .is_none()
         {
@@ -3549,8 +3651,8 @@ fn cmd_run_decode(decdir: &str, w4dir: &str, iters: usize, npu_attn: bool) -> Ex
             return ExitCode::FAILURE;
         }
     }
-    for n in 0..42usize {
-        for s in W4U_SHAPES.iter() {
+    for n in 0..layers {
+        for s in shapes.iter() {
             let data = match std::fs::read(format!("{w4dir}/layer{n:02}_{}.bin", s.name)) {
                 Ok(d) => d,
                 Err(e) => {
@@ -3568,9 +3670,9 @@ fn cmd_run_decode(decdir: &str, w4dir: &str, iters: usize, npu_attn: bool) -> Ex
             }
         }
     }
-    let mut ops: Vec<ChainOp> = Vec::with_capacity(168);
-    for n in 0..42usize {
-        for (si, s) in W4U_SHAPES.iter().enumerate() {
+    let mut ops: Vec<ChainOp> = Vec::with_capacity(layers * 4);
+    for n in 0..layers {
+        for (si, s) in shapes.iter().enumerate() {
             let xv = live[if s.k == 6144 { 1 } else { 0 }].1.as_ptr() as u64;
             match chain_op(
                 &dev,
@@ -3589,13 +3691,13 @@ fn cmd_run_decode(decdir: &str, w4dir: &str, iters: usize, npu_attn: bool) -> Ex
     }
     let x_hdl = [live[0].0.handle(), live[1].0.handle()];
     let c_hdl: Vec<u32> = (2..6).map(|i| live[i].0.handle()).collect();
-    let mut op_handles: Vec<Vec<u32>> = Vec::with_capacity(168);
-    for n in 0..42usize {
+    let mut op_handles: Vec<Vec<u32>> = Vec::with_capacity(layers * 4);
+    for n in 0..layers {
         for si in 0..4 {
             op_handles.push(vec![
                 ops[n * 4 + si].ctrl_bo.handle(),
                 live[6 + n * 4 + si].0.handle(),
-                x_hdl[if W4U_SHAPES[si].k == 6144 { 1 } else { 0 }],
+                x_hdl[if shapes[si].k == 6144 { 1 } else { 0 }],
                 c_hdl[si],
             ]);
         }
@@ -3607,11 +3709,22 @@ fn cmd_run_decode(decdir: &str, w4dir: &str, iters: usize, npu_attn: bool) -> Ex
         Some(d.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect())
     };
     let norms = match rd_u16file(&format!("{decdir}/norms.bin")) {
-        Some(v) if v.len() == 85 * 2048 => v,
+        Some(v) if v.len() == (2 * layers + 1) * 2048 => v,
         _ => {
             eprintln!("read {decdir}/norms.bin failed");
             return ExitCode::FAILURE;
         }
+    };
+    let qknorms = if arch.qk_norm {
+        match rd_u16file(&format!("{decdir}/qknorms.bin")) {
+            Some(v) if v.len() == layers * 256 => v,
+            _ => {
+                eprintln!("read {decdir}/qknorms.bin failed");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        Vec::new()
     };
     let x0 = match rd_u16file(&format!("{decdir}/x0.bin")) {
         Some(v) if v.len() == 2048 => v,
@@ -3622,14 +3735,14 @@ fn cmd_run_decode(decdir: &str, w4dir: &str, iters: usize, npu_attn: bool) -> Ex
     };
     let cache_seq = 1024usize;
     let mut kcache = match rd_u16file(&format!("{decdir}/kcache.bin")) {
-        Some(v) if v.len() == 42 * 2 * cache_seq * 128 => v,
+        Some(v) if v.len() == layers * arch.kv * cache_seq * 128 => v,
         _ => {
             eprintln!("read kcache failed");
             return ExitCode::FAILURE;
         }
     };
     let mut vcache = match rd_u16file(&format!("{decdir}/vcache.bin")) {
-        Some(v) if v.len() == 42 * 2 * cache_seq * 128 => v,
+        Some(v) if v.len() == layers * arch.kv * cache_seq * 128 => v,
         _ => {
             eprintln!("read vcache failed");
             return ExitCode::FAILURE;
@@ -3643,7 +3756,7 @@ fn cmd_run_decode(decdir: &str, w4dir: &str, iters: usize, npu_attn: bool) -> Ex
         }
     };
     let pos = 100usize;
-    let (rc, rs) = rope_table(pos);
+    let (rc, rs) = rope_table(pos, arch.rope_base);
 
     // M4a NPU-attention state. Layouts must match
     // iron/operators/flowkv_decode: KV cache = (2 heads, 1024 pos, [K|V],
@@ -3787,7 +3900,7 @@ fn cmd_run_decode(decdir: &str, w4dir: &str, iters: usize, npu_attn: bool) -> Ex
     // M5a xnpu-perf: per-shape OpMeta（同 run-w4ulayer）+ flowkv（S=pos+1
     // 运行时；stream 口径给满编译容量的 KV 全量）。it=0 的 checked step
     // 含逐层 golden 磁盘读，不记录，避免污染 solo 分布。
-    let metas: Vec<OpMeta> = W4U_SHAPES
+    let metas: Vec<OpMeta> = shapes
         .iter()
         .map(|s| {
             let mut m = OpMeta::new(
@@ -3828,8 +3941,8 @@ fn cmd_run_decode(decdir: &str, w4dir: &str, iters: usize, npu_attn: bool) -> Ex
                     rec: &mut Recorder,
                     rec_seq: &mut u64|
      -> Option<Vec<u16>> {
-        let k = W4U_SHAPES[si].k;
-        let m = W4U_SHAPES[si].m;
+        let k = shapes[si].k;
+        let m = shapes[si].m;
         let vi = if k == 6144 { 1 } else { 0 };
         let slots = if vi == 0 { 24 } else { 4 };
         {
@@ -3884,7 +3997,7 @@ fn cmd_run_decode(decdir: &str, w4dir: &str, iters: usize, npu_attn: bool) -> Ex
     let mut sc = Scratch {
         xn: vec![0u16; 2048],
         qr: vec![0u16; 2048],
-        kr: vec![0u16; 256],
+        kr: vec![0u16; arch.kv * 128],
         attn: vec![0u16; 2048],
         gu: vec![0u16; 12288],
         sw: vec![0u16; 6144],
@@ -3902,20 +4015,31 @@ fn cmd_run_decode(decdir: &str, w4dir: &str, iters: usize, npu_attn: bool) -> Ex
                        rec: &mut Recorder,
                        rec_seq: &mut u64|
      -> bool {
-        for n in 0..42usize {
+        for n in 0..layers {
             let Scratch { xn, qr, kr, attn, gu, sw } = sc;
             rms_norm_bf16(x, &norms[n * 2 * 2048..][..2048], xn);
             let qkv = match gemv(ops, n * 4, 0, xn, it, rec, rec_seq) {
                 Some(v) => v,
                 None => return false,
             };
-            rope_apply(&qkv[..2048], &rc, &rs, 16, qr);
-            rope_apply(&qkv[2048..2304], &rc, &rs, 2, kr);
-            for kv in 0..2usize {
-                let off = (n * 2 + kv) * cache_seq * 128 + pos * 128;
+            let kdim = arch.kv * 128;
+            rope_apply(&qkv[..2048], &rc, &rs, arch.heads, qr);
+            rope_apply(&qkv[2048..2048 + kdim], &rc, &rs, arch.kv, kr);
+            if arch.qk_norm {
+                // hy: per-head rms AFTER rope. qk_rms can't alias x and out,
+                // so bounce through attn as scratch (kr is only kv·128 long).
+                let qlen = qr.len();
+                qk_rms_bf16(qr, &qknorms[n * 256..][..128], attn);
+                qr.copy_from_slice(&attn[..qlen]);
+                qk_rms_bf16(kr, &qknorms[n * 256 + 128..][..128], &mut attn[..kdim]);
+                kr.copy_from_slice(&attn[..kdim]);
+            }
+            for kv in 0..arch.kv {
+                let off = (n * arch.kv + kv) * cache_seq * 128 + pos * 128;
                 kcache[off..off + 128].copy_from_slice(&kr[kv * 128..(kv + 1) * 128]);
-                vcache[off..off + 128]
-                    .copy_from_slice(&qkv[2304 + kv * 128..2304 + (kv + 1) * 128]);
+                vcache[off..off + 128].copy_from_slice(
+                    &qkv[2048 + kdim + kv * 128..2048 + kdim + (kv + 1) * 128],
+                );
             }
             match fk.as_mut() {
                 Some(fk) => {
@@ -3987,8 +4111,17 @@ fn cmd_run_decode(decdir: &str, w4dir: &str, iters: usize, npu_attn: bool) -> Ex
                     }
                 }
                 None => {
-                    let klo = n * 2 * cache_seq * 128;
-                    attention_bf16(qr, &kcache[klo..], &vcache[klo..], pos, cache_seq, attn);
+                    let klo = n * arch.kv * cache_seq * 128;
+                    attention_bf16(
+                        qr,
+                        &kcache[klo..],
+                        &vcache[klo..],
+                        pos,
+                        cache_seq,
+                        attn,
+                        arch.heads,
+                        arch.kv,
+                    );
                 }
             }
             let o = match gemv(ops, n * 4 + 1, 1, attn, it, rec, rec_seq) {
@@ -4053,7 +4186,7 @@ fn cmd_run_decode(decdir: &str, w4dir: &str, iters: usize, npu_attn: bool) -> Ex
     let step1 = t0.elapsed();
 
     // Final norm + verification.
-    rms_norm_bf16(&x, &norms[84 * 2048..][..2048], &mut sc.xn);
+    rms_norm_bf16(&x, &norms[2 * layers * 2048..][..2048], &mut sc.xn);
     let _ = std::fs::write(
         "/tmp/dec_hidden.bin",
         (0..2048).flat_map(|i| sc.xn[i].to_le_bytes()).collect::<Vec<u8>>(),
@@ -4112,7 +4245,7 @@ fn cmd_run_decode(decdir: &str, w4dir: &str, iters: usize, npu_attn: bool) -> Ex
             Mode::Solo,
             it,
             tb,
-            (if npu_attn { 168 + 42 } else { 168 }) as u32,
+            (layers * 4 + if npu_attn { layers } else { 0 }) as u32,
             1,
         );
     }
@@ -4124,23 +4257,27 @@ fn cmd_run_decode(decdir: &str, w4dir: &str, iters: usize, npu_attn: bool) -> Ex
         1e3 / per.as_secs_f64() / 1e3
     );
     println!(
-        "  (CPU: rope+{}+norms+swiglu; NPU: 168 w4gemvu{})",
+        "  (CPU: rope+{}+norms+swiglu{}; NPU: {} w4gemvu{})",
         if npu_attn {
             "kv-row-append"
         } else {
             "GQA-attention"
         },
+        if arch.qk_norm { "+qk-norm" } else { "" },
+        layers * 4,
         if npu_attn {
-            " on CU0 + 42 flowkv attention on CU1"
+            format!(" on CU0 + {} flowkv attention on CU1", layers)
         } else {
-            " on 1 CU"
+            " on 1 CU".to_string()
         },
     );
 
     // ---- M5a xnpu-perf 报告 ----
     let model = MachineModel::default();
     let title = format!(
-        "run-decode: 42L, {} attention, {iters} timed iters",
+        "run-decode: {} {}L, {} attention, {iters} timed iters",
+        arch.name,
+        layers,
         if npu_attn { "NPU flowkv" } else { "CPU scalar" }
     );
     let (md, summary) = xnpu_perf::render_markdown(&rec, &metas, &model, &title);
