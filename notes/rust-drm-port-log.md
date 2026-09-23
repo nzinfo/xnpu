@@ -739,3 +739,73 @@ bf16 半 ULP 0.4%,翻转概率极低,抽样 20 行未遇)。
 包会连 NPU 设备初始化一起拖入);safetensors 键带 `.weight` 后缀;
 torch bf16 张量 `.numpy()` 不支持须先 `.to(float32)`;numpy 标量
 `.tobytes()` 行为怪异用 struct.pack;4 PDI 单次 configure_cus 正常。
+
+## §14 w4gemvu 通用内核:单 PDI 四形状闭环 (M3b, 2026-09-23)
+
+### 设计(为何可行)
+
+四投影形状 (qkv 2560×2048 / o 2048×2048 / gateup 12288×2048 / down
+2048×6144) 的 device 侧完全一致——worker 循环、fifo 几何、放置全同,
+只有 ctrl-code (BD 长度/tap) 随 (M,K) 变 → **一个 PDI,零 CU 切换**。
+K 从 tile 槽尾运行时读取 (自描述 tile),m=4 编译期内建。
+
+固定几何:ELEM=13840B = padding 后 max-K tile,acquire(1) 单指针契约
+(acquire(n>1) 两重死路:放置器不保证元素连续 0x44000/0x48000/…,
+dynamic-objFifo lowering 链接失败 `undefined symbol: A_..._cons_buff_1`)。
+TILES_PER_B=16 = gcd{80,64,384,64} 的最大公因子,每 run F =
+tiles/16 ∈ {5,4,24,4} 个 B 元素。B fifo depth 必须 ≥2:depth-1 自环
+BD (bd N→N) 的重挂与流内已缓冲数据竞态。
+
+### 排错一:peano -O2 锚点怪癖(int4 流指针丢 +8)
+
+全输出确定性错误 (qkv 2444/2560,down 1963/2048),跨 depth-1/2、跨
+脚本/pytest 稳定。**单位向量指纹法**定位:x=e_j + 图样权重 (全 +1,
+scale 1),扫描 j 得每行有效权重向量——row0 = [0,0,-8,0,…,1,1,1],
+恰是槽头 K 字节 `[00 08 00 00]` 当 nibbles 解包 (0x08 低 nibble = 有符
+号 -8,位置 2);每行首 8B 打 0x33 标记复测:**四行权重窗口全部 -8B
+偏移** (row r 有效窗口 = 槽 [r·k/2, r·k/2+k/2)),x 对齐与 scale 锚点
+(+8) 和 K 读取锚点 (+0) 均正确。即 peano 把
+`weights_packed=(int4*)(a_in+8)` 编成从 a_in+0 读 (movs/padda 流式路
+径),而索引式 scale 载入 (lda.s16 [p2,dj0]) 与标量 K 载入都保留 +8。
+字节级复现:当前源码 clang++ -O2 重编 .o 与部署 cmp 相同——编译器行
+为确定,不是陈旧产物。判别式:常数误差 -4.959 = (-8-1)·x[2] −
+Σ_{j≠2,j<16} x[j] (bf16 收窄后 -39.25) 精确吻合。
+
+**修法 = 布局 v2 顺应有效锚点**(不改源码锚点,防怪癖翻转):
+`[行主序 nibbles (row r @ r·k/2)][8B 洞][scales][pad][K u32 @13832]`。
+内核只改一处:k 从 `a_in+ELEM-8` 读。指纹复验:每行 j=0..15 命中各自
+标记 → mirror 三场景 bad=0。
+
+### 排错二:shim BD 上限 16 → 单 BD 多元素 B fill
+
+12288×2048 (F=24) 编译失败 `Allocator exhausted available buffer
+descriptor IDs`——每元素一个无 tap fill 消耗 F 个 shim BD,通道上限
+16。**修法**:vector buffer = F×K_MAX 元素,host 复制 x F 份
+(零填充每槽尾),单大 BD 正 stride tap——与 A 路径同构的已验证流形
+状。引擎侧代价 ~1.9ms/token (18.6MB/token memcpy),M3b 可接受。
+陷阱:`run_test` 原样写入 input_buffers,裸 (K,) x 只覆盖槽 1,槽
+2..F 陈旧 → group0 对、其余全错的指纹;op 暴露 `replicate_vector()`
+供 forward 与 test 共用。
+
+### 验证与数据
+
+- pytest 4 形状 × 5 iter = **20/20 PASS** (rel 0.07 / abs 0.7)。
+- **4 个 main.pdi sha256 逐字节相同**
+  (20e56620884828a0bb8f5a200c365a376726398bfde4a3de8b3fc07144ebd05b)
+  ——通用性硬前提成立,差异全在 insts.bin ctrl-code。
+- 延迟 (µs):qkv ≈ 320,o ≈ 325,gateup ≈ 1080,down ≈ 600
+  → 层合计 ≈ 2.3ms → 42 层 ≈ **97ms/token ≈ 10.3 tok/s**
+  (对照:四形状各自 PDI + 层序切换 ≈ 205ms/token;grouped 上限
+  13.3 tok/s)。gateup 有效权重带宽 12.9 GB/s 已近本机 DDR 顶。
+- K=2048 的 A 流有 2/3 padding 带宽浪费 (1.1MB 流 vs 370KB 有效),
+  是后续优化空间 (per-K ELEM 会破坏 PDI 一致性,需权衡)。
+
+### 下一步
+
+Rust run-w4layer 切单 CU × 4 ctrl code (PDI 只 load 一次);importer
+换 v2 打包器 (槽尾 K + 13840 槽 + 洞);重测四模式期望全 ≈97ms/token;
+然后 MHA/swiglu/add 链全 42 层 decode 对拍。
+
+上游求证清单新增:⑨peano -O2 对 int4 流式指针丢字节偏移 (movs/padda
+路径) 而索引式载入保留;⑩shim DMA 通道 BD 分配上限 16 无诊断信息
+(gateup F=24 直接耗尽)。
