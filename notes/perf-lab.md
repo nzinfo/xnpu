@@ -431,3 +431,65 @@ CU 切换。flowkv 表现：0.11 GB/s use / 1.06 GB/s stream / 3% bw → 判定
 mixed，即 S 感知 DMA 之前的预期状态。数值与性能两条线就此分离：
 数值线关闭，性能线（S-aware DMA / exp2 chunk 向量化 / CU 融合）转入
 待办。
+
+## P5：FLM per-op trace（LD_PRELOAD 拦截 XRT C++ API）——44 tok/s 的结构解剖
+
+**日期**：2026-09-24 凌晨。**工具**：`xnpu/crates/xnpu-ftrace`（Rust cdylib，
+用户批准的方案 A）+ `tools/flm_trace_analyze.py`。
+
+### 设计与坑
+
+- FLM 闭源内核 DLL（lib{hunyuan,q4_npu_eXpress,gemm,dequant,mha,lm_head}_npu.so）
+  **动态链接 libxrt_coreutil.so.2 的 C++ API**（`nm -D` 全是 `U _ZN3xrt...`）
+  → LD_PRELOAD 拦截 mangled 符号即可，无需碰 ioctl（M1 xdump 技术上移一层）。
+- 拦截集 19 个符号（run/runlist 的 start/wait/add/exec/reset、set_arg_at_index
+  两型、bo 的 ctor/map/sync、kernel/xclbin/hwctx/module/elf ctor）。全部指针/
+  标量传参、无 sret → 统一 `-> u64` 透传 RAX 是精确 ABI（void 调用方本就忽略
+  RAX）。dlsym(RTLD_NEXT) 每符号 OnceLock 缓存。
+- **坑 1**：libstdc++ SSO 判定——长度字段 +8 两种模式都有效（首版误读 local
+  buffer 首字节当长度，读出 77 字节垃圾）。
+- **坑 2**：**FLM 所有 kernel 都叫 `MLIR_AIE`**（mlir_aie 默认名）→ kernel 名
+  无鉴别力。身份改由：xclbin ctor 的文件路径（layer vs fused_prefill 两图）
+  + bo_new 尺寸直方图（26MiB×32=每层权重、133MiB=lm_head）+ 每 run 的
+  arg 指纹（idx→bo size）。
+- **坑 3**：kernel 对象被 move（vector 搬家），run_new 里出现的 kern 地址在
+  kern_new 里没有 → 地址 join 有洞；顺序 join 够用。
+- **坑 4**：分析时间轴必须统一绝对 t0——两版探索脚本各自取了"首事件"与
+  "首个 run_start"当原点，差 0.9s，险些把 setup 期的权重 staging 当成 decode。
+- 运行配方：`sudo -n env HOME=/home/nzinfo FTRACE_OUT=... LD_PRELOAD=... flm run
+  hy-mt2:1.8b`（root 的 HOME 找不到模型会触发重新下载；memlock 需 root）。
+
+### 结果（hy-mt2 1.8B，翻译 prompt 22 tok + 8 tok 生成）
+
+- **setup**：203 个 BO 共 1170MiB：26MiB×32（每层权重 BO，= 我们估算的
+  25.9MiB/层 q4 权重 ✓）、133MiB×1（lm_head）、1MiB×136 + 2MiB×33（激活/
+  中间量）。权重全走 SHMEM BO 常驻，同我们。
+- **prefill**：8 op/层 × 32 层 = 257 次 run_start，逐 op start+wait（与我们的
+  调度粒度相同！），4.89ms/层，共 156ms（22 tok，≈141 tok/s）。每层 8 op 的
+  稳态时长 ≈ 330/90/95/250/300/770/930/720 µs。
+- **decode：每 token = 33 个 run（32 层各 1 个融合内核 + 1）打进一个 runlist，
+  一次 rl_exec + 一次 rl_wait**；另有一个 2.66ms 的长 run（lm_head，133MiB →
+  52 GB/s）。21.44 ms/token（46.6 tok/s，与 serve 基线 44.3 一致）。
+  - 设备批次被 [wait-block 13.5ms, exec→ret 18.0ms] 夹逼 → **0.42–0.56
+    ms/层 = 48–64 GB/s 有效权重流**。
+  - host 残余 ~5ms/token（含与 wait 重叠的下一 token runlist prep——两个
+    runlist 地址交替 ping-pong，经典双缓冲）。
+- **对比我们（78.4ms/token，cpu-attention）的 3.7× 差距分解**：
+  1. **算子数**：FLM 每层 1 个融合内核 vs 我们 4 个 w4gemvu + attention——
+     层内全融合（qkv+rope+qk-norm+attn+o+gateup+swiglu+down 一个内核）；
+  2. **调度**：每 token 1 次 exec+1 次 wait vs 我们 160 次 submit+syncobj
+     往返（~55µs×160≈8.8ms）+ 84 次 CU 切换（650µs PDI 重载当 cu_mask 变）；
+  3. **带宽**：FLM 层内核 48–64 GB/s vs 我们 useful 14（slot 峰 43）——
+     硬件流远未到顶，我们的小形状（down F=4=14GB/s）与逐 op 开销拖垮聚合；
+  4. lm_head 在 NPU（2.66ms）——我们的 M4 遗留项。
+- **MachineModel 硬数据**：33.3 GB/s 的 bw_stream 锚点被证伪为天花板——
+  FLM 实测 ≥52 GB/s（lm_head 单 BO 大流）与 48–64 GB/s（层权重流）。
+  M5a 遗留的"按访问粒度分档重校准"现在有下界：大 BO 顺序流 ≥50 GB/s。
+
+### 局限与后续
+
+- runlist 内部逐 run 的设备时间 API 层不可见（无逐 run wait）——只拿到批次
+  总量；逐 op 需 M1 式原始 EXEC_BO ioctl 时间戳（后继）。
+- FLM 的层融合内核内部结构（tile 划分/多列利用）不可见——但 48–64 GB/s
+  已经是可对标的数字。
+- 产物：build/perf/flm_hy_trace.log（6874 行原始 trace）。
