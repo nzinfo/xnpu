@@ -2748,6 +2748,8 @@ struct DecArch {
     /// qkv fused shape: (M, F). o/gateup/down are shared with MiniCPM5.
     qkv_m: usize,
     qkv_f: usize,
+    /// flowkv_decode fixture stem (per-arch compiled KV-head geometry).
+    fk_fixture: &'static str,
     decdir: &'static str,
     w4dir: &'static str,
 }
@@ -2761,6 +2763,7 @@ const DEC_MINICPM: DecArch = DecArch {
     rope_base: 5e6,
     qkv_m: 2560,
     qkv_f: 5,
+    fk_fixture: "flowkv_decode_16h_2kv_128d_1024s_32cs_2col",
     decdir: "/home/nzinfo/qwen/xnpu/build/dec",
     w4dir: "/home/nzinfo/qwen/xnpu/build/w4u",
 };
@@ -2776,6 +2779,7 @@ const DEC_HY: DecArch = DecArch {
     rope_base: 11158840.0,
     qkv_m: 3072, // cat(q 2048, k 512, v 512), 16Q/4KV GQA
     qkv_f: 6,
+    fk_fixture: "flowkv_decode_16h_4kv_128d_1024s_32cs_4col",
     decdir: "/home/nzinfo/qwen/xnpu/build/dec_hy",
     w4dir: "/home/nzinfo/qwen/xnpu/build/w4u_hy",
 };
@@ -3545,12 +3549,7 @@ fn cmd_run_decode(
     let build = "/home/nzinfo/qwen/xnpu/build";
     let layers = arch.layers;
     let shapes = arch.shapes();
-    // flowkv fixture is 16h_2kv (MiniCPM5); the hy 16h_4kv variant is not
-    // compiled yet — fall back to the scalar A/B path.
-    let npu_attn = npu_attn_req && arch.name == "minicpm";
-    if npu_attn_req && !npu_attn {
-        println!("note: NPU attention needs the 16h_4kv flowkv fixture for {name} — using Rust scalar attention", name = arch.name);
-    }
+    let npu_attn = npu_attn_req;
     println!(
         "decode chain: {name} {layers} layers, w4gemvu projections on CU0 + {} attention{}, {iters} iters",
         if npu_attn { "flowkv NPU (CU1)" } else { "Rust scalar" },
@@ -3580,9 +3579,7 @@ fn cmd_run_decode(
 
     // M4a flowkv fixture: same 8-col QoS partition, its own CU (func 1).
     let fk_fixture = if npu_attn {
-        match load_fixture(&format!(
-            "{build}/flowkv_decode_16h_2kv_128d_1024s_32cs_2col.mlir.prj"
-        )) {
+        match load_fixture(&format!("{build}/{}.mlir.prj", arch.fk_fixture)) {
             Some(f) => {
                 println!("flowkv: pdi {} B, ctrl-code {} B", f.0.len(), f.1.len());
                 f
@@ -3759,14 +3756,24 @@ fn cmd_run_decode(
     let (rc, rs) = rope_table(pos, arch.rope_base);
 
     // M4a NPU-attention state. Layouts must match
-    // iron/operators/flowkv_decode: KV cache = (2 heads, 1024 pos, [K|V],
-    // 128) interleaved per layer; Q element = [Q_group (1024) | angles
-    // (128 interleaved cos/sin) | hdr(16, runtime S u32 in the first two
-    // bf16 bit patterns)] per KV group. Angles/curve: the SAME rope_table
-    // the scalar path uses (kernel is angle-source agnostic), header at
-    // the element TAIL (peano anchor, notes §16).
+    // iron/operators/flowkv_decode: KV cache = (kv heads, 1024 pos, [K|V],
+    // 128) interleaved per layer; Q element = [Q_group | angles (128
+    // interleaved cos/sin) | hdr(16, runtime S u32 in the first two bf16
+    // bit patterns)] per KV group, header at the element TAIL (peano
+    // anchor, notes §16).
+    //
+    // ANGLES ARE IDENTITY (cos=1, sin=0) BY CONTRACT: the kernel ropes Q
+    // on the fly (reference.py: O = softmax(rope(Q)·K)·V, K pre-roped), so
+    // shipping real angles alongside the host-roped Q double-rotates —
+    // R(a)·R(a)=R(2a), i.e. Q at 2·pos (the latent M4a bug the hy port
+    // exposed; minicpm's NPU path had it too). Identity is exact in bf16
+    // (x·1−y·0 = x), so the host's roped (+qk-normed, hy) Q passes through
+    // bit-exact and ALL of rope/qk-norm stays host-side for both archs.
     const FK_CAP: usize = 1024;
-    const FK_STRIDE: usize = 8 * 128 + 128 + 16; // 1176 elems per group
+    // Q element stride: one GQA group's Q heads + angles + runtime-S hdr
+    // (op.py pack_q_with_angles). minicpm 8h/group=1176, hy 4h/group=656.
+    let fk_group = arch.heads / arch.kv;
+    let fk_stride = fk_group * 128 + 128 + 16;
     struct FkState {
         ops: Vec<ChainOp>,
         handles: Vec<Vec<u32>>,
@@ -3775,14 +3782,14 @@ fn cmd_run_decode(
         o: (BufferObject, Mapping),
     }
     let mut fk: Option<FkState> = if npu_attn {
-        let q_bytes_total = 2 * FK_STRIDE * 2;
+        let q_bytes_total = arch.kv * fk_stride * 2;
         let o_bytes_total = 16 * 128 * 2;
-        let mut qdata = vec![0u16; 2 * FK_STRIDE];
-        for g in 0..2usize {
-            let abase = g * FK_STRIDE + 8 * 128;
+        let mut qdata = vec![0u16; arch.kv * fk_stride];
+        for g in 0..arch.kv {
+            let abase = g * fk_stride + fk_group * 128;
             for j in 0..64 {
-                qdata[abase + 2 * j] = f32_to_bf16(rc[j]);
-                qdata[abase + 2 * j + 1] = f32_to_bf16(rs[j]);
+                qdata[abase + 2 * j] = f32_to_bf16(1.0); // identity angles
+                qdata[abase + 2 * j + 1] = f32_to_bf16(0.0);
             }
             // hdr[0..2] = S as u32 (little-endian halves); rest stays 0.
             qdata[abase + 128] = (pos + 1) as u16;
@@ -3827,12 +3834,12 @@ fn cmd_run_decode(
 
         // Per-layer interleaved KV caches: history rows 0..pos from the
         // exported kcache/vcache; the row at `pos` is written per step.
-        let mut kv = Vec::with_capacity(42);
-        for n in 0..42usize {
-            let mut inter = vec![0u16; 2 * FK_CAP * 2 * 128];
-            for kvh in 0..2usize {
+        let mut kv = Vec::with_capacity(layers);
+        for n in 0..layers {
+            let mut inter = vec![0u16; arch.kv * FK_CAP * 2 * 128];
+            for kvh in 0..arch.kv {
                 for p in 0..pos {
-                    let src = (n * 2 + kvh) * cache_seq * 128 + p * 128;
+                    let src = (n * arch.kv + kvh) * cache_seq * 128 + p * 128;
                     let dst = (kvh * FK_CAP * 2 + p * 2) * 128;
                     inter[dst..dst + 128].copy_from_slice(&kcache[src..src + 128]);
                     inter[dst + 128..dst + 256].copy_from_slice(&vcache[src..src + 128]);
@@ -3861,9 +3868,9 @@ fn cmd_run_decode(
             kv.push((bo, map));
         }
 
-        let mut ops = Vec::with_capacity(42);
-        let mut handles = Vec::with_capacity(42);
-        for n in 0..42usize {
+        let mut ops = Vec::with_capacity(layers);
+        let mut handles = Vec::with_capacity(layers);
+        for n in 0..layers {
             let h = kv[n].0.handle();
             match chain_op(
                 &dev,
@@ -3883,8 +3890,12 @@ fn cmd_run_decode(
             }
         }
         println!(
-            "flowkv: 42 kv cache BOs (1 MiB each), q {} B, o {} B, 42 ops on CU1",
-            q_bytes_total, o_bytes_total
+            "flowkv: {} kv cache BOs ({} KiB each), q {} B, o {} B, {} ops on CU1",
+            layers,
+            arch.kv * FK_CAP * 2 * 128 * 2 / 1024,
+            q_bytes_total,
+            o_bytes_total,
+            layers
         );
         Some(FkState {
             ops,
@@ -3914,20 +3925,27 @@ fn cmd_run_decode(
             m.bytes_stream = Some((8 * (s.m / 32) * W4U_ELEM) as u64);
             m
         })
-        .chain(std::iter::once({
-            let s_pos = (pos + 1) as u64;
-            let mut m = OpMeta::new(
-                "flowkv",
-                "attn",
-                1,
-                2 * s_pos * 2 * 128 * 2 + 2 * FK_STRIDE as u64 * 2, // S 行 KV + q
-                (16 * 128 * 2) as u64,
-                (16 * s_pos * 128 * 2 * 2) as u64,
-            );
-            // 内核按编译容量流 KV（S 是运行时 header）；stream 口径给全量
-            m.bytes_stream = Some(2 * FK_CAP as u64 * 2 * 128 * 2 + 2 * FK_STRIDE as u64 * 2);
-            m
-        }))
+        .chain(if npu_attn {
+            Some({
+                let s_pos = (pos + 1) as u64;
+                let nkv = arch.kv as u64;
+                let mut m = OpMeta::new(
+                    "flowkv",
+                    "attn",
+                    1,
+                    nkv * s_pos * 2 * 128 * 2 + nkv * fk_stride as u64 * 2, // S 行 KV + q
+                    (16 * 128 * 2) as u64,
+                    (16 * s_pos * 128 * 2 * 2) as u64,
+                );
+                // 内核按编译容量流 KV（S 是运行时 header）；stream 口径给全量
+                m.bytes_stream =
+                    Some(nkv * FK_CAP as u64 * 2 * 128 * 2 + nkv * fk_stride as u64 * 2);
+                m
+            })
+        } else {
+            None
+        }
+        .into_iter())
         .collect();
     let mut rec = Recorder::new();
     let mut rec_seq = 0u64;
@@ -4049,13 +4067,17 @@ fn cmd_run_decode(
                     {
                         let (bo, map) = &mut fk.kv[n];
                         let bytes = map.as_mut_slice();
-                        for kvh in 0..2usize {
+                        for kvh in 0..arch.kv {
                             let off = ((kvh * FK_CAP * 2 + pos * 2) * 128) * 2;
                             for j in 0..128 {
                                 bytes[off + j * 2..off + j * 2 + 2]
                                     .copy_from_slice(&kr[kvh * 128 + j].to_le_bytes());
+                                // V rows start after Q + all K heads: 2048 +
+                                // kv*128 (2304 was the MiniCPM kv=2 constant;
+                                // hy kv=4 needs 2560 — the current token's V
+                                // was K-head-2/3 data, ~12% E2E rms).
                                 bytes[off + 256 + j * 2..off + 256 + j * 2 + 2]
-                                    .copy_from_slice(&qkv[2304 + kvh * 128 + j].to_le_bytes());
+                                    .copy_from_slice(&qkv[2048 + kdim + kvh * 128 + j].to_le_bytes());
                             }
                             if let Err(e) = bo.sync(SyncDirection::ToDevice, off as u64, 512) {
                                 eprintln!("kv{n:02} row sync: {e}");
@@ -4068,11 +4090,12 @@ fn cmd_run_decode(
                     {
                         let (qbo, qmap) = &mut fk.q;
                         let bytes = qmap.as_mut_slice();
-                        for g in 0..2usize {
-                            let base = g * FK_STRIDE * 2;
-                            for j in 0..1024 {
+                        let gq = fk_group * 128; // Q heads per element
+                        for g in 0..arch.kv {
+                            let base = g * fk_stride * 2;
+                            for j in 0..gq {
                                 bytes[base + j * 2..base + j * 2 + 2]
-                                    .copy_from_slice(&qr[g * 1024 + j].to_le_bytes());
+                                    .copy_from_slice(&qr[g * gq + j].to_le_bytes());
                             }
                         }
                         if let Err(e) = qbo.sync(SyncDirection::ToDevice, 0, qbo.size() as u64) {
