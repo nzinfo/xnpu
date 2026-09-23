@@ -159,6 +159,25 @@ fn main() -> ExitCode {
             };
             cmd_run_w4layer(&w4dir, layers, iters)
         }
+        Some("run-w4ulayer") => {
+            let w4dir = args.get(1).cloned().unwrap_or_else(|| {
+                "/home/nzinfo/qwen/xnpu/build/w4u".to_string()
+            });
+            let nums: Vec<usize> = args
+                .get(2..)
+                .map(|rest| rest.iter().filter_map(|s| s.parse().ok()).collect())
+                .unwrap_or_default();
+            let (layers, iters) = match nums.as_slice() {
+                [layers, iters] => (*layers, *iters),
+                [layers] => (*layers, 3),
+                [] => (42, 3),
+                _ => {
+                    eprintln!("run-w4ulayer: expected [layers] [iters]");
+                    return ExitCode::FAILURE;
+                }
+            };
+            cmd_run_w4ulayer(&w4dir, layers, iters)
+        }
         Some("run-w4gemv") => {
             let prj = args.get(1).cloned().unwrap_or_else(|| {
                 "/home/nzinfo/qwen/xnpu/build/fused_dequant_gemv_2048x2048_1tsi_512tso_4col_g32.mlir.prj"
@@ -183,7 +202,7 @@ fn main() -> ExitCode {
         }
         _ => {
             eprintln!(
-                "usage: xnpu-cli <info | ctx-probe [max] [cols] | run-add [prj-dir] [bf16|i8] | run-gemm [prj-dir] [M K N] [bf16|i8] | run-multi [add-prj] [gemm-prj] [M K N] | run-pipe [prj-dir] [M K N] [iters] | run-chain [add-prj] [gemm-prj] [M K N] [reps] | run-q8 [gemm-prj] [rescale-prj] [M K N tile_m] [reps] | run-w4gemv [prj-dir] [M K] [group] [tsi] [iters] | run-w4layer [w4-dir] [layers] [iters]>"
+                "usage: xnpu-cli <info | ctx-probe [max] [cols] | run-add [prj-dir] [bf16|i8] | run-gemm [prj-dir] [M K N] [bf16|i8] | run-multi [add-prj] [gemm-prj] [M K N] | run-pipe [prj-dir] [M K N] [iters] | run-chain [add-prj] [gemm-prj] [M K N] [reps] | run-q8 [gemm-prj] [rescale-prj] [M K N tile_m] [reps] | run-w4gemv [prj-dir] [M K] [group] [tsi] [iters] | run-w4layer [w4-dir] [layers] [iters] | run-w4ulayer [w4u-dir] [layers] [iters]>"
             );
             ExitCode::FAILURE
         }
@@ -2659,6 +2678,562 @@ fn cmd_run_w4layer(w4dir: &str, nlayers: usize, iters: usize) -> ExitCode {
         }
     }
     report("grouped", t0.elapsed());
+
+    ExitCode::SUCCESS
+}
+
+/// One MiniCPM5 decode projection shape for the UNIVERSAL w4gemvu kernel:
+/// fixture stem + B-stream geometry. Mirrors IRON w4gemvu/op.py (notes §14).
+struct W4UShape {
+    name: &'static str,
+    m: usize,
+    k: usize,
+    /// B fifo elements = tiles_per_col / 16 (tiles_per_col = M / 32): the
+    /// multi-element B fill that keeps shim BD usage at one per channel.
+    f: usize,
+}
+
+const W4U_SHAPES: [W4UShape; 4] = [
+    W4UShape { name: "qkv", m: 2560, k: 2048, f: 5 },
+    W4UShape { name: "o", m: 2048, k: 2048, f: 4 },
+    W4UShape { name: "gateup", m: 12288, k: 2048, f: 24 },
+    W4UShape { name: "down", m: 2048, k: 6144, f: 4 },
+];
+
+/// One padded max-K layout-v2 slot (nibbles + hole + scales + K at the tail).
+const W4U_ELEM: usize = 13840;
+const W4U_K_MAX: usize = 6144;
+
+/// M3b: the same 42-layer projection chain on the UNIVERSAL w4gemvu kernel.
+/// All four shapes share one PDI (the kernel reads K from the slot tail at
+/// runtime), so the whole chain runs on ONE CU and differs only in ctrl
+/// code — the ~650us-per-switch PDI reload run-w4layer pays 168 times per
+/// token is gone BY CONSTRUCTION, not by scheduling. Differences from v1:
+///   - fixture stems w4gemvu_{M}x{K}; the four PDIs must be byte-identical
+///     (asserted — that identity is the entire premise of the single CU);
+///   - packed layout v2: 8 cols x (M/32) x 13840-byte slots;
+///   - the vector buffer is the multi-element B stream: F K_MAX-wide
+///     slots each holding x zero-padded — two shared x BOs (xu2048 with
+///     24 slots serves every F in {5,4,24}; xu6144 with 4 slots serves down).
+/// Expected convergence: all four scheduling modes at the device floor
+/// (~2.3 ms/layer), where v1 spanned 75-234 ms/token on scheduling alone.
+fn cmd_run_w4ulayer(w4dir: &str, nlayers: usize, iters: usize) -> ExitCode {
+    let build = "/home/nzinfo/qwen/xnpu/build";
+    println!(
+        "w4 UNIVERSAL layer chain: {nlayers} layers x 4 GEMV on ONE CU, {iters} iters/mode, weights {w4dir}"
+    );
+
+    // Fixtures: per-shape ctrl code, one shared PDI.
+    let fixtures: Vec<(Vec<u8>, Vec<u8>, u32)> = W4U_SHAPES
+        .iter()
+        .map(|s| {
+            match load_fixture(&format!("{build}/w4gemvu_{}x{}.mlir.prj", s.m, s.k)) {
+                Some(f) => f,
+                None => {
+                    eprintln!(
+                        "load fixture w4gemvu_{}x{} failed (run the w4gemvu pytest first)",
+                        s.m, s.k
+                    );
+                    std::process::exit(2);
+                }
+            }
+        })
+        .collect();
+    for (s, f) in W4U_SHAPES.iter().zip(&fixtures) {
+        println!(
+            "  {:>7}: ctrl {} B, {} cols (M={}, K={}, F={})",
+            s.name, f.1.len(), f.2, s.m, s.k, s.f
+        );
+    }
+    for (s, f) in W4U_SHAPES.iter().zip(&fixtures).skip(1) {
+        if f.0 != fixtures[0].0 {
+            eprintln!(
+                "PDI for {} differs from {} — stale fixtures, rebuild",
+                s.name,
+                W4U_SHAPES[0].name
+            );
+            return ExitCode::FAILURE;
+        }
+    }
+    println!(
+        "PDI identical across all 4 shapes ({} B) — universal kernel confirmed",
+        fixtures[0].0.len()
+    );
+
+    let dev = match Device::open_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("open amdxdna device: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let md = match dev.aie_metadata() {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("AIE metadata: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let cols = fixtures.iter().map(|f| f.2).max().unwrap_or(8);
+    let num_tiles = cols * md.core.row_count as u32;
+    let mut ctx = match HwContext::create(&dev, num_tiles) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("create hwctx: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(e) = ctx.configure_cus(&[(fixtures[0].0.as_slice(), 0)]) {
+        eprintln!("configure_cus (1 PDI): {e}");
+        return ExitCode::FAILURE;
+    }
+    println!("1 CU attached (cu0 = w4gemvu universal), {} cols / {} tiles", cols, num_tiles);
+
+    // Replicated activation BOs: xu2048 (24 slots) serves every K=2048 shape
+    // (each op's B fill reads an F-slot prefix); xu6144 (4 slots) serves down.
+    let mut live: Vec<(BufferObject, Mapping)> = Vec::new();
+    let mut x_va: [u64; 2] = [0; 2]; // [xu2048 (24 slots), xu6144 (4 slots)]
+    let xu2048 = vec![0u8; 24 * W4U_K_MAX * 2];
+    let xu6144 = vec![0u8; 4 * W4U_K_MAX * 2];
+    x_va[0] = match chain_tensor(&dev, &mut live, "xu2048", &xu2048) {
+        Some(v) => v,
+        None => {
+            eprintln!("xu2048 BO failed");
+            return ExitCode::FAILURE;
+        }
+    };
+    x_va[1] = match chain_tensor(&dev, &mut live, "xu6144", &xu6144) {
+        Some(v) => v,
+        None => {
+            eprintln!("xu6144 BO failed");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut c_va = [0u64; 4];
+    for (si, s) in W4U_SHAPES.iter().enumerate() {
+        c_va[si] = match chain_tensor(&dev, &mut live, &format!("c_{}", s.name), &vec![0u8; s.m * 2]) {
+            Some(v) => v,
+            None => {
+                eprintln!("c_{} BO failed", s.name);
+                return ExitCode::FAILURE;
+            }
+        };
+    }
+
+    // Real weights, layout v2: one SHMEM BO per (layer, shape), all preloaded.
+    let mut w_va = vec![0u64; nlayers * 4];
+    let mut total_w = 0usize;
+    for n in 0..nlayers {
+        for (si, s) in W4U_SHAPES.iter().enumerate() {
+            let data = match std::fs::read(format!("{w4dir}/layer{n:02}_{}.bin", s.name)) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("read layer{n:02}_{}: {e}", s.name);
+                    return ExitCode::FAILURE;
+                }
+            };
+            let expect = 8 * (s.m / 32) * W4U_ELEM;
+            if data.len() != expect {
+                eprintln!(
+                    "layer{n:02}_{}: {} B, expected {expect} B (stale import? use --layout v2)",
+                    s.name,
+                    data.len()
+                );
+                return ExitCode::FAILURE;
+            }
+            total_w += data.len();
+            w_va[n * 4 + si] = match chain_tensor(&dev, &mut live, &format!("w{n:02}.{}", s.name), &data) {
+                Some(v) => v,
+                None => {
+                    eprintln!("w{n:02}.{} BO failed", s.name);
+                    return ExitCode::FAILURE;
+                }
+            };
+        }
+    }
+    let useful_w: usize = W4U_SHAPES
+        .iter()
+        .map(|s| s.m * s.k / 2 + s.m * (s.k / 32) * 2)
+        .sum::<usize>()
+        * nlayers;
+    println!(
+        "weights resident: {:.2} GB slot stream / {:.2} GB useful in {} BOs",
+        total_w as f64 / 1e9,
+        useful_w as f64 / 1e9,
+        live.len() - 6
+    );
+
+    let mut ops: Vec<ChainOp> = Vec::with_capacity(nlayers * 4);
+    for n in 0..nlayers {
+        for (si, s) in W4U_SHAPES.iter().enumerate() {
+            let xv = x_va[if s.k == 6144 { 1 } else { 0 }];
+            let op = chain_op(
+                &dev,
+                &format!("{}L{n:02}", s.name),
+                &fixtures[si].1,
+                0, // ONE CU for every shape — that is the whole point.
+                &[w_va[n * 4 + si], xv, c_va[si]],
+            );
+            match op {
+                Some(o) => ops.push(o),
+                None => {
+                    eprintln!("op setup layer{n:02} {} failed", s.name);
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+    }
+    // Per-op arg handles: [ctrl(shape), w(layer,shape), x, c]. live layout:
+    // [xu2048, xu6144, c_qkv, c_o, c_gateup, c_down, w00.qkv, w00.o, ...].
+    let x_hdl = [live[0].0.handle(), live[1].0.handle()];
+    let c_hdl: Vec<u32> = (2..6).map(|i| live[i].0.handle()).collect();
+    let mut op_handles: Vec<Vec<u32>> = Vec::with_capacity(ops.len());
+    for n in 0..nlayers {
+        for si in 0..4 {
+            let wi = 6 + n * 4 + si;
+            op_handles.push(vec![
+                ops[n * 4 + si].ctrl_bo.handle(),
+                live[wi].0.handle(),
+                x_hdl[if W4U_SHAPES[si].k == 6144 { 1 } else { 0 }],
+                c_hdl[si],
+            ]);
+        }
+    }
+
+    // Warmup + golden verification on layer 0 (real weights). The x BOs get
+    // the golden activations replicated F-slots-wide — a bare (K,) write
+    // would leave slots 2..F reading the creation-time zeros. Goldens are
+    // preloaded for EVERY layer: the scheduling modes below can then verify
+    // a layer's outputs right after they drain, before later layers
+    // overwrite the shared c buffers — the deep-queue modes are only
+    // meaningful if their execution is actually checked.
+    let mut goldens: Vec<(Vec<usize>, Vec<u16>, Vec<u16>)> = Vec::with_capacity(nlayers * 4);
+    for n in 0..nlayers {
+        for s in W4U_SHAPES.iter() {
+            match read_golden(std::path::Path::new(&format!(
+                "{w4dir}/golden_L{n:02}_{}.bin",
+                s.name
+            ))) {
+                Some(g) => goldens.push(g),
+                None => {
+                    eprintln!("read golden_L{n:02}_{} failed", s.name);
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+    }
+    for (xi, slots) in [(0usize, 24usize), (1usize, 4usize)] {
+        let x_bits = &goldens[if xi == 0 { 0 } else { 3 }].1; // qkv / down
+        let (bo, map) = &mut live[xi];
+        let bytes = map.as_mut_slice();
+        for s in 0..slots {
+            let base = s * W4U_K_MAX * 2;
+            for (i, b) in x_bits.iter().enumerate() {
+                bytes[base + i * 2..base + i * 2 + 2].copy_from_slice(&b.to_le_bytes());
+            }
+        }
+        bo.sync(SyncDirection::ToDevice, 0, bo.size() as u64).ok();
+    }
+    let mut golden_ok = true;
+    for (si, s) in W4U_SHAPES.iter().enumerate() {
+        let (rows, _x_bits, ref_bits) = &goldens[si];
+        let op = &mut ops[si];
+        let seq = match op.pkt.submit(&dev, &ctx, &op_handles[si]) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("golden submit {}: {e}", s.name);
+                return ExitCode::FAILURE;
+            }
+        };
+        if syncobj_timeline_wait(&dev, ctx.syncobj_handle, seq, 10_000_000_000).is_err()
+            || op.pkt.state() != ERT_CMD_STATE_COMPLETED
+        {
+            eprintln!("golden exec {} did not complete", s.name);
+            return ExitCode::FAILURE;
+        }
+        let (c_bo, c_map) = &live[2 + si];
+        let _ = c_bo.sync(SyncDirection::ToDevice, 0, c_bo.size() as u64);
+        let cs = c_map.as_slice();
+        let mut worst = 0f32;
+        let mut bad = 0usize;
+        for (ri, row) in rows.iter().enumerate() {
+            let got = u16::from_le_bytes([cs[row * 2], cs[row * 2 + 1]]);
+            let g = bf16_to_f32(got);
+            let w = bf16_to_f32(ref_bits[ri]);
+            let err = (g - w).abs();
+            if err > 0.01 + 0.01 * w.abs() {
+                bad += 1;
+            }
+            worst = worst.max(err / (w.abs() + 1e-6));
+        }
+        println!(
+            "  golden {:>7}: {} bad rows (worst rel err {:.2e}) -> {}",
+            s.name,
+            bad,
+            worst,
+            if bad == 0 { "PASS" } else { "FAIL" }
+        );
+        golden_ok &= bad == 0;
+    }
+    if !golden_ok {
+        eprintln!("GOLDEN: FAIL — real-weight outputs disagree with the importer reference");
+        return ExitCode::FAILURE;
+    }
+    println!("GOLDEN: PASS — universal CU real-weight outputs match (bf16 tolerance)");
+
+    // Spot-verify layer n's four outputs against the importer goldens.
+    // MUST run while no later layer has overwritten the c buffers.
+    let verify_layer = |n: usize| -> bool {
+        let mut ok = true;
+        for si in 0..4 {
+            let (rows, _x_bits, ref_bits) = &goldens[n * 4 + si];
+            let (c_bo, c_map) = &live[2 + si];
+            let _ = c_bo.sync(SyncDirection::FromDevice, 0, c_bo.size() as u64);
+            let cs = c_map.as_slice();
+            for (ri, row) in rows.iter().enumerate() {
+                let got = u16::from_le_bytes([cs[row * 2], cs[row * 2 + 1]]);
+                let g = bf16_to_f32(got);
+                let w = bf16_to_f32(ref_bits[ri]);
+                if (g - w).abs() > 0.01 + 0.01 * w.abs() {
+                    ok = false;
+                }
+            }
+        }
+        ok
+    };
+
+    // Timed scheduling modes. op index = layer*4 + shape; cu never changes.
+    let nops = nlayers * 4;
+    let wait_op = |ops: &mut [ChainOp], i: usize| -> bool {
+        let op = &mut ops[i];
+        let seq = match op.pkt.submit(&dev, &ctx, &op_handles[i]) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        syncobj_timeline_wait(&dev, ctx.syncobj_handle, seq, 10_000_000_000).is_ok()
+            && op.pkt.state() == ERT_CMD_STATE_COMPLETED
+    };
+    let drain = |ops: &[ChainOp]| -> bool {
+        let mut polls = 0u64;
+        loop {
+            if ops.iter().all(|o| o.pkt.state() == ERT_CMD_STATE_COMPLETED) {
+                return true;
+            }
+            polls += 1;
+            if polls > 4_000_000 {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(50));
+        }
+    };
+    // On failure, identify what the c buffer actually holds: another
+    // layer's golden (reordered/stale output) or garbage (interleaved
+    // ctrl-code execution corrupting the run).
+    let diagnose = |n: usize| -> String {
+        let mut parts = Vec::new();
+        for si in 0..4 {
+            let (c_bo, c_map) = &live[2 + si];
+            let _ = c_bo.sync(SyncDirection::FromDevice, 0, c_bo.size() as u64);
+            let cs = c_map.as_slice();
+            let rd = |row: usize| u16::from_le_bytes([cs[row * 2], cs[row * 2 + 1]]);
+            let mut hits: Vec<usize> = Vec::new();
+            for m in 0..nlayers {
+                let (rows, _x, ref_bits) = &goldens[m * 4 + si];
+                if rows.iter().zip(ref_bits).all(|(row, rb)| {
+                    let g = bf16_to_f32(rd(*row));
+                    let w = bf16_to_f32(*rb);
+                    (g - w).abs() <= 0.01 + 0.01 * w.abs()
+                }) {
+                    hits.push(m);
+                }
+            }
+            let name = W4U_SHAPES[si].name;
+            parts.push(match hits.first() {
+                Some(&m) if m != n => format!("{name}=L{m:02}"),
+                Some(_) => format!("{name}=ok"),
+                None => {
+                    let (rows, _x, ref_bits) = &goldens[n * 4 + si];
+                    let mut worst = 0f32;
+                    for (row, rb) in rows.iter().zip(ref_bits) {
+                        worst = worst
+                            .max((bf16_to_f32(rd(*row)) - bf16_to_f32(*rb)).abs());
+                    }
+                    format!("{name}=garbage(worst {worst:.1})")
+                }
+            });
+        }
+        parts.join(" ")
+    };
+    let report = |label: &str, total: std::time::Duration| {
+        let per = total / iters as u32;
+        println!(
+            "  {label:>10}: {:>10.2?} /token ({:.1} tok/s, {:.1} GB/s useful / {:.1} GB/s slot stream)",
+            per,
+            1e3 / per.as_secs_f64() / 1e3,
+            useful_w as f64 / per.as_secs_f64() / 1e9,
+            total_w as f64 / per.as_secs_f64() / 1e9
+        );
+    };
+
+    // per-op sync (verified at each layer boundary)
+    let mut all_ok = true;
+    let mut t0 = std::time::Instant::now();
+    for _ in 0..iters {
+        for n in 0..nlayers {
+            for j in 0..4 {
+                all_ok &= wait_op(&mut ops, n * 4 + j);
+            }
+            all_ok &= verify_layer(n);
+        }
+    }
+    if !all_ok {
+        eprintln!("per-op mode failure (exec or verification)");
+        return ExitCode::FAILURE;
+    }
+    report("per-op", t0.elapsed());
+
+    // per-layer: 4 submits, wait on the batch's LAST syncobj point, verify.
+    // State-poll drains return before the final host writes are visible —
+    // the syncobj timeline is the trustworthy completion signal (per-op mode
+    // with syncobj waits verified 126/126; state drains showed write-
+    // visibility lag failures that a 2 ms retry cleared).
+    t0 = std::time::Instant::now();
+    let mut pl_bad: Vec<String> = Vec::new();
+    for it in 0..iters {
+        for n in 0..nlayers {
+            let mut last_seq = 0u64;
+            for j in 0..4 {
+                let i = n * 4 + j;
+                match ops[i].pkt.submit(&dev, &ctx, &op_handles[i]) {
+                    Ok(s) => last_seq = s,
+                    Err(_) => {
+                        eprintln!("per-layer submit failed");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+            if syncobj_timeline_wait(&dev, ctx.syncobj_handle, last_seq, 10_000_000_000)
+                .is_err()
+            {
+                eprintln!("per-layer wait timeout");
+                return ExitCode::FAILURE;
+            }
+            if !verify_layer(n) {
+                pl_bad.push(format!("{it}/{n:02}:{}", diagnose(n)));
+            }
+        }
+    }
+    report("per-layer", t0.elapsed());
+    println!(
+        "    per-layer verified layers: {}/{} bad {}",
+        iters * nlayers - pl_bad.len(),
+        iters * nlayers,
+        if pl_bad.is_empty() {
+            "-".to_string()
+        } else {
+            pl_bad.join(",")
+        }
+    );
+
+    // pipelined: all submits, one drain. Intermediate outputs are
+    // overwritten in flight, so only the final layer is verifiable.
+    t0 = std::time::Instant::now();
+    for _ in 0..iters {
+        for i in 0..nops {
+            if ops[i].pkt.submit(&dev, &ctx, &op_handles[i]).is_err() {
+                eprintln!("pipelined submit failed");
+                return ExitCode::FAILURE;
+            }
+        }
+        if !drain(&ops) {
+            eprintln!("pipelined drain timeout");
+            return ExitCode::FAILURE;
+        }
+    }
+    report("pipelined", t0.elapsed());
+    if !verify_layer(nlayers - 1) {
+        println!("    pipelined final-layer check: FAIL — {}", diagnose(nlayers - 1));
+    } else {
+        println!("    pipelined final-layer check: PASS");
+    }
+
+    // grouped: same-CU batching is now the SAME order as per-layer — kept to
+    // confirm the two coincide (zero switches means order no longer matters).
+    t0 = std::time::Instant::now();
+    for _ in 0..iters {
+        for si in 0..4 {
+            for n in 0..nlayers {
+                let i = n * 4 + si;
+                if ops[i].pkt.submit(&dev, &ctx, &op_handles[i]).is_err() {
+                    eprintln!("grouped submit failed");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        if !drain(&ops) {
+            eprintln!("grouped drain timeout");
+            return ExitCode::FAILURE;
+        }
+    }
+    report("grouped", t0.elapsed());
+
+    // Queue-depth sweep: submit in N-op chunks, wait each batch out on the
+    // syncobj timeline — the only trustworthy completion signal (state-poll
+    // drains return before the final host writes are visible, and past a
+    // packet's first execution its state field is stale anyway: submit never
+    // resets it). Verify the batch's LAST layer only — earlier layers'
+    // outputs are legitimately overwritten by later ops of the same batch.
+    // Per-iteration times expose the variance the old totals were hiding.
+    for chunk in [4usize, 6, 8, 12, 16, 24, 32, 64, nops] {
+        let mut iter_ms: Vec<f64> = Vec::with_capacity(iters);
+        let mut exec_ok = 0usize;
+        let mut bad = String::new();
+        for it in 0..iters {
+            t0 = std::time::Instant::now();
+            let mut start = 0;
+            let mut ok = true;
+            while start < nops {
+                let end = (start + chunk).min(nops);
+                let mut last_seq = 0u64;
+                for i in start..end {
+                    match ops[i].pkt.submit(&dev, &ctx, &op_handles[i]) {
+                        Ok(s) => last_seq = s,
+                        Err(_) => {
+                            eprintln!("chunk{chunk} submit failed");
+                            return ExitCode::FAILURE;
+                        }
+                    }
+                }
+                if syncobj_timeline_wait(&dev, ctx.syncobj_handle, last_seq, 10_000_000_000)
+                    .is_err()
+                {
+                    eprintln!("chunk{chunk} wait timeout");
+                    return ExitCode::FAILURE;
+                }
+                let last_layer = end / 4 - 1;
+                if !verify_layer(last_layer) {
+                    ok = false;
+                    bad = format!("it{it} L{last_layer:02} holds {}", diagnose(last_layer));
+                }
+                start = end;
+            }
+            iter_ms.push(t0.elapsed().as_secs_f64() * 1e3);
+            exec_ok += ok as usize;
+        }
+        iter_ms.sort_by(|a, b| a.total_cmp(b));
+        let med = iter_ms[iter_ms.len() / 2];
+        println!(
+            "  chunk{:>3}: median {:>7.2} ms/token ({:>5.1} tok/s, min {:>6.2}, max {:>6.2}) verified {}/{} {}",
+            chunk,
+            med,
+            1e3 / med,
+            iter_ms[0],
+            iter_ms[iter_ms.len() - 1],
+            exec_ok,
+            iters,
+            &bad
+        );
+    }
 
     ExitCode::SUCCESS
 }
