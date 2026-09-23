@@ -912,3 +912,106 @@ tools/decode_export.py，f32 计算 + 每 op 边界一次 bf16 舍入 + w4 反�
   42 层后仍稳定在 0.5% 量级、不放大（残差流的自愈性，R3 logits 同观）。
 - 引擎骨架就此闭合：加载→常驻 BO→逐层 (norm→gemv→glue)→final norm，
   全在 Rust，无 XRT/无 Python。M4 = 换掉 CPU attention + 提速两路线。
+
+## §16 M4a：flowkv_decode 扩展到 MiniCPM5 形状——两个连环根因与 dump-probe 方法论（2026-09-23，IRON 62475f6）
+
+**目标**：上游 flowkv_decode（llama-1B 4Q×64d GQA）扩到 MiniCPM5
+（16Q/2KV/d128，group8，cache≤1024）+ 运行时 S（守护进程单 PDI 全
+ decode 步复用）。板上结果：**35 passed / 5 skipped**（skip = 8col
+ 512s 形状放置失败，HEAD 同败，纯几何：8 列要 8 个 shim DMA tile）。
+
+### 根因 A：头 S==0 语义缺省 → 全死行 → NaN
+
+不传 seq_len_cur 的旧调用（上游主测试）头全零 → 内核 S=0 → 所有行
+判死 → l=0 → `O = 0 · inv(0) = NaN`；且哨兵 bf16(-1.0039e30) 与
+m_old f32(-1e30) 差非零 → F=0 而非 1，死行并不代数中性。
+**修复**：头 S==0 语义为"满编译容量"——rope_q 新增第 4 参
+seq_len_cap（design 编译期常量传入）。
+
+### 根因 B（真根因，A 修完后露出）：peano 流式指针锚点丢常量偏移
+
+给 Q 元素**前面**加 16 元素头后，peano -O2 把 rope 循环 angles 流式
+指针基址的 +16 常量偏移丢掉（x1/x2/q_head 基址保留）→ 内核实际
+angles 基址 = q_in + nqh·hd = 上游无头公式。证据 = 反解内核实际用的
+每对 (c,s)：j≥8 对恰为 golden 对 j−8，j<8 对 |c|>1 垃圾（读到 Q 尾部
+数据）。与 §13 w4gemvu "流式权重指针丢 +8 字节"同类——**peano 的流式
+指针锚点若不再与它认识的基址形式逐字一致，常量偏移会被静默丢弃**。
+**修法（§13 同款"顺应锚点"）**：头移元素尾部，布局
+`[Q_heads | angles | hdr(16)]`，rope 的 angles/q_head 基址恢复与上游
+逐字相同；头只走标量尾读。探针复验 rotq vs golden = 0.0137（bf16 噪声）。
+
+### dump-probe 方法论（两连升级，判别力极强）
+
+- **v1**：value_accum 暂存 inter 包 F/C/l + V 行0，normalize 写入
+  output 替代 O → 一次上板拿到 score→value 边界全状态。
+- **v2**：design 把 inter 元素 +2hd+16+hd，score_chunk 在包尾写
+  `[k_row0 | rotq_h0 | qhdr | raw_q_h0]` → score tile 内部状态跨 tile
+  可见。反解出 rotq 用的角度 ⟹ 定位锚点差 16。
+- **O drain 归属语义**（避免误判）：每批 drain 写各自 kv 区域，
+  `output[c*256:(c+1)*256]` 是**对应批次**的 dump（batch0 的 dump 在
+  batch1 处理前已落盘）；value tile 的 cur_chunk_base 恒 0 → 暂存条件
+  恒真 → 暂存的是最后一个 chunk。曾因误归属指控"第二批 DMA 卡旧地址"，
+  MLIR 验证 fill 偏移全对——**先核对 dump 归属再立假设**。
+
+### 排除清单（省未来重查）
+
+statics 尺寸/放置（MAX 缩回 4/64 仍败）、dot 动态循环 spill（展开仍
+败→但展开式+标量哨兵作为最终形态保留）、DMA 第二 task group 用旧地址
+（fill 偏移全对）、no_rope/dot32/k_stuck/no_scale/KV swap/sin flip/
+partial-S/sharpness/l_miss/角度变体——全部离线指纹不匹配。
+
+### 遗产（最终形态保留）
+
+- 死行 -1e30 哨兵 + exp2 下溢 → 在线 softmax 更新代数中性（C=1,F=0,
+  l 不变），死 chunk 无需特判下游；标量选择、不进向量路径。
+- dot 的 mac 偏移保持编译期常量全展开（动态偏移循环形态会 spill 过
+  0x400 栈进 K fifo）。
+- NOCPP 下 math.h 不可用 → inv_sqrt(d) 用三元常量（精确 f32 位）。
+
+### 下一步
+
+M4a 集成：Rust run-decode 把 CPU attention（~17ms/token 标量）换成
+本 op（导出 d=128 fixture；Q 头/angles 打包进 Rust——头在尾部布局；
+KV cache 交错布局 BO，k/v 写 cache 暂留宿主侧）→ 预期 attention 归零、
+token 时间 102.9→~86ms。
+
+## 17. M4a 收官：flowkv E2E 集成 + 首 exec O 读竞态（2026-09-23）
+
+### E2E 结果（run-decode，w4gemvu CU0 + flowkv CU1）
+
+- **速度回退**：NPU attention 全链 241–256ms/token（~4 tok/s），反而
+  慢于 CPU attention 路径的 102.9ms——§16 预估的 86ms 没有兑现。原因
+  二：flowkv 单 exec ~2.6ms × 42 层 ≈ 109ms（kernel 逐 pos 标量 exp2，
+  ~3 GF/s 延迟受限）+ CU0(w4gemvu)↔CU1(flowkv) 逐 op 交替触发 ~650µs
+  PDI 重载 × ~84 次/token ≈ 55ms。这是 M5 性能阶段的第一靶子。
+- final hidden vs golden rms 4.3–4.4%（golden rms 的百分比），A/B
+  （NPU vs CPU attention 同链）rms 差 8–10% —— 落在 bf16 score +
+  exp2-arg 量化噪声底（§16 的 fk_head6.py 离线模型同量级），非实现错误。
+- 提交：IRON ce3c674（flowkv 头尾布局 + 哨兵 + 测试），xnpu 19d1704。
+
+### 首 exec O 读竞态（本节核心遗产）
+
+**症状**：PDI 加载后的第一次 exec（fkprobe iter-0 / decode layer-0），
+O 输出部分为零/错值（head-0 lstsq scale 0.75 一类）；第二次起干净。
+decode E2E 表现为 layer 0 起就发散。
+
+**机制**：O drain（设备 DMA 写回宿主 SHMEM）可滞后于完成 syncobj——
+syncobj 只承诺固件侧命令完成，不承诺宿主可见。首次 exec 后续迭代
+之所以干净，是前面的读路径顺带做了 clflush。
+
+**修法（照抄 XRT）**：每次 submit 前对输出 BO 做
+`sync(SyncDirection::ToDevice, 0, size)`（方向无关的 clflush 语义，
+§1 就发现 direction-1 需要 debug BO，方向 0 只 flush）。fkprobe 与
+run-decode flowkv 路径各加一行，3/3 复验干净，E2E 对拍恢复。
+
+**方法论**：syncobj timeline 是唯一可信的"完成"信号；state-poll
+（包状态字段）会更早返回（w4ulayer §14b 已见）；而"完成"≠"宿主读
+得到"——首次 DMA 写回需要显式 flush 屏障。M5 度量框架的 Event 语义
+按此定义：t_complete 取 syncobj wait 返回，读数据前另记 flush 成本。
+
+### 遗留（进 M5）
+
+- 每 op submit+syncobj 往返 ~55µs ×168 op ≈ 9ms/token 纯调度开销；
+  CU 切换 PDI 重载 ~650µs（§14b）。这是 M5a 度量框架的第一批锚点。
+- flowkv 2.6ms/op @ S=101：per-position 标量 exp2 循环 → ~3 GF/s，
+  latency-bound，是 M5 优化的头号候选。
