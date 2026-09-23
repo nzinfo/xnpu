@@ -240,3 +240,73 @@ built on IRON）。
 - flowkv 16h_4kv fixture 编译 + qkv E2E 对拍。
 - FLM per-op trace（hook.cpp C++ 扩展 vs LD_PRELOAD——待用户裁决，
   涉及禁 C++ 红线的例外申请）→ 同 schema 对比表。
+
+## P3（2026-09-24）M5c 主体：hy-mt2 1.8B 全引擎 E2E PASS + per-op 表
+
+### 设计
+
+run-decode 双 arch 化：`DecArch` 结构（layers/heads/kv/qk_norm/rope_base/
+qkv_m/qkv_f/decdir/w4dir），DEC_MINICPM 与 DEC_HY 两个 const profile。
+CLI `run-decode [dirs] [iters] hy cpu`——"hy" 换 arch，"cpu" 保 Rust 标量
+attention。hy 与 minicpm 的差异全部收敛进 profile：
+
+- 32 层、16Q/4KV（GQA group 4）、qkv 融合 M=3072/F=6（3072/8 满足 packer
+  32 整除，**PDI 与其它形状字节一致已验证**——通用内核前提不动摇）；
+- qk-norm 在 rope **之后**（qk_rms_bf16 逐头 128 维 rms，权重
+  qknorms.bin L×256=[q|k]）；
+- rope base 11158840.0（f32 舍入 rel 7e-9，远低于角度噪声）；
+- norms 索引 (2L+1)、KV cache L×4×1024×128、最终 norm 2L 偏移全部参数化。
+
+decode_export.py 同步双 arch（--arch hy 出 build/dec_hy），minicpm 回归
+bit-identical（仅 meta.json 加字段）。
+
+### 踩坑（都留痕）
+
+1. `const` 里不能调 `powf`（E0015）→ Python 算好硬编码 + 注释推导。
+2. qk_rms 不能 alias 输入输出 → 借 attn 当 scratch 弹一次；
+   `kr.copy_from_slice(attn)` 长度 512 vs 2048 panic → `&attn[..kdim]`。
+3. `qr.copy_from_slice(&attn[..qr.len()])` E0502（qr 可变借用里再不可变
+   借用 qr.len()）→ 先取 `let qlen = qr.len()`。
+4. 权重加载循环里残留 `W4U_SHAPES`（minicpm 形状）→ hy qkv 尺寸校验必炸；
+   gemv 闭包同样两处 → 全换 `shapes[si]`。教训：**参数化改造要 grep 到
+   底，常量名相似（W4U_SHAPES vs shapes）编译器不救你**。
+
+### 结果（2026-09-24，build/perf/decode_cpu_5it_1790184457）
+
+- **E2E PASS**：final hidden rms 0.0265 = **1.0%** golden rms（门槛 5%）。
+  最大绝对差 0.50 出现在 golden 85.0（0.6%）；L24 起零星 22/2048 超逐层
+  容差（worst rel 3.1 是近零 golden 放大，最终收敛）——与 minicpm 同
+  fingerprint，非系统误差。
+- **12.8 tok/s**（78.4 ms/token），同 harness minicpm 4.1–4.3 → 3×；
+  FLM hy2 基线 44.3 tok/s → 差 3.5×。
+- per-op（solo=submit+wait 墙钟，5 iters×32 层各 160 样本）：
+
+| op | 形状 | solo µs | stream GB/s | %bw | 判定 |
+|---|---|---|---|---|---|
+| qkv | 3072×2048 | 305 | 34.9 | 105% | memory-bound |
+| o | 2048×2048 | 248 | 28.6 | 86% | memory-bound |
+| gateup | 12288×2048 | 984 | 43.2 | **130%** | memory-bound |
+| down | 2048×6144 | 503 | 14.1 | 42% | mixed |
+
+- 链式：Σ solo = 65.3 ms vs 墙钟 78.4 ms → **Δ=13.1 ms/token =
+  CPU glue**（标量 attention + rope + qk-norm + swiglu + x 复制 + 每 op
+  submit/wait 往返），≈102 µs/op。
+- **机器模型锚点失效发现**：bw_stream=33.3 GB/s（minicpm 42L 校准）被
+  gateup 单 op 打到 43 GB/s（130%）——锚点依赖负载形态（Bo 大小/页
+  驻留模式），%bw>100% 应触发重校准而非判不可能。TileSight 式模型要
+  把"有效带宽按访问粒度分档"做进 MachineModel（后续）。
+
+### 判读（vs FLM 44.3 tok/s 的 3.5× 差距构成）
+
+1. 投影流本身 65.3 ms（若 burst 流水化可再压，单 op 级 submit+wait 是
+   上界口径）；
+2. 13.1 ms CPU glue——attention 上 NPU（flowkv 16h_4kv fixture）+
+   图执行器消 per-op 往返是下一刀；
+3. FLM 还有 layer 间双 buffer/prefill 融合图——先测准我们自己的，
+   再对齐它的调度。
+
+### 下一步
+
+- flowkv 16h_4kv fixture 编译（IRON）→ hy NPU attention E2E。
+- FLM per-op trace 同 schema 对比（hook.cpp C++ 例外待用户裁决）。
+- MachineModel 带宽分档（按 op 流粒度重校准 bw_stream）。
