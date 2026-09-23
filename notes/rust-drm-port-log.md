@@ -809,3 +809,62 @@ Rust run-w4layer 切单 CU × 4 ctrl code (PDI 只 load 一次);importer
 上游求证清单新增:⑨peano -O2 对 int4 流式指针丢字节偏移 (movs/padda
 路径) 而索引式载入保留;⑩shim DMA 通道 BD 分配上限 16 无诊断信息
 (gateup F=24 直接耗尽)。
+
+## §14b M3b 收官:Rust 单 CU 全链验证 + 调度方法论纠偏 (2026-09-23)
+
+`run-w4ulayer`(main.rs)+ importer `--layout v2`(tools/w4_import.py):
+42 层 × 4 形状全部挂在 **1 个 CU** 上(PDI 断言逐字节相同后只 configure
+一次),importer 输出 build/w4u(2.75GB,42 层 × 65.5MB,含每层 golden
+`golden_L{n:02}_{shape}.bin`)。x BO 共 2 个:xu2048 = 24×6144 槽
+(F∈{5,4,24} 读前缀)、xu6144 = 4×6144;golden 前把 x 按槽复制写入
+(bare (K,) 只覆盖槽 1 的老坑在 Rust 侧同样存在)。
+
+### 结果 (5 iters, 42 层)
+
+- **GOLDEN 4/4 PASS**(真权重,worst rel err = 0)。
+- per-op 84ms;**其余一切调度 ≈ 75ms/token ≈ 13.3-13.4 tok/s**:
+  chunk 4/6/8/12/16/24/32/64/168 全落 74.7-78.7ms,逐迭代方差 <1%。
+- 全部逐层校验通过(per-layer 210/210;chunk 扫描逐批验末层)。
+- v1 的 pipelined 反常 (234ms) 消失 → 确认那是 168 次 cu_mask 变化
+  PDI 重载的代价,单 CU 下顺序无关。
+
+### 调度方法论三课 (这次纠偏的核心产出)
+
+1. **包状态轮询 (state-poll drain) 不是完成信号**。两层失效:
+   ①`submit` 从不重置包头 state 字段——只有驱动完成时写 COMPLETED,
+   所以任何包的**第二次及以后执行**,轮询会读到上一次的陈旧 COMPLETED
+   秒回;②即使首跑,状态置 COMPLETED 也早于最终 DMA 写抵达主机内存
+   (可见性滞后,睡 2ms 重验全转好 = "transient" 判别)。
+   **唯一可信信号 = syncobj 时间线等待**(per-op 模式 126/126 零失败
+   为证)。曾据此信过的 50/24/15ms"加速"全是计时假象(迭代 ≥1 从未
+   真等设备;末迭代尾巴流出计时窗)。修正后所有模式平坦收敛。
+2. **校验目标必须与批边界对齐**:chunk=6 (非 4 倍数) 批界切进层中间,
+   验"末层"读到的是下一半层的输出,酷似错序——诊断器(输出对 42 层
+   golden 全匹配,报告"layer 10 holds L11")一眼定位是覆盖不是错序。
+   逐层诊断器本身值得保留:reorder/stale 给 "L{n}",真损坏给
+   "garbage(worst x.x)"。
+3. **同 CU 排队执行按序且正确**:168 op 同 CU 深队列,零错序零丢失
+   (所有可验层全对)。ERT/fw 对单 CU 命令是串行保序的,引擎可以直接
+   依赖。
+
+### 真实瓶颈定位
+
+75ms/token ≈ 65.5MB/层 ÷ **39GB/s 槽流**(= 每列 ~5GB/s,与单 op
+gateup 39GB/s 一致)。这不是硬墙:M2 GEMM 夹具曾以不同 DMA 模式跑到
+**54GB/s 汇聚**。两条提速路线(优先级排序):
+1. **消 K padding**:K=2048 形状槽流 3 倍于有效字节。per-K ELEM
+   (4616/13840) 需 2 PDI 2 CU(fifo 元素几何编译进 PDI,单 PDI 动态
+   ELEM 死路已验证推理)→ 槽流 2.75GB→1.11GB,若仍 39GB/s 则
+   **~28ms/token ≈ 35 tok/s**。
+2. DMA 模式调优向 54GB/s 逼近(fifo depth、BD 尺寸、多 tile 迭代维)。
+
+### 本次新增钉死事实
+
+- submit 不重置 state(见上);syncobj timeline 点按序完成,可当批屏障。
+- SHMEM BO 的 FromDevice sync 不能等在途 DMA(只做 cache 失效),
+  校验前必须已有 syncobj 屏障。
+- 2.75GB 常驻 168 BO 无压力(91GB RAM);configure_cus 单 PDI 单 CU
+  与 4 PDI 4 CU 同稳。
+
+上游求证清单不变(⑨⑩待发)。M3b 剩:MHA d=128 fixture + swiglu + add
+链全 42 层 decode 对拍 CPU 4.55 tok/s 基线。

@@ -19,6 +19,10 @@ to bf16) so the Rust harness can verify real-weight outputs within bf16
 tolerance (real scales are not dyadic, so bit-exactness is not expected).
 
 Run:  ironenv/bin/python tools/w4_import.py --layers 0 1   # subset for bring-up
+      ironenv/bin/python tools/w4_import.py --layout v2    # universal single-PDI
+                                                     # slots (m_input=4, K@tail,
+                                                     # 8x(M/32)x13840 per shape)
+Golden rows are layout-independent (f32 dot of dequantized weights).
 """
 
 import argparse
@@ -34,12 +38,22 @@ import torch
 # NPU device on import (fails under a plain user shell).
 import importlib.util  # noqa: E402
 
-_spec = importlib.util.spec_from_file_location(
+_SPEC_V1 = importlib.util.spec_from_file_location(
     "w4ref", "/home/nzinfo/qwen/xnpu/IRON/iron/operators/w4gemv2/reference.py"
 )
-_w4ref = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_w4ref)
-quantize_and_pack = _w4ref.quantize_and_pack
+_SPEC_V2 = importlib.util.spec_from_file_location(
+    "w4uref", "/home/nzinfo/qwen/xnpu/IRON/iron/operators/w4gemvu/reference.py"
+)
+
+
+def _load(spec):
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.quantize_and_pack
+
+
+PACKERS = {"v1": (_load(_SPEC_V1), "w4gemv2 tiles (tsi rows/tile)"),
+           "v2": (_load(_SPEC_V2), "w4gemvu universal slots (m_input=4, K in slot tail)")}
 
 MODEL = Path("/home/nzinfo/qwen/xnpu/models/minicpm5-2b/model.safetensors")
 
@@ -78,17 +92,25 @@ def write_golden(out, shape, k, rows, ref_bits, x_bits):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--out", default="/home/nzinfo/qwen/xnpu/build/w4")
+    ap.add_argument("--layout", choices=sorted(PACKERS), default="v1",
+                    help="v1: w4gemv2 tiles (per-shape PDI); v2: w4gemvu "
+                         "universal slots (one PDI, m_input=4, K in slot tail)")
+    ap.add_argument("--out", default=None,
+                    help="output dir (default build/w4 for v1, build/w4u for v2)")
     ap.add_argument("--layers", type=int, nargs="*", default=None,
                     help="layer indices to import (default: all 42)")
     args = ap.parse_args()
+    quantize_and_pack, layout_desc = PACKERS[args.layout]
+    out = Path(args.out) if args.out else Path(
+        f"/home/nzinfo/qwen/xnpu/build/{'w4u' if args.layout == 'v2' else 'w4'}")
     layers = args.layers if args.layers is not None else list(range(42))
 
     from safetensors import safe_open
 
-    out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    meta = {"group_size": 32, "cols": 8, "layers": layers, "shapes": {}}
+    meta = {"group_size": 32, "cols": 8, "layout": args.layout,
+            "layers": layers, "shapes": {}}
+    m_input = 4 if args.layout == "v2" else None  # v2: kernel rows/tile is fixed
 
     # Deterministic activation per K (bf16 small integers, exact).
     xs = {2048: (torch.arange(2048) % 7 - 3).to(torch.bfloat16),
@@ -114,10 +136,23 @@ def main():
                 assert W.shape == (m, k)
                 # bf16 -> f32 is lossless; the packer quantizes from f32.
                 packed, w_dequant = quantize_and_pack(
-                    W.to(torch.float32).numpy(), group_size=32, m_input=tsi, cols=8
+                    W.to(torch.float32).numpy(), group_size=32,
+                    m_input=(m_input if m_input is not None else tsi), cols=8
                 )
+                if args.layout == "v2":
+                    # 8 cols x (M/32) tiles x 13840-byte slot
+                    assert len(packed) == 8 * (m // 32) * 13840, (
+                        f"layer {n} {shape}: v2 packed is {len(packed)} bytes"
+                    )
                 path = out / f"layer{n:02d}_{shape}.bin"
                 packed.tofile(path)
+                # Per-layer goldens let the Rust harness verify outputs of
+                # ANY layer right after it drains (before later layers
+                # overwrite the shared c buffers) — the deep-queue scheduling
+                # modes are only meaningful if their execution is checked.
+                rows, ref = spot_rows(m, k, w_dequant, xs[k])
+                write_golden(out, f"L{n:02d}_{shape}", k, rows, ref,
+                             xs[k].view(torch.uint16).numpy())
                 if n == layers[0]:
                     meta["shapes"][shape] = {
                         "M": m, "K": k, "tsi": tsi, "bytes": len(packed),
