@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/xnpu-hal", "crates/xnpu-cli", "crates/xnpu-perf"]
+members = ["crates/xnpu-hal", "crates/xnpu-cli", "crates/xnpu-perf", "crates/xnpu-ftrace"]
 
 [workspace.package]
 version = "0.1.0"
