@@ -868,3 +868,47 @@ gateup 39GB/s 一致)。这不是硬墙:M2 GEMM 夹具曾以不同 DMA 模式跑
 
 上游求证清单不变(⑨⑩待发)。M3b 剩:MHA d=128 fixture + swiglu + add
 链全 42 层 decode 对拍 CPU 4.55 tok/s 基线。
+
+## §15 M3b 收官：全 42 层 decode 链 E2E 对拍 PASS（2026-09-23）
+
+`run-decode`：w4gemvu 单 CU 投影（168 op）+ Rust CPU 胶水，一步真实
+decode（pos=100, cache_seq=1024），对拍 torch 参考（导出器
+tools/decode_export.py，f32 计算 + 每 op 边界一次 bf16 舍入 + w4 反量化
+权重，与 R3 同哲学）。
+
+**结果：PASS —— final hidden rms 误差 0.0234 = golden 自身 rms(4.562)
+的 0.5%**；最大绝对偏差 0.5 落在 golden=109 的元素上（0.5%），top-3
+偏差全部 ~0.4-0.6% 相对 = 纯 bf16 栈噪声（R3 全 IRON 栈也是这个量级）。
+逐层看：L0-L10 全部在容差内，L11 起 >26/2048 元素出 1-2% 带（渐变
+漂移，非 bug 特征——真 bug（rope 错/GQA 映射错）会在 L0 就大规模爆）。
+
+**性能：steady 102.9ms/token ≈ 9.7 tok/s**（首步 114ms 带校验），
+= CPU 全软栈 4.55 tok/s 的 2.1×。分解（对照 §14b 数据）：
+- 75ms：NPU 投影地板（39GB/s 槽流，§14b 已定位）；
+- ~9ms：168×55µs submit+syncobj 串行往返（per-op 模式代价，§14b per-op
+  84ms 同源）；
+- ~17ms：Rust 标量 attention（42 层×16 头×2×101×128 MAC ≈ 35 MFLOP，
+  标量 ~2GFLOP/s）+ 复制写 x 槽（~13MB）+ 胶水。
+→ M4 把 attention 换 NPU 通用 decode-MHA + 消 K padding（§14b 路线①
+28ms 地板）后，35 tok/s 路线畅通。
+
+### 踩坑
+
+1. **导出器 x0.bin bug**：x 在层循环里被消费后才写 x0.bin → 文件内容
+   是"final hidden 输入"而非"decode 步输入"。goldens 在循环内先算完
+   （正确），只有 x0 错。修复 = 循环前 clone；只重生成 x0.bin 即可，
+   无需重导（42 层量化分钟级）。
+2. **FromDevice sync 的 EINVAL 是常态**：gemv 读输出处 `.ok()?` 直接
+   把整个 step 判失败。SHMEM 本身 cache 一致，方向 1 ioctl 无 debug BO
+   必 EINVAL（M1 老坑在新代码里复发）——读路径一律 best-effort。
+3. 借鉴既有纪律：per-layer 校验用 0.01+0.02|g| 容差（裸 rel 在近零
+   golden 上必然爆炸，max rel 6835 全是这类）；最终判定用
+   **rms/golden_rms 相对值**。
+
+### 认知
+
+- CPU 胶水（rms/rope/GQA/swiglu/add）逐位镜像参考数学是可行且足够的
+  对拍策略：只要 op 边界舍入一致，误差就是纯 NPU gemv 求和序噪声，
+  42 层后仍稳定在 0.5% 量级、不放大（残差流的自愈性，R3 logits 同观）。
+- 引擎骨架就此闭合：加载→常驻 BO→逐层 (norm→gemv→glue)→final norm，
+  全在 Rust，无 XRT/无 Python。M4 = 换掉 CPU attention + 提速两路线。
