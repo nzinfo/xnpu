@@ -493,3 +493,102 @@ mixed，即 S 感知 DMA 之前的预期状态。数值与性能两条线就此�
 - FLM 的层融合内核内部结构（tile 划分/多列利用）不可见——但 48–64 GB/s
   已经是可对标的数字。
 - 产物：build/perf/flm_hy_trace.log（6874 行原始 trace）。
+
+## P6（2026-09-24）：带宽分档 MachineModel + perf-calibrate + 链式 min/med/max + submit 开销分档
+
+M5a 收尾。P1 立的四个欠账一次清掉：单锚带宽证伪后的**分档机器模型**、
+`perf-calibrate` 子命令（上板实测天花板并产出 overlay JSON）、链式块的
+**min/med/max 分布**、submit 开销**按流量分桶**。全部围绕一个原则：
+**报告里的每个百分数必须对着 op 自己认领的那档天花板**，否则数字不可比。
+
+### 设计
+
+- **MachineModel.bw_tiers: BTreeMap<tier, GB/s>** + default_tier。三档语义
+  = 访问粒度，不是数值区间：
+  - `seq-dma` 52：顺序大 BO 权重流（FLM lm_head 133MiB/2.66ms 下界，M5c P5；
+    M2 GEMM 曾见 54）。**无自测内核**——我们栈里没有一个纯顺序流算子可测它，
+    保留 FLM 下界并在 provenance 里注明"未自测"。
+  - `slot-stream` 43：F 槽复制流（P1 gateup F=24 上界）。本次实测校准到 41.2。
+  - `strided` 1.2：2D stride KV 容量流（P2 flowkv）。实测 0.92–0.95。
+  - `bw_stream_gbps` 33.3 降级为遗留兜底（bw_tiers 空/default_tier 缺失才用）。
+  - OpMeta 认领档（`.with_tier(...)`），verdict/%bw 用该档分母；未知档名落
+    default_tier。overlay_json 支持 `bw_tiers` 嵌套数字对象（花括号配平
+    透传 + 递归解析），**按 key 合并**——部分校准（只测到一档）其余档保默认。
+- **perf-calibrate [hy] [iters]**：每形状 solo×N + **同 op 连发块**×8N。
+  这是仓库里第一批 per-shape burst 数字——run-w4ulayer 的 burst 块全是
+  混 op 链，per-op burst 从未被隔离过。slot 档天花板 = 各形状 burst GB/s
+  最大值；flowkv（可选 fixture，cu1）同法测 strided 档；submit_overhead =
+  per-shape solo−burst 中位。产物 = overlay JSON（自校验 round-trip 解析）
+  落 build/perf/machine_model.json，供后续 run-* 加载。
+- **链式块 min/med/max**：同标签块跨 iter 的 per-iter 墙钟分布。动机：均值
+  会被单个慢 iter 拉偏（P1 的 chunk 扫描已见），min 才是设备极限口径。
+- **submit 开销分档**：solo−burst 按 op 设备侧流量分桶（<1MiB/1-4/4-16/
+  ≥16MiB）取中位，对照模型常数 55µs。单一常数把 host 往返和 solo 排队撞上
+  的 CU 切换/PDI 重载混在一起；分桶后各桶才可解释。
+
+### 步骤与坑（全留痕）
+
+1. **cu_func ≠ CU 槽位（踩坑，10s 超时）**：perf-calibrate 初版把 flowkv PDI
+   配在 `(pdi, 1)` ——configure_cus 的第二个元素是 **cu_func（DPU 函数号，
+   必须 0）**，CU 槽位是列表下标、由 chain_op 的 cu 参数选择。func=1 时固件
+   查一个 PDI 里不存在的 DPU 函数，op 永不执行，syncobj 10s 超时。run-decode
+   4080 行注释早就写着这个陷阱（"func != 0 … the op never runs"），没看熟。
+   修：两 PDI 都 func 0，flowkv op 走 cu 1。
+2. **µs 边界吞事件（踩坑，gateup 丢 burst 归属）**：首跑 gateup 的 burst 块
+   被"误判成链式块"（cov=0.5）。dump trace 真相：块窗口 [47381, 116437] 里
+   有 48 个 gateup burst + **1 个 down solo**——wait 返回 → burst_done 打戳 →
+   立即 submit 下一个形状的首个 solo，三步落在**同一微秒**，闭区间把外来
+   事件吞了。修：块归属窗口改半开 `[t_start, t_complete)`；块自己的末次
+   submit 至少早完成一个设备 op，不会撞上界。单元测试 chain_min_med_max
+   钉住分布语义。
+3. **gateup 首跑 69ms/48op=1438µs vs 修后 49ms/48=1030µs**：同代码两次跑
+   差 40%（29.6 vs 41.3 GB/s）。归因：48 深队列连续 submit 的背压/调度非
+   确定性（M2 run-pipe 见过同款）。**burst 天花板本身是下界口径**——取
+   多跑最大值；这也解释了为什么校准值（41.2）应低于真硬件极限（FLM 同
+   机器 48–64）。记录在 provenance。
+4. 测试：xnpu-perf 9/9（新增 overlay 嵌套 bw_tiers 合并、bw_for 查表/未知
+   档兜底、tier 选 verdict 分母、链 min/med/max 分布）。
+
+### 结果（hy-mt2，layer00，6 solo + 48 burst，两跑一致）
+
+| op | F | solo µs | burst/op µs | slot GB/s | %bw(41.2) |
+|---|---|---|---|---|---|
+| qkv | 6 | 364 | 279 | 38.0 | 88% |
+| o | 4 | 256 | 195 | 36.4 | 85% |
+| gateup | 24 | 1130 | 1030 | 41.3 | 96% |
+| down | 4 | 541 | 471 | 15.1 | 35% |
+| flowkv | – | 2343 | 2288 | 0.92 (strided 档) | 77% of 1.2 |
+
+- **校准产物**：`bw_tiers {slot-stream 41.2, strided 0.95}`，submit 52.8µs，
+  seq-dma 保留 52（未自测）。build/perf/machine_model.json。
+- **down 是 slot 档的短板**（15 vs 41）：K=6144=K_MAX 无 padding（stream≈
+  useful），F=4 复制窄——每列有用速率的地板。而 K=2048 形状 3× padding
+  换来 36-41 GB/s slot 流：**同一内核里 padding 与速率强相关**，消 padding
+  （双 PDU per-K ELEM）必须同时提每列速率才不倒退（M3b 遗留方向的定量注脚）。
+- **submit 开销分桶**（perf-calibrate 报告）：1-4MiB=55µs（+0%，flowkv 干净
+  solo）/ 4-16MiB=69.7（+27%）/ ≥16MiB=81.7（+49%）——随流大小单调涨，
+  大 op 的 solo 里混进了排队效应，不止 host 往返。run-decode（纯 solo 链）
+  无 burst 对照，该节自动隐藏（设计如此）。
+- **run-decode hy 4 iters（NPU attention）新报告**：decode-step 链
+  min/med/max = 178.1/182.9/190.0 ms（5.5 tok/s 路径）；`o` 的 solo
+  971µs vs 隔离 195µs —— CU 切换代价自动归属到切换后首个 op（P1 结论在
+  分档口径下重现）；flowkv useful 0.10 vs stream 0.94 GB/s 双口径同表
+  （S 很小、内核按编译容量整流的语义直接可读）。
+
+### 语义讨论（记下来防止将来误读）
+
+- **strided 档的循环性**：1.2 的"天花板"本身就来自 flowkv（P2），flowkv
+  对它永远 ~77%。这档的含义是"该访问形态下已观察到的上界"——判 memory-bound
+  说的是"在此形态内余量不大，要快就得换形态"（S 感知 DMA），不是"硬件到顶"。
+  各档天花板全部是**实测下界**语义，报告口径写明。
+- verdict 词表未变，但分母换了：P1 时代 gateup 130%（>100% 暴露锚点失效）
+  现在 96%（真实余量读数）。**>100% 不再出现 = 分档起了作用**；若未来再见
+  >100%，说明出现了新档未建模（如 LM 融合内核的 48-64 GB/s 形态——那是
+  seq-dma 与 slot 之间的东西，等我们有融合内核再立档）。
+
+### 遗留
+
+- seq-dma 档无自测内核（纯顺序大流 DMA 夹具，或拿 lm_head w4 化后回测）。
+- 校准值随队列深度漂移（40% 级）：后续 perf-calibrate 可加深度扫描
+  （burst_n 8/16/32/64）取拐点，现在只取单深度最大值。
+- run-* 主线尚未加载 machine_model.json（overlay_json 就绪，接线一行）。
