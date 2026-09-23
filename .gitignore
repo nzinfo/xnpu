@@ -1,0 +1,14 @@
+# Nested repos manage themselves
+IRON/
+xnpu/
+
+# Toolchains, builds, models, scratch
+ironenv/
+iree-amd-aie/
+build/
+logs/
+models/
+tests_latest.csv
+__pycache__/
+*.pyc
+.aiecc_failure_*
