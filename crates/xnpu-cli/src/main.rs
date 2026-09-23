@@ -3401,7 +3401,7 @@ fn cmd_run_w4ulayer(w4dir: &str, nlayers: usize, iters: usize) -> ExitCode {
     }
 
     // ---- M5a xnpu-perf 报告：per-op 表 + 链式块对比 + roofline 判定 ----
-    let model = MachineModel::default();
+    let model = machine_model_or_default();
     let title = format!("run-w4ulayer: {nlayers} layers x 4 shapes, {iters} iters/mode");
     let (md, summary) = xnpu_perf::render_markdown(&rec, &metas, &model, &title);
     println!("\n{md}");
@@ -3424,6 +3424,26 @@ fn cmd_run_w4ulayer(w4dir: &str, nlayers: usize, iters: usize) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// M5a P6 收尾（P7 接线）：报告一律对最新校准渲染 —— perf-calibrate 的
+/// 产物 build/perf/machine_model.json 存在则 overlay 到默认值上；解析失败
+/// 退回默认值并提示，绝不阻塞测量本身。
+fn machine_model_or_default() -> MachineModel {
+    const PATH: &str = "/home/nzinfo/qwen/xnpu/build/perf/machine_model.json";
+    match std::fs::read_to_string(PATH) {
+        Ok(text) => match MachineModel::default().overlay_json(&text) {
+            Ok(m) => {
+                println!("machine model: {PATH}（{}）", m.name);
+                m
+            }
+            Err(e) => {
+                eprintln!("machine model {PATH} 解析失败（{e}）— 用默认值");
+                MachineModel::default()
+            }
+        },
+        Err(_) => MachineModel::default(),
+    }
+}
+
 /// M5a P6: measure the machine-model ceilings on-device and emit the overlay
 /// JSON. Per shape (layer-00 real weights, ONE universal w4gemvu CU):
 /// solo xN then a same-op burst block — the FIRST per-shape burst/op numbers
@@ -3437,10 +3457,14 @@ fn cmd_perf_calibrate(arch: &DecArch, iters: usize) -> ExitCode {
     let build = "/home/nzinfo/qwen/xnpu/build";
     let shapes = arch.shapes();
     let w4dir = arch.w4dir;
-    let burst_n = (iters * 8).max(16);
+    // 队列深度扫描（P7）：P6 的 48-op gateup 块两跑差 40%（29.6→41.3 GB/s），
+    // 深队列背压非确定 —— 单一深度读数不可作天花板。每个深度各出一块
+    // （事件名带 /dN 后缀，报告 per-op 表逐深度成行），天花板 = 跨深度
+    // （及跨跑）最大值，仍是下界语义。
+    const DEPTHS: [usize; 4] = [8, 16, 32, 64];
     println!(
-        "perf-calibrate: {} shapes, layer00 weights, {} solo + {} burst/op",
-        arch.name, iters, burst_n
+        "perf-calibrate: {} shapes, layer00 weights, {} solo + burst depth sweep {:?}",
+        arch.name, iters, DEPTHS
     );
 
     let fixtures: Vec<(Vec<u8>, Vec<u8>, u32)> = shapes
@@ -3594,8 +3618,13 @@ fn cmd_perf_calibrate(arch: &DecArch, iters: usize) -> ExitCode {
         ops.push(op);
     }
 
-    // Per shape: solo xN (submit+wait), then ONE same-op burst block.
-    println!("\n== slot-stream tier（每形状 solo + 同 op 连发） ==");
+    // Per shape: solo xN (submit+wait), then one same-op burst block PER
+    // DEPTH. Depth rows carry the "/dN" name suffix so the report table
+    // shows one row per (shape, depth); the base name keeps the solos.
+    // Depth metas must reach all_metas — the report looks bytes/tier up by
+    // exact name, naked rows would render as n/a-bytes.
+    println!("\n== slot-stream tier（每形状 solo + 同 op 连发深度扫描 {:?}） ==", DEPTHS);
+    let mut all_metas: Vec<OpMeta> = metas.clone();
     for si in 0..4 {
         for it in 0..iters {
             let ts = std::time::Instant::now();
@@ -3613,33 +3642,31 @@ fn cmd_perf_calibrate(arch: &DecArch, iters: usize) -> ExitCode {
             rec.solo(&metas[si], it as u32, ts, rec_seq);
             rec_seq += 1;
         }
-        let t0 = std::time::Instant::now();
-        let mut last_seq = 0u64;
-        for it in 0..burst_n {
-            match ops[si].pkt.submit(&dev, &ctx, &op_handles[si]) {
-                Ok(s) => {
-                    last_seq = s;
-                    rec.burst_submit(&metas[si], it as u32, rec_seq);
-                    rec_seq += 1;
-                }
-                Err(e) => {
-                    eprintln!("burst submit {}: {e}", shapes[si].name);
-                    return ExitCode::FAILURE;
+        for &d in DEPTHS.iter() {
+            let mut dm = metas[si].clone();
+            dm.name = format!("{}/d{d}", shapes[si].name);
+            let t0 = std::time::Instant::now();
+            let mut last_seq = 0u64;
+            for it in 0..d {
+                match ops[si].pkt.submit(&dev, &ctx, &op_handles[si]) {
+                    Ok(s) => {
+                        last_seq = s;
+                        rec.burst_submit(&dm, it as u32, rec_seq);
+                        rec_seq += 1;
+                    }
+                    Err(e) => {
+                        eprintln!("burst submit {}: {e}", dm.name);
+                        return ExitCode::FAILURE;
+                    }
                 }
             }
+            if syncobj_timeline_wait(&dev, ctx.syncobj_handle, last_seq, 10_000_000_000).is_err() {
+                eprintln!("burst wait {} timed out", dm.name);
+                return ExitCode::FAILURE;
+            }
+            rec.burst_done(&dm.name, Mode::Burst, 0, t0, d as u32, d as u32);
+            all_metas.push(dm);
         }
-        if syncobj_timeline_wait(&dev, ctx.syncobj_handle, last_seq, 10_000_000_000).is_err() {
-            eprintln!("burst wait {} timed out", shapes[si].name);
-            return ExitCode::FAILURE;
-        }
-        rec.burst_done(
-            shapes[si].name,
-            Mode::Burst,
-            0,
-            t0,
-            burst_n as u32,
-            burst_n as u32,
-        );
     }
 
     // flowkv (cu1): zeros are fine — S header 0 = full compiled capacity, and
@@ -3728,7 +3755,6 @@ fn cmd_perf_calibrate(arch: &DecArch, iters: usize) -> ExitCode {
         fk_op = Some((op, handles, (kv_bo, _kv_map), (q_bo, q_map), (o_bo, o_map)));
     }
 
-    let mut all_metas = metas.clone();
     if let Some((op, handles, (_kv_bo, _), (_q_bo, _), (o_bo, _))) = fk_op.as_mut() {
         println!("\n== strided tier（flowkv 容量流，S=0） ==");
         const FK_CAP_U: u64 = 1024;
@@ -3761,66 +3787,123 @@ fn cmd_perf_calibrate(arch: &DecArch, iters: usize) -> ExitCode {
             rec.solo(&m, it as u32, ts, rec_seq);
             rec_seq += 1;
         }
-        let t0 = std::time::Instant::now();
-        let mut last_seq = 0u64;
-        for it in 0..burst_n / 2 {
-            let _ = o_bo.sync(SyncDirection::ToDevice, 0, o_bo.size() as u64);
-            match op.pkt.submit(&dev, &ctx, handles) {
-                Ok(s) => {
-                    last_seq = s;
-                    rec.burst_submit(&m, it as u32, rec_seq);
-                    rec_seq += 1;
-                }
-                Err(e) => {
-                    eprintln!("flowkv burst submit: {e}");
-                    return ExitCode::FAILURE;
+        let mut fk_depth_metas: Vec<OpMeta> = Vec::new();
+        for &d in DEPTHS.iter() {
+            let mut dm = m.clone();
+            dm.name = format!("flowkv/d{d}");
+            let tb = std::time::Instant::now();
+            let mut last_seq = 0u64;
+            for it in 0..d {
+                let _ = o_bo.sync(SyncDirection::ToDevice, 0, o_bo.size() as u64);
+                match op.pkt.submit(&dev, &ctx, handles) {
+                    Ok(s) => {
+                        last_seq = s;
+                        rec.burst_submit(&dm, it as u32, rec_seq);
+                        rec_seq += 1;
+                    }
+                    Err(e) => {
+                        eprintln!("flowkv burst submit: {e}");
+                        return ExitCode::FAILURE;
+                    }
                 }
             }
+            if syncobj_timeline_wait(&dev, ctx.syncobj_handle, last_seq, 10_000_000_000).is_err() {
+                eprintln!("flowkv burst wait timed out");
+                return ExitCode::FAILURE;
+            }
+            rec.burst_done(&dm.name, Mode::Burst, 0, tb, d as u32, d as u32);
+            fk_depth_metas.push(dm);
         }
-        if syncobj_timeline_wait(&dev, ctx.syncobj_handle, last_seq, 10_000_000_000).is_err() {
-            eprintln!("flowkv burst wait timed out");
-            return ExitCode::FAILURE;
-        }
-        rec.burst_done("flowkv", Mode::Burst, 0, t0, (burst_n / 2) as u32, (burst_n / 2) as u32);
         all_metas.push(m);
+        all_metas.extend(fk_depth_metas);
     }
 
     // ---- report + overlay JSON ----
-    let model = MachineModel::default();
-    let title = format!("perf-calibrate: {} shapes, layer00, {iters} solo + {burst_n} burst", arch.name);
+    // 起点是上一次校准（merge 语义：本次实测的键覆盖，未测的保留）。
+    let model = machine_model_or_default();
+    let title = format!(
+        "perf-calibrate: {} shapes, layer00, {iters} solo + burst depth sweep {:?}",
+        arch.name, DEPTHS
+    );
     let (md, summary) = xnpu_perf::render_markdown(&rec, &all_metas, &model, &title);
     println!("\n{md}");
 
-    let by_name = |n: &str| summary.ops.iter().find(|o| o.name == n);
+    // 深度行名 = "{base}/d{N}"，solo 只记在 base 名下 —— overhead = base
+    // solo_med − 各深度 burst/op（每深度一个样本进中位，深度间应平坦，
+    // 不平坦本身就是发现）。
+    fn base_of(n: &str) -> &str {
+        n.split('/').next().unwrap_or(n)
+    }
+    let solo_med_of = |n: &str| {
+        summary
+            .ops
+            .iter()
+            .find(|o| o.name == n)
+            .and_then(|o| o.solo_med_us)
+    };
     let mut slot_ceiling = 0f64;
     let mut ovhs: Vec<f64> = Vec::new();
+    println!("== 深度扫描结果（slot-stream） ==");
     for s in shapes.iter() {
-        if let Some(o) = by_name(s.name)
-            && let (Some(b), Some(sb)) = (o.burst_us_per_op, o.stream_bytes)
-        {
+        let solo_m = solo_med_of(s.name);
+        for o in summary.ops.iter().filter(|o| base_of(&o.name) == s.name) {
+            let (Some(b), Some(sb)) = (o.burst_us_per_op, o.stream_bytes) else {
+                continue; // base 行只有 solo
+            };
             let g = sb as f64 / (1000.0 * b);
             slot_ceiling = slot_ceiling.max(g);
-            if let Some(ovh) = o.overhead_us() {
-                ovhs.push(ovh);
+            if let Some(sm) = solo_m {
+                ovhs.push(sm - b);
             }
             println!(
-                "  {:>7} (F={}): burst {:>6.1} µs -> {:>5.1} GB/s slot stream (ovh {})",
-                s.name,
+                "  {:>12} (F={}): burst {:>7.1} µs/op -> {:>5.1} GB/s slot stream (solo {}, ovh {})",
+                o.name,
                 s.f,
                 b,
                 g,
-                o.overhead_us().map(|v| format!("{v:.1} µs")).unwrap_or_else(|| "–".into())
+                solo_m.map(|v| format!("{v:.1} µs")).unwrap_or_else(|| "–".into()),
+                solo_m.map(|sm| format!("{:.1} µs", sm - b)).unwrap_or_else(|| "–".into()),
             );
         }
     }
-    let strided = by_name("flowkv")
-        .and_then(|o| o.burst_us_per_op.zip(o.stream_bytes).map(|(b, sb)| sb as f64 / (1000.0 * b)));
+    let strided = summary
+        .ops
+        .iter()
+        .filter(|o| base_of(&o.name) == "flowkv")
+        .filter_map(|o| o.burst_us_per_op.zip(o.stream_bytes))
+        .map(|(b, sb)| sb as f64 / (1000.0 * b))
+        .fold(0f64, f64::max);
+    let strided = (strided > 0.0).then_some(strided);
+    if strided.is_some() {
+        println!("\n== 深度扫描结果（strided / flowkv） ==");
+        for o in summary
+            .ops
+            .iter()
+            .filter(|o| o.name != "flowkv" && base_of(&o.name) == "flowkv")
+        {
+            if let (Some(b), Some(sb)) = (o.burst_us_per_op, o.stream_bytes) {
+                println!(
+                    "  {:>12}: burst {:>7.1} µs/op -> {:>5.2} GB/s strided",
+                    o.name,
+                    b,
+                    sb as f64 / (1000.0 * b)
+                );
+            }
+        }
+    }
     ovhs.sort_by(|a, b| a.total_cmp(b));
     let submit_ovh = if ovhs.is_empty() {
         model.submit_overhead_us // 无 burst 数据时保留默认
     } else {
         ovhs[ovhs.len() / 2]
     };
+    // 稳健性：本轮一个可测行都没有时保留模型现值，绝不把 0 写进 overlay
+    // （P7 实测中招：一次 meta 缺失的跑把 slot-stream 0.0 写进
+    // machine_model.json，下一跑全表 inf%）。
+    if slot_ceiling <= 0.0 {
+        slot_ceiling = model.bw_for(Some(tier::SLOT_STREAM));
+        eprintln!("slot ceiling 本轮无可测样本 — 保留模型现值 {slot_ceiling:.1}");
+    }
 
     println!("\n== 校准结果 ==");
     println!("slot-stream ceiling = {:.1} GB/s", slot_ceiling);
@@ -3835,9 +3918,10 @@ fn cmd_perf_calibrate(arch: &DecArch, iters: usize) -> ExitCode {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let prov = format!(
-        "perf-calibrate {}: slot-stream={:.1} GB/s（burst 上界），strided={}，seq-dma=52 FLM 下界（M5c P5，未自测），submit={:.1}µs solo−burst 中位",
+        "perf-calibrate {}: slot-stream={:.1} GB/s（burst 深度扫描 {:?} 取跨深度最大），strided={}，seq-dma=52 FLM 下界（M5c P5，未自测），submit={:.1}µs solo−burst 中位",
         arch.name,
         slot_ceiling,
+        DEPTHS,
         strided.map(|g| format!("{g:.2}")).unwrap_or_else(|| "默认1.2".into()),
         submit_ovh
     );
@@ -4762,7 +4846,7 @@ fn cmd_run_decode(
     );
 
     // ---- M5a xnpu-perf 报告 ----
-    let model = MachineModel::default();
+    let model = machine_model_or_default();
     let title = format!(
         "run-decode: {} {}L, {} attention, {iters} timed iters",
         arch.name,
@@ -5132,7 +5216,7 @@ fn cmd_run_fkprobe(prj: &str, iters: usize) -> ExitCode {
         }
     }
 
-    let model = MachineModel::default();
+    let model = machine_model_or_default();
     let title = format!("run-fkprobe: flowkv 16h/2kv d128 S=1024, {iters} solo + {BURST_N} burst");
     let (md, summary) = xnpu_perf::render_markdown(&rec, &metas, &model, &title);
     println!("\n{md}");
