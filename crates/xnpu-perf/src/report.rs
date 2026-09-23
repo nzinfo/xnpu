@@ -289,12 +289,15 @@ pub fn render_markdown(
         for c in &summary.chains {
             let per_iter = c.per_iter_us();
             let cov = c.coverage();
-            let serial: Option<f64> = c
-                .names
-                .iter()
-                .map(|n| solo_of.get(n.as_str()).copied())
-                .sum::<Option<f64>>()
-                .map(|s| s * cov);
+            let serial: Option<f64> = if c.names.is_empty() {
+                None
+            } else {
+                c.names
+                    .iter()
+                    .map(|n| solo_of.get(n.as_str()).copied())
+                    .sum::<Option<f64>>()
+                    .map(|s| s * cov)
+            };
             let serial_s = serial
                 .map(|v| format!("{v:.1}"))
                 .unwrap_or_else(|| "–".into());
@@ -333,18 +336,14 @@ fn summarize(rec: &Recorder, metas: &[OpMeta]) -> ReportSummary {
         evs.entry(e.name.as_str()).or_default().push(e);
     }
 
-    // 块归属：窗口内 burst 事件的 op 名集合
+    // 块归属：窗口内事件（任意模式）的 op 名集合
     let mut per_op_burst: BTreeMap<&str, (f64, u32)> = BTreeMap::new(); // (wall_sum, submits)
     let mut chain_map: BTreeMap<(String, Mode), ChainStats> = BTreeMap::new();
     for b in &rec.blocks {
         let names: BTreeSet<&str> = rec
             .events
             .iter()
-            .filter(|e| {
-                e.mode == Mode::Burst
-                    && e.t_submit_us >= b.t_start_us
-                    && e.t_submit_us <= b.t_complete_us
-            })
+            .filter(|e| e.t_submit_us >= b.t_start_us && e.t_submit_us <= b.t_complete_us)
             .map(|e| e.name.as_str())
             .collect();
         let wall = (b.t_complete_us - b.t_start_us) as f64;
@@ -496,5 +495,46 @@ mod tests {
         for o in &summary.ops {
             assert!(o.burst_us_per_op.is_none());
         }
+    }
+
+    /// run-decode 模式：链块窗口内全是 solo 事件（每 op submit+wait 的链），
+    /// 名字归属与覆盖倍数必须照常工作（regression：曾按 burst-only 收名，
+    /// cov=168/1、serial=Some(0)）。
+    #[test]
+    fn solo_only_chain_block() {
+        let mut rec = Recorder::new();
+        let a = OpMeta::new("opA", "f", 0, 100, 10, 0);
+        let b_ = OpMeta::new("opB", "f", 1, 100, 10, 0);
+        // 2 个 iter，每 iter 各 op 提交 3 次（solo）
+        for it in 0..2u32 {
+            let tb = Instant::now();
+            for _ in 0..3 {
+                let t0 = Instant::now();
+                sleep(Duration::from_micros(50));
+                rec.solo(&a, it, t0, 0);
+                let t0 = Instant::now();
+                sleep(Duration::from_micros(50));
+                rec.solo(&b_, it, t0, 1);
+            }
+            rec.burst_done("decode-step", Mode::Solo, it, tb, 6, 1);
+        }
+        let (_, summary) = render_markdown(&rec, &[a, b_], &MachineModel::default(), "t");
+        assert_eq!(summary.chains.len(), 1);
+        let c = &summary.chains[0];
+        assert_eq!(c.names.len(), 2, "solo events must feed chain names");
+        assert!((c.coverage() - 3.0).abs() < 1e-9, "cov=3, got {}", c.coverage());
+        // 每 op solo_med ≥50µs，serial est ≥ 2×50×3
+        let solo_of: std::collections::BTreeMap<&str, f64> = summary
+            .ops
+            .iter()
+            .filter_map(|o| o.solo_med_us.map(|v| (o.name.as_str(), v)))
+            .collect();
+        let serial: f64 = c
+            .names
+            .iter()
+            .map(|n| solo_of[n.as_str()])
+            .sum::<f64>()
+            * c.coverage();
+        assert!(serial >= 290.0, "serial est {serial}");
     }
 }

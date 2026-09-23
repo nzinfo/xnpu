@@ -3784,8 +3784,50 @@ fn cmd_run_decode(decdir: &str, w4dir: &str, iters: usize, npu_attn: bool) -> Ex
         None
     };
 
+    // M5a xnpu-perf: per-shape OpMeta（同 run-w4ulayer）+ flowkv（S=pos+1
+    // 运行时；stream 口径给满编译容量的 KV 全量）。it=0 的 checked step
+    // 含逐层 golden 磁盘读，不记录，避免污染 solo 分布。
+    let metas: Vec<OpMeta> = W4U_SHAPES
+        .iter()
+        .map(|s| {
+            let mut m = OpMeta::new(
+                s.name,
+                "w4gemvu",
+                0,
+                (s.m * s.k / 2 + s.m * (s.k / 32) * 2 + s.k * 2) as u64,
+                (s.m * 2) as u64,
+                (2 * s.m * s.k) as u64,
+            );
+            m.bytes_stream = Some((8 * (s.m / 32) * W4U_ELEM) as u64);
+            m
+        })
+        .chain(std::iter::once({
+            let s_pos = (pos + 1) as u64;
+            let mut m = OpMeta::new(
+                "flowkv",
+                "attn",
+                1,
+                2 * s_pos * 2 * 128 * 2 + 2 * FK_STRIDE as u64 * 2, // S 行 KV + q
+                (16 * 128 * 2) as u64,
+                (16 * s_pos * 128 * 2 * 2) as u64,
+            );
+            // 内核按编译容量流 KV（S 是运行时 header）；stream 口径给全量
+            m.bytes_stream = Some(2 * FK_CAP as u64 * 2 * 128 * 2 + 2 * FK_STRIDE as u64 * 2);
+            m
+        }))
+        .collect();
+    let mut rec = Recorder::new();
+    let mut rec_seq = 0u64;
+
     // One w4gemvu call: replicate x into the vector BO, submit, wait, read c.
-    let mut gemv = |ops: &mut [ChainOp], i: usize, si: usize, x: &[u16]| -> Option<Vec<u16>> {
+    let mut gemv = |ops: &mut [ChainOp],
+                    i: usize,
+                    si: usize,
+                    x: &[u16],
+                    it: u32,
+                    rec: &mut Recorder,
+                    rec_seq: &mut u64|
+     -> Option<Vec<u16>> {
         let k = W4U_SHAPES[si].k;
         let m = W4U_SHAPES[si].m;
         let vi = if k == 6144 { 1 } else { 0 };
@@ -3804,6 +3846,7 @@ fn cmd_run_decode(decdir: &str, w4dir: &str, iters: usize, npu_attn: bool) -> Ex
                 return None;
             }
         }
+        let ts = std::time::Instant::now();
         let op = &mut ops[i];
         let seq = match op.pkt.submit(&dev, &ctx, &op_handles[i]) {
             Ok(s) => s,
@@ -3815,6 +3858,10 @@ fn cmd_run_decode(decdir: &str, w4dir: &str, iters: usize, npu_attn: bool) -> Ex
         if let Err(e) = syncobj_timeline_wait(&dev, ctx.syncobj_handle, seq, 10_000_000_000) {
             eprintln!("gemv wait (op {i}, seq {seq}): {e}");
             return None;
+        }
+        if it > 0 {
+            rec.solo(&metas[si], it, ts, *rec_seq);
+            *rec_seq += 1;
         }
         let (c_bo, c_map) = &live[2 + si];
         // SHMEM is coherent; the direction-1 ioctl needs a debug BO (M1) —
@@ -3850,12 +3897,15 @@ fn cmd_run_decode(decdir: &str, w4dir: &str, iters: usize, npu_attn: bool) -> Ex
                        x: &mut Vec<u16>,
                        sc: &mut Scratch,
                        fk: &mut Option<FkState>,
-                       check: bool|
+                       check: bool,
+                       it: u32,
+                       rec: &mut Recorder,
+                       rec_seq: &mut u64|
      -> bool {
         for n in 0..42usize {
             let Scratch { xn, qr, kr, attn, gu, sw } = sc;
             rms_norm_bf16(x, &norms[n * 2 * 2048..][..2048], xn);
-            let qkv = match gemv(ops, n * 4, 0, xn) {
+            let qkv = match gemv(ops, n * 4, 0, xn, it, rec, rec_seq) {
                 Some(v) => v,
                 None => return false,
             };
@@ -3911,6 +3961,7 @@ fn cmd_run_decode(decdir: &str, w4dir: &str, iters: usize, npu_attn: bool) -> Ex
                     // the o BO's cache lines before submit so the post-wait
                     // read sees the DMA writes.
                     let _ = fk.o.0.sync(SyncDirection::ToDevice, 0, fk.o.0.size() as u64);
+                    let ts = std::time::Instant::now();
                     let seq = match op.pkt.submit(&dev, &ctx, &fk.handles[n]) {
                         Ok(s) => s,
                         Err(e) => {
@@ -3924,6 +3975,10 @@ fn cmd_run_decode(decdir: &str, w4dir: &str, iters: usize, npu_attn: bool) -> Ex
                         eprintln!("flowkv wait (layer {n}, seq {seq}): {e}");
                         return false;
                     }
+                    if it > 0 {
+                        rec.solo(&metas[4], it, ts, *rec_seq);
+                        *rec_seq += 1;
+                    }
                     // SHMEM is coherent; the direction-1 ioctl is best-effort.
                     let _ = fk.o.0.sync(SyncDirection::FromDevice, 0, fk.o.0.size() as u64);
                     let os = fk.o.1.as_slice();
@@ -3936,19 +3991,19 @@ fn cmd_run_decode(decdir: &str, w4dir: &str, iters: usize, npu_attn: bool) -> Ex
                     attention_bf16(qr, &kcache[klo..], &vcache[klo..], pos, cache_seq, attn);
                 }
             }
-            let o = match gemv(ops, n * 4 + 1, 1, attn) {
+            let o = match gemv(ops, n * 4 + 1, 1, attn, it, rec, rec_seq) {
                 Some(v) => v,
                 None => return false,
             };
             add_bf16(x, &o, xn); // x = x + o (reuse xn as scratch)
             std::mem::swap(x, xn);
             rms_norm_bf16(x, &norms[(n * 2 + 1) * 2048..][..2048], xn);
-            *gu = match gemv(ops, n * 4 + 2, 2, xn) {
+            *gu = match gemv(ops, n * 4 + 2, 2, xn, it, rec, rec_seq) {
                 Some(v) => v,
                 None => return false,
             };
             swiglu_bf16(gu, sw);
-            let d = match gemv(ops, n * 4 + 3, 3, sw) {
+            let d = match gemv(ops, n * 4 + 3, 3, sw, it, rec, rec_seq) {
                 Some(v) => v,
                 None => return false,
             };
@@ -3985,7 +4040,10 @@ fn cmd_run_decode(decdir: &str, w4dir: &str, iters: usize, npu_attn: bool) -> Ex
     let mut t0 = std::time::Instant::now();
     {
         let mut ops2 = std::mem::take(&mut ops);
-        let ok = decode_step(&mut ops2, &mut kcache, &mut vcache, &mut x, &mut sc, &mut fk, true);
+        let ok = decode_step(
+            &mut ops2, &mut kcache, &mut vcache, &mut x, &mut sc, &mut fk, true, 0,
+            &mut rec, &mut rec_seq,
+        );
         ops = ops2;
         if !ok {
             eprintln!("decode step failed");
@@ -4037,14 +4095,26 @@ fn cmd_run_decode(decdir: &str, w4dir: &str, iters: usize, npu_attn: bool) -> Ex
 
     // Timed iterations (steady state; caches are idempotent at fixed pos).
     t0 = std::time::Instant::now();
-    for _ in 0..iters {
+    for it in 1..=iters as u32 {
+        let tb = std::time::Instant::now();
         let mut ops2 = std::mem::take(&mut ops);
-        let ok = decode_step(&mut ops2, &mut kcache, &mut vcache, &mut x, &mut sc, &mut fk, false);
+        let ok = decode_step(
+            &mut ops2, &mut kcache, &mut vcache, &mut x, &mut sc, &mut fk, false, it,
+            &mut rec, &mut rec_seq,
+        );
         ops = ops2;
         if !ok {
             eprintln!("timed decode step failed");
             return ExitCode::FAILURE;
         }
+        rec.burst_done(
+            "decode-step",
+            Mode::Solo,
+            it,
+            tb,
+            (if npu_attn { 168 + 42 } else { 168 }) as u32,
+            1,
+        );
     }
     let per = t0.elapsed() / iters as u32;
     println!(
@@ -4066,6 +4136,34 @@ fn cmd_run_decode(decdir: &str, w4dir: &str, iters: usize, npu_attn: bool) -> Ex
             " on 1 CU"
         },
     );
+
+    // ---- M5a xnpu-perf 报告 ----
+    let model = MachineModel::default();
+    let title = format!(
+        "run-decode: 42L, {} attention, {iters} timed iters",
+        if npu_attn { "NPU flowkv" } else { "CPU scalar" }
+    );
+    let (md, summary) = xnpu_perf::render_markdown(&rec, &metas, &model, &title);
+    println!("\n{md}");
+    let dir = "/home/nzinfo/qwen/xnpu/build/perf";
+    if std::fs::create_dir_all(dir).is_ok() {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let stem = format!(
+            "{dir}/decode_{}_{}it_{ts}",
+            if npu_attn { "npu" } else { "cpu" },
+            iters
+        );
+        let json = trace_json(&rec, &model, &title, &summary);
+        match std::fs::write(format!("{stem}.json"), json)
+            .and_then(|()| std::fs::write(format!("{stem}.md"), &md))
+        {
+            Ok(()) => println!("perf trace written: {stem}.json / .md"),
+            Err(e) => eprintln!("perf trace write failed: {e}"),
+        }
+    }
 
     ExitCode::SUCCESS
 }
