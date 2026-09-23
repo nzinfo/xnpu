@@ -592,3 +592,69 @@ M5a 收尾。P1 立的四个欠账一次清掉：单锚带宽证伪后的**分�
 - 校准值随队列深度漂移（40% 级）：后续 perf-calibrate 可加深度扫描
   （burst_n 8/16/32/64）取拐点，现在只取单深度最大值。
 - run-* 主线尚未加载 machine_model.json（overlay_json 就绪，接线一行）。
+
+## P7 校准收尾：machine_model.json 接线 + 队列深度扫描（2026-09-24⑥）
+
+P6 三遗留清两项半：① run-* 报告全部对最新校准渲染（接线落地）；②
+perf-calibrate 深度扫描（8/16/32/64）——**P6 的"深队列背压"假设被证伪**；
+③ seq-dma 夹具评估后判定现有夹具不可用（算术见下），FLM 52 下界保留。
+
+### 设计
+
+- `machine_model_or_default()`：`build/perf/machine_model.json` 存在则
+  overlay 到默认值（merge 语义——本次实测键覆盖、未测键保留），解析失败
+  退默认并提示，绝不阻塞测量。四个报告点全接：run-w4ulayer /
+  perf-calibrate / run-decode / run-fkprobe。perf-calibrate 的起点也是
+  上一次校准，报告里能看到"旧天花板 vs 本次实测"的对照。
+- 深度扫描：每形状 solo×iters 后按 DEPTHS=[8,16,32,64] 各出一块同 op
+  连发块；深度行事件/metas 用 `{base}/d{N}` 名字——报告 per-op 表逐深度
+  成行（tier/字节随 meta 走），天花板 = 跨深度最大。overhead = base
+  solo_med − 各深度 burst/op（每深度一个样本进中位）。
+- flowkv 同样扫描（每 submit 前 o_bo clflush 照旧）。
+
+### 步骤与坑
+
+1. **深度行 meta 裸奔**（板上一跑即抓）：给事件改了名却忘了把改名后的
+   meta 塞进 all_metas —— 报告深度行全变 `n/a-bytes`，更糟的是
+   slot_ceiling 因此为 0 **写进了 machine_model.json**，下一跑接线读入后
+   全表 `inf%`。修复（双保险）：深度 meta 进 all_metas + **零天花板守卫**
+   （本轮无可测行时保留模型现值，绝不把 0 写进 overlay）。
+2. 闭包 `|n: &str| -> &str` 两个生命周期被推断成不同 → 编译错；改嵌套
+   `fn`（单输入生命周期正确省略）。
+3. provenance format 串加了 `{:?}` 占位忘加参数（编译期抓住）。
+4. **时序测试 flake 两跑**（均紧跟 release build 同命令触发，load 高时
+   sleep 精度劣化），8 连跑（含复现条件 2 次）不再现、失败名未捕获——
+   留档：若再现先抓名字再放宽界，不盲调。
+
+### 结果（同日 3 跑深度扫描）
+
+- **深度平坦**：8→64 每-op 差 ≤4%。gateup 45.4/45.6/45.7/45.7（d8→d64，
+  GB/s slot）、qkv 40.2→41.8、o 35-39（最噪 ±3%）、down 15.5→15.8、
+  flowkv 0.97→0.98。**P6 把 gateup 两跑 40% 差归因"深队列背压"是错的**
+  ——同一跑内深度无关；变异在**跑与跑之间**。
+- **跑间漂移（同日单调上行，跨 op 相关）**：gateup 41.3（P6）→ 42.5 →
+  45.4 → 45.7 → 45.6 GB/s；run-decode 链 182.9 → 161.2 ms/token；链内
+  flowkv 1976µs 快于隔离校准 2153µs（报告 109% 如实标记校准过期）。
+  跨 op 相关指向**全局设备态**（时钟/温度/固件状态机），根因未明——
+  开放问题。天花板"下界 + 多跑取最大"的 P6 语义因此更必要。
+- submit 常数三跑 52.8 → 86.6 → 55.7µs：单值是 16 样本（4 形状×4 深度）
+  的中位，qkv solo 偏高（372µs vs burst 258，首批 op 残留切换效应）会
+  拖偏 —— **P6 的流量分桶才是稳定视角**，单常数标注为噪声大。
+- 终态校准（落 machine_model.json）：slot-stream **45.6**、strided 0.98、
+  submit 55.7。down 仍是 slot 短板（15.7 GB/s，34%）。
+
+### seq-dma 夹具评估（为什么没做）
+
+- 现有 gemm 夹具全部 compute-bound：2048×2048×6144 = 51.5 GOP 对 ~91MB
+  流量，8 列 4.9-6 TF/s 时算力是瓶颈，测出来的是算力不是 DMA。
+- add 夹具 1 列且元素数语义含混 —— 单 shim 吞吐 ≠ 阵列聚合，立档无 op
+  认领，反而污染 tier 语义。
+- **正解 = lm_head w4 上 NPU（M4 遗留）**：124MB w4 顺序权重流正是
+  seq-dma 形态（FLM 133MiB/2.66ms 同款），届时天然回测。
+
+### 遗留
+
+- 跑间漂移根因（全局设备态）未明；校准建议每次重要测量前跑一次
+  perf-calibrate（<10s）取当日基线。
+- 时序测试 flake 名字未捕获（见坑 4）。
+- lm_head w4 = seq-dma 立档 + M4 收尾双收益，待排期。
