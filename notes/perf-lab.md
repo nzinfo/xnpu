@@ -310,3 +310,81 @@ bit-identical（仅 meta.json 加字段）。
 - flowkv 16h_4kv fixture 编译（IRON）→ hy NPU attention E2E。
 - FLM per-op trace 同 schema 对比（hook.cpp C++ 例外待用户裁决）。
 - MachineModel 带宽分档（按 op 流粒度重校准 bw_stream）。
+
+## P4（2026-09-24）hy NPU attention 12.1% 判读：AIE2P exp2 硬件初等函数 3–6% 系统误差（实锤）
+
+### 背景与判别设计
+
+M4a 已修 double-rope（内核对 Q 施 RoPE；宿主改喂 identity angles
+cos=1/sin=0（bf16 精确），q 预 rope+qk-norm 后送入——identity 下内核
+rope 位精确，宿主/内核职责干净分离）。此后 hy npu E2E 仍 12.1%（门槛
+5%，cpu 同链路 1.0%）→ 本条把 per-op flowkv 残差解剖到底。
+
+工具链（tools/，一次编译多 run 复用 runlist）：
+- `fk_hy_check.py`：E2E 精确 layer-0 数据（导出 norms/qknorms/cache）XRT
+  单独跑 flowkv，多档逐位仿真对拍 + 逐头 rms/lstsq scale/maxscore 表；
+- `fk_exp2_probe.py`：四模式 bisect（mono/shuf/dense×幅值）；
+- `fk_exp2_fine.py`：细步长 arg 扫描，V one-hot 逐位置暴露权重；
+- `fk_exp2_pairs.py`：成对同值 k（位置性 vs 取值性判别）+ 逆序（rescale 路径）；
+- `fk_exp2_iso.py`：**隔离测量**——单点非零 k，其余 100 位置 arg≡0
+  （f 恒 1），`x = 100p/(1−p)` 精确反解硬件 exp2 输出，201 个 arg。
+
+### 死路（全部留痕）
+
+1. Rust 打包：XRT 同打包复现 3.6%（O rms 0.080 上 0.00285）→ 非打包 bug。
+2. 尾部/runtime-S：−1e30 sentinel 代数中性，tail-pad 模型拟合更差（0.00832，
+   无 shrinkage）且逐头 lstsq scale≈1 早期即排除。
+3. 文档化舍入全链仿真（bf16 score 存储、1.4453125 伪 log2e、bf16 f/C_c、
+   l bf16 交叉、f32 Y）：hy 数据上仅 0.00046——**内核实测 0.00285 与文档
+   算术不符，偏差与模型正交**。trueLog2e 变体无差别。
+4. plain bf16 仿真 0.00051；exp2arg 模型 0.00280（更差）。
+5. online-rescale 路径：shuf-deep（中流 max 更新）贴合 0.0007 → C_c 路径
+   本身无辜（但见下：它放大真凶 3×）。
+6. 分数幅值律：dense×9 复现 hy 量级 0.0030 —— 误判为 score-ULP 放大；
+   mono 扫描 score 至 −16 却贴合 → score 侧额外 ULP 噪声被排除。
+7. 值核 bf16 乘积假设（f·V 逐项舍入）：real 数据上无改善（0.00293）。
+8. 位置性假设：成对同值 k 逐位相同（max 对内差 0.000000，跨头 0.000000）
+   → 误差是 score **取值**的确定函数，与位置/头/FIFO 无关。
+
+### 实锤（fk_exp2_iso.py，2026-09-24）
+
+`aie::exp2<bfloat16>` = `::exp2(accum<accfloat>)` AIE2P 硬件初等指令
+（elementary.hpp 仅此一路，无 f32 输出变体）的按值相对误差：
+
+- **mean +3.25%，max +5.67%，min −0.6%**（n=201，arg∈[−24,0]）；
+- arg=0 与整数 arg 处 ≈0；**峰值在 frac(arg)≈0.5–0.6，周期 1.0** ——
+  尾数多项式中段系统性偏高（粗系数快速路径）；
+- 确定性、逐位可复现（同 arg 同误差）。
+
+### 由此解释全部观测
+
+- l 虚高 +3.2%（f 均值 +3.25% → Σf 膨胀）→ 逐头 O scale 0.988–1.057；
+- 逐头误差与 maxscore 反相关：尖 softmax 主权重 arg≈0（精确区），平坦
+  softmax 的 arg 铺满 [−1,0]（误差区）——hy h(max 8.7)=0.4%、h(3.4)=6.5%；
+- 逆序扫描（每 chunk max 更新）误差 ×3 至 14.9%——C_c 同 intrinsic，
+  rescale 级联复利；
+- pytest 全容量均匀数据 f≡1（arg≡0 精确区）→ fixture 免疫，与旧
+  l-recursion bug 同款盲区；
+- 向量 rms 指标的教训：单维 4% 误差被 128 维稀释成 0.0005——**逐位置
+  相对误差才是 softmax 类算子的合格指标**（2f 反解法即为此设计）。
+
+### 系统性外延
+
+IRON `softmax.cc:61/146`、`mha.cc:256` 用同一 `aie::exp2<bfloat16>` 模式
+→ prefill/MHA 同病。aie_api aie2p 无精确 exp2（16-bit 输出快速族仅
+Fix2Float/Float2Fix/Inv/InvSqrt/Tanh/Exp2）。
+
+### 修法选项（待用户裁决 C++ 红线）
+
+1. flowkv.cc 换手写精确 2^x（f32 Horner 尾数多项式 + 指数位操作，~15 行，
+   f/C_c 三处共用 helper；顺手可把逐位置 broadcast-exp2 改整 chunk 向量化，
+   精度+性能双收）；
+2. 不动 C++：hy attention 留 CPU（S=101 时本就更快更准：12.8 vs 6.4 tok/s），
+   flowkv 数值噪声底记录在案；
+3. 两者并行：先 2 后 1。
+
+### 附带性能事实
+
+flowkv 4col 1819 µs/层 ×32 = 58 ms/token，按容量 1024 流 KV（1.15 GB/s）
+而非 runtime S——attention 上 NPU 前必须先修容量流（S-感知 DMA），否则
+数值修好也慢于 CPU。
