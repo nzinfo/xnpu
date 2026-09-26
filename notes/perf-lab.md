@@ -734,3 +734,65 @@ perf-calibrate 深度扫描（8/16/32/64）——**P6 的"深队列背压"假设
 - 跑间漂移根因（全局设备态）未明；machine_model.json 跨架构互踩；
   时序 flake 名字未捕获；seq-dma 自测内核仍未立档（lm_head 是其天然
   载荷但归 slot-stream 层）。
+
+## P9（2026-09-26）配置对比的决定性实验：o 算子 846→244µs（cu_mask 翻转税 19.3ms/token）+ 性能差距分解
+
+### 设计思路（一个异常引出的配置裁决）
+
+P8 后链表里 o 独瘦：solo 846µs / 8.4 GB/s，而同字节数的 down 502µs、
+更大的 qkv（10.6MB）只要 307µs。o 是链中唯一"前一 op 是异 CU（flowkv
+CU1）"的算子 → 假设：M2 的 cu_mask 变更 → 固件 PDI 重载（~650µs）
+在通用 PDI 时代仍然存在，每次 mask 翻转付一次。**决定性实验**：
+`run-decode hy cpu`（无 flowkv 提交，其余全同）——o 降到 **244µs
+（29.0 GB/s，64% %bw）**，假设坐实。w4gemvu PDI 通用化消灭了 CU0 内的
+重载，但 CU0↔CU1 翻转每层仍付 ~600µs，×32 = **19.3ms/token 纯税**。
+
+### 两种配置同日对照（都是 5 iters、同校准）
+
+| 配置 | ms/token | tok/s | 分解 |
+|---|---|---|---|
+| CPU attention + NPU 投影 + NPU lm_head | **87.2** | **11.5** | w4gemvu 65.2 + lm 9.0 + host ~8.9 + CPU attn ~4.0 |
+| 全 NPU（flowkv attention）| 165.2 | 6.0 | 上者 −4 + flowkv 62.7 + 翻转税 19.3 |
+
+（87.2 − 9.0 lm = 78.2 ≈ P5 的 78.4 基线，口径闭环。）
+
+- **S=1 短上下文：CPU attention 完胜**（4ms vs 82ms）。flowkv 现在
+  无论 S 都流全容量 KV（op.py 自证："they still stream … F_c=0"），
+  1.96ms/层 × 32 + 翻转税。
+- **长上下文反转**：CPU attention O(S)（标量 Rust），S=1024 时 ~秒级；
+  flowkv 容量流 O(1)。修好 S-aware 后 NPU attention 才有意义。
+
+### 性能差距分解（decode 口径，FLM 21.44ms/token = 46.6 tok/s，P5）
+
+我们最快配置 87.2ms = **4.1×**（全 NPU 165.2 = 7.7×）：
+
+| 项 | 我们 ms | FLM ms | 差距根源 | 修法 | 潜力 |
+|---|---|---|---|---|---|
+| 投影（qkv/o/gateup/down）| 65.2 | ~14 | ① K-padding 3×（ELEM 按 K_MAX=6144）② down/qkv 带宽短板 ③ 逐 op 开销 vs 层内全融合 | per-K ELEM 内核（M3b） | **−34** |
+| attention | 4.0(CPU) | ~0（融合）| flowkv 容量流+翻转税 | S-aware DMA + 单 PDI | 长上下文必需 |
+| lm_head | 9.0 | 2.66 | 同 K-padding 3× | per-K ELEM | −6 |
+| host 调度 | 8.9 | ~5 | 129–161 次 submit+wait vs 1 次 runlist | runlist 批量提交 | −4 |
+| 终态估计 | | | | | **~43ms（2×FLM）** |
+
+**翻转税的根治难点**：w4gemvu 占满 8 列、flowkv 编 4 列——静态布局冲突，
+"并入单 PDI"需重排列（w4gemvu 降列数=降带宽）或 flowkv 降 1 列（×4 慢），
+都不划算。FLM 单 xclbin 33 runs 免税是设计出来的（层内全融合）。
+短期裁决：**短上下文用 CPU attention 配置**（87.2ms 已是当前最优），
+flowkv 留作长上下文专项（S-aware + 翻转税一起修，才有正收益）。
+
+### 遗留修复：machine_model.json 跨架构互踩（已完成）
+
+perf-calibrate 默认 minicpm 形状集会把 strided 档写成 minicpm 值
+（0.246），hy run 的 flowkv 行拿 0.246 当分母 → %bw 虚高 4×。修复：
+**strided 层级按架构限定**（`strided:hy-mt2` / `strided:minicpm`）——
+flowkv 几何（头数/容量）本来就是架构专属；slot-stream/seq-dma 与架构
+无关保留裸名。calibrate 写限定键、run-decode 按 arch.name 认领、
+fkprobe 从夹具名辨识（_4kv=hy）。上板复核：层级表同时显示
+strided 1.2（兜底默认）与 strided:hy-mt2 1.0（校准），flowkv 行
+认领正确（109%，P7 已知的链内快于隔离的诚实标记）。
+
+### 新遗留
+
+- cu_mask 翻转税的精确机理（固件行为）未解剖——若未来固件/驱动支持
+  同分区多 PDI 常驻，19.3ms 自动回收。
+- runlist 批量提交（FLM 式 1 exec/token）：161×54µs submit 往返。
