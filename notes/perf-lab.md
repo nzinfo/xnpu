@@ -1026,3 +1026,27 @@ DMA 通道 ~5GB/s 是当前流上限**，8 列 → ~40GB/s 封顶；FLM 21.44ms
 - **下一步**（按预期收益排序）：runlist 批量提交（129 submit×54µs ≈7ms
   host 开销）；attention 同 PDI 融合（FLM 33 run/token vs 我们 129）；
   CPU 侧胶水（rope/norm/swiglu 每层 ~0.2ms×32）。
+
+## P14（2026-09-27）：v5.4 双累加器 —— 串行 FMA 链假设证实，E2E 56.9→49.6ms
+- **假设**（P13 遗留 ~0.5µs/块计算暴露的嫌犯）：热循环 `acc = aie::mac(acc, rf, sfd)`
+  是 64 深循环携带依赖（fpmac ~4-5 拍延迟 → 每块 ~130-160 拍纯等待）。
+- **修法**：偶/奇组各一条独立累加链（flat 循环步长 2，全部索引仍是 g 的地址
+  算术——P13 铁律不破），尾部和 acc0+acc1。
+- **第一版撞墙**：`acc0 + acc1`（accum 相加）lowering 成 `G_FADD <16 x s32>`
+  peano Legalizer 无法合法化（clang backend fatal）。**修 = 终和也走 fpmac**：
+  `mac(acc0, broadcast(1.0f), acc1.to_vector<float>())`——本循环全程依赖的
+  合法形态，accum 裸加法以后永远不要再写。
+- **pytest（30/30 PASS）**：lm 3530→**2719-2722µs（50.1GB/s）**、gateup
+  457→~400、qkv 222→~175、down 264→247、o 已在地板（146-180 噪声带）。
+- **E2E（run-decode hy cpu）**：**49.56ms/token（20.2 tok/s）**，门全过
+  （argmax 25868/top-8 8/8/rel_rms 0.0278/hidden 1.9%）。med 49.11。
+  链上 solo：qkv 152 / o 141 / gateup 348（41GB/s，90% 档）/ down 229.5 /
+  lmhead 2655（52.9GB/s ≈ 器件墙）。Σ 设备 ≈30.5ms，CPU 间隙 18.6ms
+  （attention 13.4 + 胶水 5.2，trace 逐 op 分解：op 前 gap o=417.9µs×32 /
+  down=105.9 / qkv=32.6 / gateup=22.6 / lm=33）。
+- **性能台账**：v4 58.41 → v5.2 56.93 → v5.4 **49.56** ms/token。FLM 21.44
+  → 差距 2.31×。设备侧剩余：小形状每 op 固定成本（o 141µs vs 裸流 44µs ≈
+  ~90µs/op × 129 ≈ 4-8ms，融合奖池）+ gateup/down 距墙的 10-20%。
+- **下一杠杆排序**（更新）：①attention 同 PDI 融合或 S 感知 flowkv（13.4ms
+  CPU + 终态全 NPU 要求）②层内 4 GEMV 融合/批量（消每 op 固定成本）③胶水
+  NPU 化。纯 runlist 批量在 CPU-interlocked 链上无收益（每 op x 依赖前 op C）。
