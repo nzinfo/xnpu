@@ -2741,18 +2741,20 @@ fn cmd_run_w4layer(w4dir: &str, nlayers: usize, iters: usize) -> ExitCode {
 /// fixture stem + B-stream geometry. Mirrors IRON w4gemvu/op.py (notes §14).
 struct W4UShape {
     name: &'static str,
+    /// PADDED M (v3 block ABI: K=2048 -> M % 192 == 0 and blocks even,
+    /// K=6144 -> M % 64 == 0; pad rows are zero weights -> zero outputs).
     m: usize,
     k: usize,
-    /// B fifo elements = tiles_per_col / 16 (tiles_per_col = M / 32): the
-    /// multi-element B fill that keeps shim BD usage at one per channel.
+    /// B fifo elements = blocks_per_col / 2 (one B slot serves two blocks):
+    /// the multi-element B fill that keeps shim BD usage at one/channel.
     f: usize,
 }
 
 const W4U_SHAPES: [W4UShape; 4] = [
-    W4UShape { name: "qkv", m: 2560, k: 2048, f: 5 },
-    W4UShape { name: "o", m: 2048, k: 2048, f: 4 },
-    W4UShape { name: "gateup", m: 12288, k: 2048, f: 24 },
-    W4UShape { name: "down", m: 2048, k: 6144, f: 4 },
+    W4UShape { name: "qkv", m: 2688, k: 2048, f: 14 }, // 2560 -> 2688
+    W4UShape { name: "o", m: 2112, k: 2048, f: 11 }, // 2048 -> 2112
+    W4UShape { name: "gateup", m: 12288, k: 2048, f: 64 },
+    W4UShape { name: "down", m: 2048, k: 6144, f: 32 },
 ];
 
 /// Decode-chain architecture profile (run-decode): everything the glue
@@ -2782,8 +2784,8 @@ const DEC_MINICPM: DecArch = DecArch {
     kv: 2,
     qk_norm: false,
     rope_base: 5e6,
-    qkv_m: 2560,
-    qkv_f: 5,
+    qkv_m: 2688, // 2560 padded to the v3 block ABI
+    qkv_f: 14,
     fk_fixture: "flowkv_decode_16h_2kv_128d_1024s_32cs_2col",
     decdir: "/home/nzinfo/qwen/xnpu/build/dec",
     w4dir: "/home/nzinfo/qwen/xnpu/build/w4u",
@@ -2799,7 +2801,7 @@ const DEC_HY: DecArch = DecArch {
     // rounding shifts it 7e-9 relative, far below rope-angle noise.
     rope_base: 11158840.0,
     qkv_m: 3072, // cat(q 2048, k 512, v 512), 16Q/4KV GQA
-    qkv_f: 6,
+    qkv_f: 16,
     fk_fixture: "flowkv_decode_16h_4kv_128d_1024s_32cs_4col",
     decdir: "/home/nzinfo/qwen/xnpu/build/dec_hy",
     w4dir: "/home/nzinfo/qwen/xnpu/build/w4u_hy",
@@ -2809,16 +2811,49 @@ impl DecArch {
     fn shapes(&self) -> [W4UShape; 4] {
         [
             W4UShape { name: "qkv", m: self.qkv_m, k: 2048, f: self.qkv_f },
-            W4UShape { name: "o", m: 2048, k: 2048, f: 4 },
-            W4UShape { name: "gateup", m: 12288, k: 2048, f: 24 },
-            W4UShape { name: "down", m: 2048, k: 6144, f: 4 },
+            W4UShape { name: "o", m: 2112, k: 2048, f: 11 },
+            W4UShape { name: "gateup", m: 12288, k: 2048, f: 64 },
+            W4UShape { name: "down", m: 2048, k: 6144, f: 32 },
         ]
     }
 }
 
-/// One padded max-K layout-v2 slot (nibbles + hole + scales + K at the tail).
-const W4U_ELEM: usize = 13840;
+/// One v3 COMPACT-BLOCK fifo element (P10): n = 6144/K tiles at 16-byte
+/// strides (load_v streams cannot start misaligned — fingerprinted) + the
+/// K header at the tail. v2 padded EVERY tile to a max-K slot: 3x DDR
+/// waste at K=2048 (P9's biggest gap item; the A/B also showed the op is
+/// issue-bound, not bandwidth-bound — v3 buys back bandwidth headroom and
+/// 1.6 GB of resident weights, not device time).
+const W4U_ELEM: usize = 13888;
 const W4U_K_MAX: usize = 6144;
+const W4U_CALLS: usize = 3; // static kernel calls per block (kernel skips i >= n)
+const W4U_BLOCKS_PER_B: usize = 2; // blocks served per B fifo element
+
+/// v3 block math (mirrors IRON w4gemvu/reference.py).
+fn w4u_tiles(k: usize) -> usize {
+    W4U_K_MAX / k // 3 (K=2048) / 1 (K=6144)
+}
+fn w4u_blocks(m: usize, k: usize) -> usize {
+    (m / 8 / 4) / w4u_tiles(k)
+}
+/// C rows the drain writes (K=6144 carries 2/3 zero rows, 12-row groups).
+fn w4u_c_rows(m: usize, k: usize) -> usize {
+    m * W4U_CALLS / w4u_tiles(k)
+}
+/// B fifo elements = blocks/2 (one B slot serves two blocks).
+fn w4u_f(m: usize, k: usize) -> usize {
+    w4u_blocks(m, k) / W4U_BLOCKS_PER_B
+}
+/// Real output row -> C-buffer row (K=6144: real rows at 12t..12t+4).
+fn w4u_c_off(row: usize, k: usize) -> usize {
+    if k == 6144 {
+        (row / 4) * (W4U_CALLS * 4) + row % 4
+    } else {
+        row
+    }
+}
+/// lm_head padded M: vocab 120818 -> 1260 even blocks of 3 tiles.
+const W4U_LM_M: usize = 120960;
 
 /// M3b: the same 42-layer projection chain on the UNIVERSAL w4gemvu kernel.
 /// All four shapes share one PDI (the kernel reads K from the slot tail at
@@ -2827,10 +2862,11 @@ const W4U_K_MAX: usize = 6144;
 /// token is gone BY CONSTRUCTION, not by scheduling. Differences from v1:
 ///   - fixture stems w4gemvu_{M}x{K}; the four PDIs must be byte-identical
 ///     (asserted — that identity is the entire premise of the single CU);
-///   - packed layout v2: 8 cols x (M/32) x 13840-byte slots;
+///   - packed layout v3 compact blocks: 8 cols x blocks_per_col x
+///     13888-byte blocks (K from the block tail; 16-byte tile strides);
 ///   - the vector buffer is the multi-element B stream: F K_MAX-wide
 ///     slots each holding x zero-padded — two shared x BOs (xu2048 with
-///     24 slots serves every F in {5,4,24}; xu6144 with 4 slots serves down).
+///     64 slots serves every F in {14,11,64}; xu6144 with 32 serves down).
 /// Expected convergence: all four scheduling modes at the device floor
 /// (~2.3 ms/layer), where v1 spanned 75-234 ms/token on scheduling alone.
 fn cmd_run_w4ulayer(w4dir: &str, nlayers: usize, iters: usize) -> ExitCode {
@@ -2909,8 +2945,8 @@ fn cmd_run_w4ulayer(w4dir: &str, nlayers: usize, iters: usize) -> ExitCode {
     // (each op's B fill reads an F-slot prefix); xu6144 (4 slots) serves down.
     let mut live: Vec<(BufferObject, Mapping)> = Vec::new();
     let mut x_va: [u64; 2] = [0; 2]; // [xu2048 (24 slots), xu6144 (4 slots)]
-    let xu2048 = vec![0u8; 24 * W4U_K_MAX * 2];
-    let xu6144 = vec![0u8; 4 * W4U_K_MAX * 2];
+    let xu2048 = vec![0u8; 64 * W4U_K_MAX * 2];
+    let xu6144 = vec![0u8; 32 * W4U_K_MAX * 2];
     x_va[0] = match chain_tensor(&dev, &mut live, "xu2048", &xu2048) {
         Some(v) => v,
         None => {
@@ -2927,7 +2963,12 @@ fn cmd_run_w4ulayer(w4dir: &str, nlayers: usize, iters: usize) -> ExitCode {
     };
     let mut c_va = [0u64; 4];
     for (si, s) in W4U_SHAPES.iter().enumerate() {
-        c_va[si] = match chain_tensor(&dev, &mut live, &format!("c_{}", s.name), &vec![0u8; s.m * 2]) {
+        c_va[si] = match chain_tensor(
+            &dev,
+            &mut live,
+            &format!("c_{}", s.name),
+            &vec![0u8; w4u_c_rows(s.m, s.k) * 2],
+        ) {
             Some(v) => v,
             None => {
                 eprintln!("c_{} BO failed", s.name);
@@ -2948,10 +2989,10 @@ fn cmd_run_w4ulayer(w4dir: &str, nlayers: usize, iters: usize) -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            let expect = 8 * (s.m / 32) * W4U_ELEM;
+            let expect = 8 * w4u_blocks(s.m, s.k) * W4U_ELEM;
             if data.len() != expect {
                 eprintln!(
-                    "layer{n:02}_{}: {} B, expected {expect} B (stale import? use --layout v2)",
+                    "layer{n:02}_{}: {} B, expected {expect} B (stale import? rerun w4_import)",
                     s.name,
                     data.len()
                 );
@@ -2989,11 +3030,11 @@ fn cmd_run_w4ulayer(w4dir: &str, nlayers: usize, iters: usize) -> ExitCode {
                 "w4gemvu",
                 0,
                 (s.m * s.k / 2 + s.m * (s.k / 32) * 2 + s.k * 2) as u64, // w4 + scales + x
-                (s.m * 2) as u64, // c out
+                (w4u_c_rows(s.m, s.k) * 2) as u64, // c out (K6144: 3M rows)
                 (2 * s.m * s.k) as u64,
             )
             .with_tier(tier::SLOT_STREAM); // x 复制进 F 槽的 slot 流形态
-            m.bytes_stream = Some((8 * (s.m / 32) * W4U_ELEM) as u64); // padded slot 流
+            m.bytes_stream = Some((8 * w4u_blocks(s.m, s.k) * W4U_ELEM) as u64); // 块流
             m
         })
         .collect();
@@ -3059,7 +3100,7 @@ fn cmd_run_w4ulayer(w4dir: &str, nlayers: usize, iters: usize) -> ExitCode {
             }
         }
     }
-    for (xi, slots) in [(0usize, 24usize), (1usize, 4usize)] {
+    for (xi, slots) in [(0usize, 64usize), (1usize, 32usize)] {
         let x_bits = &goldens[if xi == 0 { 0 } else { 3 }].1; // qkv / down
         let (bo, map) = &mut live[xi];
         let bytes = map.as_mut_slice();
@@ -3094,7 +3135,8 @@ fn cmd_run_w4ulayer(w4dir: &str, nlayers: usize, iters: usize) -> ExitCode {
         let mut worst = 0f32;
         let mut bad = 0usize;
         for (ri, row) in rows.iter().enumerate() {
-            let got = u16::from_le_bytes([cs[row * 2], cs[row * 2 + 1]]);
+            let co = w4u_c_off(*row, s.k);
+            let got = u16::from_le_bytes([cs[co * 2], cs[co * 2 + 1]]);
             let g = bf16_to_f32(got);
             let w = bf16_to_f32(ref_bits[ri]);
             let err = (g - w).abs();
@@ -3128,7 +3170,8 @@ fn cmd_run_w4ulayer(w4dir: &str, nlayers: usize, iters: usize) -> ExitCode {
             let _ = c_bo.sync(SyncDirection::FromDevice, 0, c_bo.size() as u64);
             let cs = c_map.as_slice();
             for (ri, row) in rows.iter().enumerate() {
-                let got = u16::from_le_bytes([cs[row * 2], cs[row * 2 + 1]]);
+                let co = w4u_c_off(*row, W4U_SHAPES[si].k);
+                let got = u16::from_le_bytes([cs[co * 2], cs[co * 2 + 1]]);
                 let g = bf16_to_f32(got);
                 let w = bf16_to_f32(ref_bits[ri]);
                 if (g - w).abs() > 0.01 + 0.01 * w.abs() {
@@ -3172,7 +3215,11 @@ fn cmd_run_w4ulayer(w4dir: &str, nlayers: usize, iters: usize) -> ExitCode {
             let (c_bo, c_map) = &live[2 + si];
             let _ = c_bo.sync(SyncDirection::FromDevice, 0, c_bo.size() as u64);
             let cs = c_map.as_slice();
-            let rd = |row: usize| u16::from_le_bytes([cs[row * 2], cs[row * 2 + 1]]);
+            let k = W4U_SHAPES[si].k;
+            let rd = |row: usize| {
+                let co = w4u_c_off(row, k);
+                u16::from_le_bytes([cs[co * 2], cs[co * 2 + 1]])
+            };
             let mut hits: Vec<usize> = Vec::new();
             for m in 0..nlayers {
                 let (rows, _x, ref_bits) = &goldens[m * 4 + si];
@@ -3434,18 +3481,18 @@ fn cmd_run_w4ulayer(w4dir: &str, nlayers: usize, iters: usize) -> ExitCode {
 }
 
 /// M8/P8: lm_head on NPU — decode token 路径最后一个 CPU 计算算子（hy
-/// vocab 120818，tied embed；pad 到 120832 = 32 行 ABI）。普适 w4gemvu
+/// vocab 120818，tied embed；pad 到 120960 = v3 块 ABI：1260 偶数块）。普适 w4gemvu
 /// PDI 在 10x M 下仍逐位同（下方 assert；只有 ctrl code 携带 M）。隔离
-/// 探针：golden step 输入，120832 全 logits 对拍 golden_lmhead（argmax +
-/// top-8 + rel_rms），solo xN + 同 op burst 拿 399 MiB 权重流的 per-op
+/// 探针：golden step 输入，120960 全 logits 对拍 golden_lmhead（argmax +
+/// top-8 + rel_rms），solo xN + 同 op burst 拿 134 MiB 权重流（v3 紧凑块）的 per-op
 /// 读数（M 比任何投影形状大 10 倍 —— 大 M slot 流是否越过 45.6 GB/s 的
 /// slot 天花板，是 P6 预言的"未建模档"信号，报告见分晓）。
 fn cmd_run_lmhead(iters: usize) -> ExitCode {
     let build = "/home/nzinfo/qwen/xnpu/build";
-    const M: usize = 120832;
+    const M: usize = W4U_LM_M;
     const K: usize = 2048;
-    // B fill 槽数 F = tiles_per_col(=M/8/4) / TILES_PER_B(=16) = 236。
-    let f_slots: usize = (M / 8 / 4) / 16;
+    // B fill 槽数 F = blocks_per_col / 2 = 630（v3：一个 B 槽供 2 块）。
+    let f_slots: usize = w4u_f(M, K);
 
     let (pdi, instr, cols) =
         match load_fixture(&format!("{build}/w4gemvu_{M}x{K}.mlir.prj")) {
@@ -3465,9 +3512,13 @@ fn cmd_run_lmhead(iters: usize) -> ExitCode {
         }
     }
     let wdata = match std::fs::read(format!("{build}/w4u_hy/lmhead.bin")) {
-        Ok(d) if d.len() == 8 * (M / 32) * W4U_ELEM => d,
+        Ok(d) if d.len() == 8 * w4u_blocks(M, K) * W4U_ELEM => d,
         Ok(d) => {
-            eprintln!("lmhead.bin: {} B, expected {}", d.len(), 8 * (M / 32) * W4U_ELEM);
+            eprintln!(
+                "lmhead.bin: {} B, expected {}",
+                d.len(),
+                8 * w4u_blocks(M, K) * W4U_ELEM
+            );
             return ExitCode::FAILURE;
         }
         Err(e) => {
@@ -3497,7 +3548,7 @@ fn cmd_run_lmhead(iters: usize) -> ExitCode {
     let x_bits = rd_u16(&g, 8, K);
     let ref_bits = rd_u16(&g, 8 + 2 * K, M);
     println!(
-        "lm_head: M={M} (vocab 120818 + 14 pad), K={K}, weights {} MiB, F={f_slots} B slots",
+        "lm_head: M={M} (vocab 120818 + 142 pad), K={K}, weights {} MiB, F={f_slots} B slots",
         wdata.len() >> 20
     );
 
@@ -3576,9 +3627,9 @@ fn cmd_run_lmhead(iters: usize) -> ExitCode {
         (2 * M * K) as u64,
     )
     .with_tier(tier::SLOT_STREAM);
-    meta.bytes_stream = Some((8 * (M / 32) * W4U_ELEM) as u64);
+    meta.bytes_stream = Some((8 * w4u_blocks(M, K) * W4U_ELEM) as u64);
 
-    // ---- 正确性：全 120832 logits 对拍（不进 perf 分布）----
+    // ---- 正确性：全 120960 logits 对拍（不进 perf 分布）----
     let seq = match op.pkt.submit(&dev, &ctx, &handles) {
         Ok(s) => s,
         Err(e) => {
@@ -3806,7 +3857,7 @@ fn cmd_perf_calibrate(arch: &DecArch, iters: usize) -> ExitCode {
     // data-dependent control flow.
     let mut live: Vec<(BufferObject, Mapping)> = Vec::new();
     let mut x_va = [0u64; 2];
-    for (i, data) in [(0usize, 24usize * W4U_K_MAX * 2), (1, 4 * W4U_K_MAX * 2)] {
+    for (i, data) in [(0usize, 64usize * W4U_K_MAX * 2), (1, 32 * W4U_K_MAX * 2)] {
         x_va[i] = match chain_tensor(&dev, &mut live, &format!("x{i}"), &vec![0u8; data]) {
             Some(v) => v,
             None => {
@@ -3817,8 +3868,12 @@ fn cmd_perf_calibrate(arch: &DecArch, iters: usize) -> ExitCode {
     }
     let mut c_va = [0u64; 4];
     for (si, s) in shapes.iter().enumerate() {
-        c_va[si] = match chain_tensor(&dev, &mut live, &format!("c_{}", s.name), &vec![0u8; s.m * 2])
-        {
+        c_va[si] = match chain_tensor(
+            &dev,
+            &mut live,
+            &format!("c_{}", s.name),
+            &vec![0u8; w4u_c_rows(s.m, s.k) * 2],
+        ) {
             Some(v) => v,
             None => {
                 eprintln!("c_{} BO failed", s.name);
@@ -3835,7 +3890,7 @@ fn cmd_perf_calibrate(arch: &DecArch, iters: usize) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        let expect = 8 * (s.m / 32) * W4U_ELEM;
+        let expect = 8 * w4u_blocks(s.m, s.k) * W4U_ELEM;
         if data.len() != expect {
             eprintln!("layer00_{}: {} B, expected {expect} B", s.name, data.len());
             return ExitCode::FAILURE;
@@ -3857,11 +3912,11 @@ fn cmd_perf_calibrate(arch: &DecArch, iters: usize) -> ExitCode {
                 "w4gemvu",
                 0,
                 (s.m * s.k / 2 + s.m * (s.k / 32) * 2 + s.k * 2) as u64,
-                (s.m * 2) as u64,
+                (w4u_c_rows(s.m, s.k) * 2) as u64,
                 (2 * s.m * s.k) as u64,
             )
             .with_tier(tier::SLOT_STREAM);
-            m.bytes_stream = Some((8 * (s.m / 32) * W4U_ELEM) as u64);
+            m.bytes_stream = Some((8 * w4u_blocks(s.m, s.k) * W4U_ELEM) as u64);
             m
         })
         .collect();
@@ -4460,15 +4515,20 @@ fn cmd_run_decode(
     // weights. live layout: [xu2048, xu6144, c_qkv, c_o, c_gateup, c_down,
     // w00.qkv, w00.o, ...].
     let mut live: Vec<(BufferObject, Mapping)> = Vec::new();
-    if chain_tensor(&dev, &mut live, "xu2048", &vec![0u8; 24 * W4U_K_MAX * 2]).is_none()
-        || chain_tensor(&dev, &mut live, "xu6144", &vec![0u8; 4 * W4U_K_MAX * 2]).is_none()
+    if chain_tensor(&dev, &mut live, "xu2048", &vec![0u8; 64 * W4U_K_MAX * 2]).is_none()
+        || chain_tensor(&dev, &mut live, "xu6144", &vec![0u8; 32 * W4U_K_MAX * 2]).is_none()
     {
         eprintln!("x BO failed");
         return ExitCode::FAILURE;
     }
     for s in shapes.iter() {
-        if chain_tensor(&dev, &mut live, &format!("c_{}", s.name), &vec![0u8; s.m * 2])
-            .is_none()
+        if chain_tensor(
+            &dev,
+            &mut live,
+            &format!("c_{}", s.name),
+            &vec![0u8; w4u_c_rows(s.m, s.k) * 2],
+        )
+        .is_none()
         {
             eprintln!("c_{} BO failed", s.name);
             return ExitCode::FAILURE;
@@ -4483,8 +4543,8 @@ fn cmd_run_decode(
                     return ExitCode::FAILURE;
                 }
             };
-            if data.len() != 8 * (s.m / 32) * W4U_ELEM {
-                eprintln!("layer{n:02}_{}: stale import (use --layout v2)", s.name);
+            if data.len() != 8 * w4u_blocks(s.m, s.k) * W4U_ELEM {
+                eprintln!("layer{n:02}_{}: stale import (rerun the importer)", s.name);
                 return ExitCode::FAILURE;
             }
             if chain_tensor(&dev, &mut live, &format!("w{n:02}.{}", s.name), &data).is_none() {
@@ -4528,11 +4588,11 @@ fn cmd_run_decode(
 
     // M8: lm_head on NPU（可选 —— 需要 q4nx_import --lmhead 的
     // lmhead.bin + golden_lmhead.bin 和 w4gemvu_120832x2048 夹具）。PDI
-    // 就是同一个普适内核，只多一份携带 M=120832 的 ctrl code。BO 存
+    // 就是同一个普适内核，只多一份携带 M=120960 的 ctrl code。BO 存
     // live_lm（所有 submit 期间保活）。minicpm 无导出 → 自动跳过。
     let mut live_lm: Vec<(BufferObject, Mapping)> = Vec::new();
     let mut lm: Option<(ChainOp, Vec<u32>, OpMeta, Vec<u16>)> = (|| {
-        const LM_M: usize = 120832;
+        const LM_M: usize = W4U_LM_M;
         const LM_K: usize = 2048;
         let (_, linstr, _) =
             match load_fixture(&format!("{build}/w4gemvu_{LM_M}x{LM_K}.mlir.prj")) {
@@ -4543,7 +4603,7 @@ fn cmd_run_decode(
                 }
             };
         let wdata = match std::fs::read(format!("{w4dir}/lmhead.bin")) {
-            Ok(d) if d.len() == 8 * (LM_M / 32) * W4U_ELEM => d,
+            Ok(d) if d.len() == 8 * w4u_blocks(LM_M, LM_K) * W4U_ELEM => d,
             _ => {
                 println!("lm_head: lmhead.bin absent/stale — skipped (q4nx_import.py --lmhead)");
                 return None;
@@ -4571,7 +4631,7 @@ fn cmd_run_decode(
         };
         let ref_bits = bits(8 + 2 * LM_K, LM_M);
         let x_bits = bits(8, LM_K);
-        let f_slots = (LM_M / 8 / 4) / 16; // 236 个 K_MAX 槽的 B fill
+        let f_slots = w4u_f(LM_M, 2048); // 630 个 K_MAX 槽的 B fill
         let mut xdata = vec![0u8; f_slots * W4U_K_MAX * 2];
         for s in 0..f_slots {
             for (j, b) in x_bits.iter().enumerate() {
@@ -4604,14 +4664,14 @@ fn cmd_run_decode(
             (2 * LM_M * LM_K) as u64,
         )
         .with_tier(tier::SLOT_STREAM);
-        meta.bytes_stream = Some((8 * (LM_M / 32) * W4U_ELEM) as u64);
+        meta.bytes_stream = Some((8 * w4u_blocks(LM_M, 2048) * W4U_ELEM) as u64);
         println!(
-            "lm_head on NPU: M={LM_M} (399 MiB weights/token), CU0 同 PDI 第 5 个 ctrl code"
+            "lm_head on NPU: M={LM_M} (133.5 MiB v3 权重/token), CU0 同 PDI 第 5 个 ctrl code"
         );
         Some((op, handles, meta, ref_bits))
     })();
 
-    // 一个 lm_head step：refill 236 个 x 槽 → submit → wait → 读 logits。
+    // 一个 lm_head step：refill 630 个 x 槽 → submit → wait → 读 logits。
     // it > 0 才记 solo（checked step 不进分布）。
     let mut lm_run = |lm: &mut Option<(ChainOp, Vec<u32>, OpMeta, Vec<u16>)>,
                   hidden: &[u16],
@@ -4619,17 +4679,16 @@ fn cmd_run_decode(
                   rec: &mut Recorder,
                   rec_seq: &mut u64|
      -> Option<Vec<u16>> {
-        const LM_M: usize = 120832;
+        const LM_M: usize = W4U_LM_M;
         let (op, handles, meta, _) = lm.as_mut()?;
-        let f_slots = (LM_M / 8 / 4) / 16;
+        let f_slots = w4u_f(LM_M, 2048);
         {
             let (xbo, xmap) = &mut live_lm[1];
             let bytes = xmap.as_mut_slice();
+            let xb: Vec<u8> = hidden.iter().flat_map(|b| b.to_le_bytes()).collect();
             for s in 0..f_slots {
-                for (j, b) in hidden.iter().enumerate() {
-                    bytes[s * W4U_K_MAX * 2 + j * 2..s * W4U_K_MAX * 2 + j * 2 + 2]
-                        .copy_from_slice(&b.to_le_bytes());
-                }
+                let base = s * W4U_K_MAX * 2;
+                bytes[base..base + xb.len()].copy_from_slice(&xb);
             }
             if let Err(e) = xbo.sync(SyncDirection::ToDevice, 0, xbo.size() as u64) {
                 eprintln!("lm x sync: {e}");
@@ -4880,11 +4939,11 @@ fn cmd_run_decode(
                 "w4gemvu",
                 0,
                 (s.m * s.k / 2 + s.m * (s.k / 32) * 2 + s.k * 2) as u64,
-                (s.m * 2) as u64,
+                (w4u_c_rows(s.m, s.k) * 2) as u64,
                 (2 * s.m * s.k) as u64,
             )
             .with_tier(tier::SLOT_STREAM);
-            m.bytes_stream = Some((8 * (s.m / 32) * W4U_ELEM) as u64);
+            m.bytes_stream = Some((8 * w4u_blocks(s.m, s.k) * W4U_ELEM) as u64);
             m
         })
         .chain(if npu_attn {
@@ -4935,17 +4994,21 @@ fn cmd_run_decode(
         let k = shapes[si].k;
         let m = shapes[si].m;
         let vi = if k == 6144 { 1 } else { 0 };
-        let slots = if vi == 0 { 24 } else { 4 };
+        let slots = shapes[si].f; // v3: 一个 B 槽供 2 块 -> F = blocks/2
         {
             let (bo, map) = &mut live[vi];
             let bytes = map.as_mut_slice();
+            // v3 的 F 是 v2 的 4x（gateup 64 槽）：x 先转成连续小端字节再
+            // 逐槽 memcpy —— 逐 u16 写 24 MB/token 是首个 v3 版本 101ms
+            // （v2 87ms）回归的主因。
+            let xb: Vec<u8> = x.iter().flat_map(|b| b.to_le_bytes()).collect();
             for s in 0..slots {
                 let base = s * W4U_K_MAX * 2;
-                for (j, b) in x.iter().enumerate() {
-                    bytes[base + j * 2..base + j * 2 + 2].copy_from_slice(&b.to_le_bytes());
-                }
+                bytes[base..base + xb.len()].copy_from_slice(&xb);
             }
-            if let Err(e) = bo.sync(SyncDirection::ToDevice, 0, bo.size() as u64) {
+            // 只同步本形状实际读的 F 槽（gateup 64 槽封顶，qkv 只 16）。
+            let bytes_n = (slots * W4U_K_MAX * 2) as u64;
+            if let Err(e) = bo.sync(SyncDirection::ToDevice, 0, bytes_n) {
                 eprintln!("gemv x sync (op {i}): {e}");
                 return None;
             }
@@ -4972,7 +5035,13 @@ fn cmd_run_decode(
         // best-effort only, like every other read path here.
         let _ = c_bo.sync(SyncDirection::FromDevice, 0, c_bo.size() as u64);
         let cs = c_map.as_slice();
-        Some((0..m).map(|r| u16::from_le_bytes([cs[r * 2], cs[r * 2 + 1]])).collect())
+        // K=6144 的 C 含 2/3 零行（12 行组，真行在前）——按 w4u_c_off 收拢。
+        Some((0..m)
+            .map(|r| {
+                let co = w4u_c_off(r, k);
+                u16::from_le_bytes([cs[co * 2], cs[co * 2 + 1]])
+            })
+            .collect())
     };
 
     // The decode step. Scratch lives outside the closure (passed per call)
@@ -5250,7 +5319,7 @@ fn cmd_run_decode(
         let argmax_g = argmax(ref_bits);
         let mut num = 0f64;
         let mut den = 0f64;
-        for i in 0..120832 {
+        for i in 0..W4U_LM_M {
             let d = f32of(logits[i]) - f32of(ref_bits[i]);
             num += (d * d) as f64;
             den += (f32of(ref_bits[i]) * f32of(ref_bits[i])) as f64;
@@ -5258,7 +5327,7 @@ fn cmd_run_decode(
         let rel_rms = (num / den).sqrt() as f32;
         let ids = |v: &Vec<u16>| -> Vec<usize> {
             let mut t: Vec<(usize, f32)> =
-                (0..120832).map(|i| (i, f32of(v[i]))).collect();
+                (0..W4U_LM_M).map(|i| (i, f32of(v[i]))).collect();
             t.sort_by(|a, b| b.1.total_cmp(&a.1));
             t.into_iter().take(8).map(|(i, _)| i).collect()
         };
