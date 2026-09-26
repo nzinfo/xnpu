@@ -3725,6 +3725,10 @@ fn cmd_perf_calibrate(arch: &DecArch, iters: usize) -> ExitCode {
     let build = "/home/nzinfo/qwen/xnpu/build";
     let shapes = arch.shapes();
     let w4dir = arch.w4dir;
+    // P9: strided 层级按架构限定 —— flowkv 几何（头数/容量）是架构专属，
+    // minicpm 与 hy 的校准互踩会把对方的 strided 天花板写进自己的报告。
+    // slot-stream/seq-dma 与架构无关，保留裸名。
+    let strided_key = format!("strided:{}", arch.name);
     // 队列深度扫描（P7）：P6 的 48-op gateup 块两跑差 40%（29.6→41.3 GB/s），
     // 深队列背压非确定 —— 单一深度读数不可作天花板。每个深度各出一块
     // （事件名带 /dN 后缀，报告 per-op 表逐深度成行），天花板 = 跨深度
@@ -4036,7 +4040,7 @@ fn cmd_perf_calibrate(arch: &DecArch, iters: usize) -> ExitCode {
             (arch.heads * 128 * 2) as u64,
             arch.heads as u64 * FK_CAP_U * 128 * 2 * 2,
         )
-        .with_tier(tier::STRIDED);
+        .with_tier(strided_key.clone());
         m.bytes_stream = Some(arch.kv as u64 * FK_CAP_U * 2 * 128 * 2 + arch.kv as u64 * fk_stride * 2);
         for it in 0..iters {
             let _ = o_bo.sync(SyncDirection::ToDevice, 0, o_bo.size() as u64);
@@ -4195,7 +4199,7 @@ fn cmd_perf_calibrate(arch: &DecArch, iters: usize) -> ExitCode {
     );
     let mut tier_body = format!("\"{}\": {}", tier::SLOT_STREAM, slot_ceiling);
     if let Some(g) = strided {
-        tier_body.push_str(&format!(", \"{}\": {:.3}", tier::STRIDED, g));
+        tier_body.push_str(&format!(", \"{}\": {:.3}", strided_key, g));
     }
     let overlay = format!(
         "{{\n  \"name\": \"xdna2-npu2-cal-{}-{}\",\n  \"bw_tiers\": {{ {} }},\n  \"default_tier\": \"{}\",\n  \"submit_overhead_us\": {:.1},\n  \"provenance\": {}\n}}\n",
@@ -4204,7 +4208,13 @@ fn cmd_perf_calibrate(arch: &DecArch, iters: usize) -> ExitCode {
     // Self-check: the overlay we emit must parse back (that's how future
     // runs will consume it).
     match MachineModel::default().overlay_json(&overlay) {
-        Ok(m) => println!("\noverlay round-trip OK: slot={} seq-dma={} strided={:.2}", m.bw_for(Some(tier::SLOT_STREAM)), m.bw_for(Some(tier::SEQ_DMA)), m.bw_for(Some(tier::STRIDED))),
+        Ok(m) => println!(
+            "\noverlay round-trip OK: slot={} seq-dma={} {}={:.2}",
+            m.bw_for(Some(tier::SLOT_STREAM)),
+            m.bw_for(Some(tier::SEQ_DMA)),
+            strided_key,
+            m.bw_for(Some(&strided_key))
+        ),
         Err(e) => {
             eprintln!("overlay does not parse ({e}) — bug in emitter");
             return ExitCode::FAILURE;
@@ -4889,7 +4899,8 @@ fn cmd_run_decode(
                     (16 * 128 * 2) as u64,
                     (16 * s_pos * 128 * 2 * 2) as u64,
                 )
-                .with_tier(tier::STRIDED); // 2D stride KV 容量流
+                // P9: 架构限定层级（strided:hy-mt2 / strided:minicpm）
+                .with_tier(format!("strided:{}", arch.name)); // 2D stride KV 容量流
                 // 内核按编译容量流 KV（S 是运行时 header）；stream 口径给全量
                 m.bytes_stream =
                     Some(nkv * FK_CAP as u64 * 2 * 128 * 2 + nkv * fk_stride as u64 * 2);
@@ -5569,7 +5580,12 @@ fn cmd_run_fkprobe(prj: &str, iters: usize) -> ExitCode {
         (o_elems * 2) as u64,            // O 输出（字节）
         (16 * CAP * 128 * 2 * 2) as u64,
     )
-    .with_tier(tier::STRIDED); // 2D stride KV 容量流
+    // P9: 架构限定层级 —— 探针无 arch 参数，从夹具名辨识（_4kv=hy）
+    .with_tier(if prj.contains("_4kv") {
+        "strided:hy-mt2"
+    } else {
+        "strided:minicpm"
+    }); // 2D stride KV 容量流
     fk_meta.bytes_stream = None; // 无 slot padding，stream 与 useful 同口径
     let metas = [fk_meta.clone()];
     let mut rec = Recorder::new();
