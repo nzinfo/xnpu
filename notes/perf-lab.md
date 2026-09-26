@@ -796,3 +796,76 @@ strided 1.2（兜底默认）与 strided:hy-mt2 1.0（校准），flowkv 行
 - cu_mask 翻转税的精确机理（固件行为）未解剖——若未来固件/驱动支持
   同分区多 PDI 常驻，19.3ms 自动回收。
 - runlist 批量提交（FLM 式 1 exec/token）：161×54µs submit 往返。
+
+## P10：w4gemvu v3 紧凑块 —— 3× DDR 浪费消灭 + "带宽瓶颈"假设证伪
+
+**动机**：P9 把 K-padding 3× 列为最大差距项（预测 −35ms）。v2 每个
+tile 占一个 K_MAX=6144 的 13840B 槽，K=2048 的 qkv/o/gateup/lm_head
+每 token 流 3× 活字节（lm_head 418MB vs 136MB 活）；权重常驻
+2.6GB。v3 目标：每块只流活字节，同时保持"一个 PDI 服务所有形状"
+（CU 切换税 19.3ms 不复活）。
+
+### 设计（w4gemvu.cc / reference.py / design.py / op.py / test.py 五件套）
+
+- **块 = fifo 元素 = 13888B**：n = 6144/K 个 tile 背靠背（K=2048→3，
+  K=6144→1），每个 tile 步长补齐 **16 字节对齐**（load_v 向量流不能
+  从未对齐地址起读——见下方踩坑），K 头在块尾固定偏移。
+- **内核每块调 3 次**（静态循环，tile_idx∈{0,1,2}）：内核读块尾 K，
+  tile_idx ≥ n 时写零行 → C fifo 元素数与 K 无关 → 设备侧全形状
+  逐位相同，**仍是单一 PDI**（md5 复核通过）。
+- **ABI M 补齐**：K=2048 → M%192==0 且块数偶（o 2048→2112，
+  lm_head 120818→120960，补零行量化为 q=0/scale=0）；K=6144 →
+  M%64==0。B 槽服务 2 块 → F = 块数/2（qkv16/o11/gateup64/down32/
+  lm630）。
+- K=6144 的 C 行按 12 行组排（前 4 行真值 + 8 零行），主机侧
+  `w4u_c_off` 收拢；K=2048 稠密。
+
+**否决的替代**：2D tap 写紧凑块（shim BD 只会按 ELEM 步长写元素，
+写不出紧凑字节流）；逐元素 B fill（16 BD/通道上限，gateup F=64 爆）；
+两套 PDI（650µs×64 重载税复活）；K6144 假 tile 填满（L1 83KB 溢出）。
+
+### 踩坑（按时间序）
+
+1. **tile_idx=1 全错、idx 0/2 全对**（pytest 2688 指纹：失配行恰为
+   ≡4..7 mod 12）。根因不是 peano 锚点怪癖不均匀，而是 **4616 % 16
+   = 8**：tile1 起址 16B 未对齐，向量流读错位；idx0@0/idx2@9232 对齐
+   所以对。修：tile 步长 (bytes+15)&~15 → 4624，块 13856→13888。
+   教训：**load_v 流的对齐是硬约束，块内偏移必须 16B 对齐**。
+2. **v3 首版 E2E 101.2ms（比 v2 87.2 倒退 14ms）**：F 槽数是 v2 的
+   4×（B 槽 2 块 vs v2 16 tile），x 复制仍走逐 u16 标量循环 → 每
+   token 24MB 慢速填充。修：x 一次转连续小端字节 + 逐槽
+   `copy_from_slice`（memcpy 速率）+ 按形状 F 限量 clflush → 87.64。
+3. pytest mmap EAGAIN（MAP_LOCKED 撞 memlock 上限）：须
+   `sudo -n env PATH=… prlimit --memlock=unlimited:unlimited -- pytest`，
+   与驱动无关（rmmod/modprobe 无效，P10 复现确认）。
+
+### 结果（正确性 + 性能）
+
+- pytest 6/6（30 项含 metrics）全过；E2E 门全同 v2：final hidden
+  PASS（rms 0.0265 = 1.0%）、argmax 25868 对、top-8 8/8、lm
+  rel_rms 0.0118。层 24 spot 检查 22/2048 出 1% 容差（worst rel
+  3.09 在 bf16 舍入级小值上）——v2 同在，门未受影响，留观。
+- **per-op（solo µs，流 GB/s）**：qkv 317/11.2 · o 254/9.6 ·
+  gateup 1014/14.0 · down 539/13.2 · lm 9118/15.4（活字节口径）。
+- **E2E：87.64 ms/token（11.4 tok/s）**，与 v2 87.2 持平。
+  权重常驻 2.6GB→1.0GB，投影流 87MB→29MB/token。
+
+### 关键发现：w4gemvu 是发射瓶颈，不是带宽瓶颈（P9 预测证伪）
+
+lm_head A/B：v2 流 408MB/8.98ms=46GB/s（恰在 slot 天花板，P8 据此
+判带宽瓶颈）；v3 流 136MB/9.15ms=15GB/s —— **流量降 3× 时间不变**。
+每块耗时 ~7.3µs 与形状无关：768 组 × ~10 条向量指令 @1.8GHz ≈ 实测。
+"省 35ms"的预测建立在时间∝字节上，被直接 A/B 证伪。v3 的真实收益：
+**3× 带宽余量**（供未来重叠/更多列）+ 1.6GB 权重容量 + lm_head
+同速下腾出带宽。
+
+### 对 FLM 对标路线的修正
+
+FLM 21.44ms 的构成是 ~448µs/层全融合 + lm 2.66ms。我们仅 4 个投影
+solo 就 2.12ms/层——**即使 host/attention 全免费也 77ms 设备下限**。
+要到 FLM 水平，唯一杠杆是内核循环本身：现在每 32 MAC ≈ 10 条向量
+指令（unpack×2 + to_float×2 + mul×2 + mac×2 + 载入×2），理论
+压缩到 ~4 条（int8 MAC 路径 / 双行共享 x 载入 / 常量折叠）→ 5× 潜力，
+正好把投影 68→14ms、lm 9→2.7ms。**P11 = w4gemvu 内层循环重写**，
+这是通往"不弱于 FLM"的主线；runlist 批量提交（−4ms）与 S-aware
+flowkv 退居其后。

@@ -19,15 +19,18 @@ The manifest carries no logical dims — the projection table below supplies
 M and K per tensor (validated: every I8 shape[0] matches ceil(M/32)*ceil(K/256)).
 
 Output contract matches w4_import.py exactly (layer{n:02d}_{shape}.bin in
-the w4gemvu v2 universal-slot layout, golden_{...}.bin spot checks,
-meta.json) so the Rust loader needs no format change — only the qkv shape
-2560 -> 3072 is new (16Q/4KV GQA instead of 16/2).
+the w4gemvu v3 COMPACT-BLOCK layout, golden_{...}.bin spot checks,
+meta.json) so the Rust loader needs only constant updates (ELEM 13888,
+padded M). Padded Ms satisfy the v3 block ABI (K=2048 -> M % 192 == 0 and
+blocks even; K=6144 -> M % 64 == 0): o 2048 -> 2112, lm_head 120818 ->
+120960 (pad rows are zero weights: q=0/scale=0 -> zero outputs, dropped
+on read).
 
-hy-mt2 decode shapes per layer:
+hy-mt2 decode shapes per layer (real -> padded M):
   qkv     3072x2048  cat(q 2048, k 512, v 512)
-  o       2048x2048  o_proj
+  o       2048->2112x2048  o_proj (pads to pack 3 tiles/block, even blocks)
   gate_up 12288x2048 cat(gate 6144, up 6144)
-  down    2048x6144  down_proj
+  down    2048x6144  down_proj (1 tile/block + 2 zero-row calls)
 
 bf16.safetensors next to the .bins carries the norms (input/post/q_norm/
 k_norm/final) for decode_export; --with-embed adds the 495 MB tied
@@ -55,6 +58,9 @@ _w4uref = importlib.util.module_from_spec(_SPEC_V2)
 assert _SPEC_V2.loader is not None
 _SPEC_V2.loader.exec_module(_w4uref)
 quantize_and_pack = _w4uref.quantize_and_pack
+blocks_per_col = _w4uref.blocks_per_col
+tiles_per_block = _w4uref.tiles_per_block
+ELEM = _w4uref.ELEM  # 13888 v3: one compact block
 
 MODEL_DIR = Path("/home/nzinfo/.config/flm/models/Hy-MT2-1.8B-NPU2")
 
@@ -67,15 +73,21 @@ PROJ = {
     "lm_head": (120818, 2048),
 }
 
-# fused shapes: (row tensors in concat order, M, K) — must match Rust W4U_SHAPES
+# fused shapes: (row tensors in concat order, M_real, K, M_padded) — must
+# match Rust W4U_SHAPES (which carries the padded M). Pad rows are zeros.
 SHAPES = {
-    "qkv": ([("q_proj", 2048), ("k_proj", 512), ("v_proj", 512)], 3072, 2048),
-    "o": ([("o_proj", 2048)], 2048, 2048),
-    "gateup": ([("gate_proj", 6144), ("up_proj", 6144)], 12288, 2048),
-    "down": ([("down_proj", 2048)], 2048, 6144),
+    "qkv": ([("q_proj", 2048), ("k_proj", 512), ("v_proj", 512)], 3072, 2048, 3072),
+    "o": ([("o_proj", 2048)], 2048, 2048, 2112),
+    "gateup": ([("gate_proj", 6144), ("up_proj", 6144)], 12288, 2048, 12288),
+    "down": ([("down_proj", 2048)], 2048, 6144, 2048),
 }
 N_LAYERS = 32
-SLOT_V2 = 13840  # v2 packed size = 8 * (M/32) * SLOT_V2 per shape
+LM_M_PAD = 120960  # 120818 -> 1260 even blocks of 3 tiles
+
+
+def packed_size(m_padded, k):
+    """v3 packed bytes = 8 cols * blocks_per_col * ELEM."""
+    return 8 * blocks_per_col(m_padded, k, 4, 8) * ELEM
 
 
 class Q4nx:
@@ -180,11 +192,13 @@ def export_lmhead(q4, out, decdir):
     hidden decode_export emits) — ref = dequant(W) @ x, f32 dot, one bf16
     rounding (spot_rows convention).
 
-    File: lmhead.bin (8*(120832/32)*13840 = 418,078,720 B = 399 MiB);
-    golden_lmhead.bin = u32 n, u32 k, x bits u16[k], ref bits u16[n].
+    File: lmhead.bin (v3 compact blocks, 8*1260*13888 = 139,991,040 B =
+    133.5 MiB); golden_lmhead.bin = u32 n (=120960, pad rows carry ref 0),
+    u32 k, x bits u16[k], ref bits u16[n] — consumers argmax/check only
+    the first 120818 rows.
     """
     head = q4.i8_matrix("lm_head.weight")  # (120818, 2048) f32
-    m_padded = 120832
+    m_padded = LM_M_PAD
     assert head.shape == (120818, 2048)
     W = np.zeros((m_padded, 2048), dtype=np.float32)
     W[:120818] = head
@@ -192,7 +206,7 @@ def export_lmhead(q4, out, decdir):
     packed, w_dequant = quantize_and_pack(
         np.ascontiguousarray(W), group_size=32, m_input=4, cols=8
     )
-    assert len(packed) == 8 * (m_padded // 32) * SLOT_V2
+    assert len(packed) == packed_size(m_padded, 2048)
     packed_bytes = len(packed)
     (out / "lmhead.bin").write_bytes(packed.tobytes())
     del packed
@@ -218,7 +232,7 @@ def main():
     ap.add_argument("--with-embed", action="store_true",
                     help="also export the 495 MB bf16 embedding table")
     ap.add_argument("--lmhead", action="store_true",
-                    help="also export lm_head (hy): lmhead.bin (399 MiB v2) "
+                    help="also export lm_head (hy): lmhead.bin (133.5 MiB v3) "
                          "+ golden_lmhead.bin for the decode golden step")
     ap.add_argument("--skip-tie-check", action="store_true")
     args = ap.parse_args()
@@ -235,7 +249,7 @@ def main():
         export_lmhead(q4, out, Path("/home/nzinfo/qwen/xnpu/build/dec_hy"))
 
     meta = {
-        "group_size": 32, "cols": 8, "layout": "v2", "layers": layers,
+        "group_size": 32, "cols": 8, "layout": "v3", "layers": layers,
         "model": "hy-mt2-1.8b", "shapes": {},
         # architecture facts decode_export needs (from FLM config.json)
         "arch": {"n_layers": 32, "hidden": 2048, "inter": 6144,
@@ -256,26 +270,35 @@ def main():
             {p: q4.i8_matrix(f"model.layers.{n}.mlp.{p}.weight")
              for p in ("gate_proj", "up_proj", "down_proj")}
         )
-        for shape, (parts, m, k) in SHAPES.items():
+        for shape, (parts, m_real, k, m_padded) in SHAPES.items():
             for p, rows in parts:
                 got = tensors[p].shape
                 assert got == (rows, k), f"L{n} {shape}/{p}: {got} != {(rows, k)}"
             W = np.concatenate([tensors[p] for p, _ in parts], axis=0)
-            assert W.shape == (m, k)
+            assert W.shape == (m_real, k)
+            if m_padded != m_real:  # v3 block ABI: pad zero rows
+                W = np.concatenate(
+                    [W, np.zeros((m_padded - m_real, k), dtype=np.float32)],
+                    axis=0,
+                )
             # f32 in, re-quantized to OUR w4 ABI (amax/7): we inherit FLM's
             # int4 weights as ground truth — the comparison target IS FLM.
             packed, w_dequant = quantize_and_pack(
                 np.ascontiguousarray(W), group_size=32, m_input=4, cols=8
             )
-            assert len(packed) == 8 * (m // 32) * SLOT_V2, (
-                f"layer {n} {shape}: v2 packed is {len(packed)} bytes"
+            assert len(packed) == packed_size(m_padded, k), (
+                f"layer {n} {shape}: v3 packed is {len(packed)} bytes"
             )
             packed.tofile(out / f"layer{n:02d}_{shape}.bin")
-            rows, ref = spot_rows(m, k, w_dequant, xs[k])
+            # spot rows stay inside the REAL rows (pad rows are trivially 0)
+            rows, ref = spot_rows(m_real, k, w_dequant, xs[k])
             write_golden(out, f"L{n:02d}_{shape}", k, rows, ref,
                          xs[k].view(torch.uint16).numpy())
             if n == layers[0]:
-                meta["shapes"][shape] = {"M": m, "K": k, "bytes": len(packed)}
+                meta["shapes"][shape] = {
+                    "M": m_padded, "M_real": m_real, "K": k,
+                    "bytes": len(packed),
+                }
                 write_golden(out, shape, k, rows, ref,
                              xs[k].view(torch.uint16).numpy())
         print(f"layer {n}: 4 shapes written", flush=True)
