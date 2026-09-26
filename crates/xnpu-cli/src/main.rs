@@ -2901,6 +2901,34 @@ fn w4u_build_x_elem(q: &[i8], d: &[u16], k: usize) -> Vec<u8> {
     out
 }
 
+/// Read a whole op's C tensor into (m,) bf16 bits — the bulk form of
+/// w4u_c_at (P15): walks column sections sequentially, no per-row
+/// div/mod, identical values and accumulation order.
+fn w4u_read_c(cs: &[u8], k: usize, m: usize) -> Vec<u16> {
+    let rpc = m / 8;
+    let chunks = w4u_chunks(k);
+    let section = (w4u_blocks(m, k) + 2) * W4U_TILE_ROWS;
+    let mut out = vec![0u16; m];
+    for col in 0..8 {
+        let base = (col * section + W4U_TILE_ROWS) * 2;
+        for w in 0..rpc {
+            let o = col * rpc + w;
+            if chunks == 1 {
+                let off = base + w * 2;
+                out[o] = u16::from_le_bytes([cs[off], cs[off + 1]]);
+            } else {
+                let mut acc = 0f32;
+                for c in 0..chunks {
+                    let off = base + (c * rpc + w) * 2;
+                    acc += bf16_to_f32(u16::from_le_bytes([cs[off], cs[off + 1]]));
+                }
+                out[o] = f32_to_bf16(acc);
+            }
+        }
+    }
+    out
+}
+
 /// Real output row -> bf16 bits from the v5 C tensor. Column col's
 /// section = (blocks+2) 16-row elements; skip the 16 leading zero rows
 /// (the activation element's), the block partials follow chunk-major;
@@ -4440,6 +4468,12 @@ fn qk_rms_bf16(x: &[u16], w: &[u16], out: &mut [u16]) {
 /// GQA decode attention: q (heads, roped) against a (kv, CACHE_SEQ, 128)
 /// cache; q head h reads kv head h/(heads/kv). Scores/softmax/PV in f32,
 /// one bf16 rounding at the output.
+///
+/// P15: K/V rows are staged to f32 ONCE per kv head (the group's q heads
+/// share them) and q once per head — the old loop re-converted every
+/// bf16 element on every multiply (~8x the conversions, and the PV walk
+/// strided the V cache per output dim). Accumulation ORDER per output is
+/// unchanged (t ascending), so results are bit-identical.
 fn attention_bf16(
     q: &[u16],
     kc: &[u16],
@@ -4452,31 +4486,45 @@ fn attention_bf16(
 ) {
     let s = pos + 1;
     let group = heads / nkv;
+    let mut kf = vec![0f32; s * 128];
+    let mut vf = vec![0f32; s * 128];
     let mut sc = vec![0f32; s];
-    for h in 0..heads {
-        let kv = h / group;
-        let mut mx = f32::NEG_INFINITY;
-        for t in 0..s {
-            let off = (kv * cache_seq + t) * 128;
-            let mut d = 0f32;
-            for j in 0..128 {
-                d += bf16_to_f32(kc[off + j]) * bf16_to_f32(q[h * 128 + j]);
-            }
-            sc[t] = d / (128f32).sqrt();
-            mx = mx.max(sc[t]);
+    let mut acc = [0f32; 128];
+    for kv in 0..nkv {
+        let base = kv * cache_seq * 128;
+        for i in 0..s * 128 {
+            kf[i] = bf16_to_f32(kc[base + i]);
+            vf[i] = bf16_to_f32(vc[base + i]);
         }
-        let mut sum = 0f32;
-        for v in sc[..s].iter_mut() {
-            *v = (*v - mx).exp();
-            sum += *v;
-        }
-        for j in 0..128 {
-            let mut acc = 0f32;
+        for h in kv * group..(kv + 1) * group {
+            let qo = h * 128;
+            let qf: [f32; 128] = std::array::from_fn(|j| bf16_to_f32(q[qo + j]));
+            let mut mx = f32::NEG_INFINITY;
             for t in 0..s {
-                let off = (kv * cache_seq + t) * 128;
-                acc += sc[t] * bf16_to_f32(vc[off + j]);
+                let kro = t * 128;
+                let mut d = 0f32;
+                for j in 0..128 {
+                    d += kf[kro + j] * qf[j];
+                }
+                sc[t] = d / (128f32).sqrt();
+                mx = mx.max(sc[t]);
             }
-            out[h * 128 + j] = f32_to_bf16(acc / sum);
+            let mut sum = 0f32;
+            for v in sc[..s].iter_mut() {
+                *v = (*v - mx).exp();
+                sum += *v;
+            }
+            acc = [0f32; 128];
+            for t in 0..s {
+                let w = sc[t];
+                let vro = t * 128;
+                for j in 0..128 {
+                    acc[j] += w * vf[vro + j];
+                }
+            }
+            for j in 0..128 {
+                out[qo + j] = f32_to_bf16(acc[j] / sum);
+            }
         }
     }
 }
@@ -4774,7 +4822,7 @@ fn cmd_run_decode(
         }
         let _ = live_lm[2].0.sync(SyncDirection::FromDevice, 0, live_lm[2].0.size() as u64);
         let cs = live_lm[2].1.as_slice();
-        Some((0..LM_M).map(|r| w4u_c_at(cs, r, 2048, LM_M)).collect())
+        Some(w4u_read_c(cs, 2048, LM_M))
     };
 
     // Host state: norms, caches, x0, goldens.
@@ -5086,9 +5134,9 @@ fn cmd_run_decode(
         // best-effort only, like every other read path here.
         let _ = c_bo.sync(SyncDirection::FromDevice, 0, c_bo.size() as u64);
         let cs = c_map.as_slice();
-        // v5 C：每列截面 [16 零行 | 块截面 | pad]，w4u_c_at 跳零行取行；
+        // v5 C：每列截面 [16 零行 | 块截面 | pad]，w4u_read_c 跳零行整块读；
         // K=6144 的 3 个 chunk 截面按 f32 求和后舍入 bf16（同 reference）。
-        Some((0..m).map(|r| w4u_c_at(cs, r, k, m)).collect())
+        Some(w4u_read_c(cs, k, m))
     };
 
     // The decode step. Scratch lives outside the closure (passed per call)
