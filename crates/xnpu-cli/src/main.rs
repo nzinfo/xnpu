@@ -212,6 +212,15 @@ fn main() -> ExitCode {
             let npu_attn = !args.iter().any(|s| s.as_str() == "cpu");
             cmd_run_decode(arch, &decdir, &w4dir, iters, npu_attn)
         }
+        Some("run-lmhead") => {
+            // M8/P8: hy lm_head on NPU — isolated probe (correctness + perf).
+            let iters = args
+                .iter()
+                .filter_map(|s| s.parse::<usize>().ok())
+                .next()
+                .unwrap_or(4);
+            cmd_run_lmhead(iters)
+        }
         Some("perf-calibrate") => {
             // M5a P6: measure machine-model ceilings (slot-stream per shape,
             // strided via flowkv) and emit the overlay JSON.
@@ -248,7 +257,7 @@ fn main() -> ExitCode {
         }
         _ => {
             eprintln!(
-                "usage: xnpu-cli <info | ctx-probe [max] [cols] | run-add [prj-dir] [bf16|i8] | run-gemm [prj-dir] [M K N] [bf16|i8] | run-multi [add-prj] [gemm-prj] [M K N] | run-pipe [prj-dir] [M K N] [iters] | run-chain [add-prj] [gemm-prj] [M K N] [reps] | run-q8 [gemm-prj] [rescale-prj] [M K N tile_m] [reps] | run-w4gemv [prj-dir] [M K] [group] [tsi] [iters] | run-w4layer [w4-dir] [layers] [iters] | run-w4ulayer [w4u-dir] [layers] [iters] | run-decode [dec-dir] [w4u-dir] [iters] [hy] [cpu] | perf-calibrate [hy] [iters]>"
+                "usage: xnpu-cli <info | ctx-probe [max] [cols] | run-add [prj-dir] [bf16|i8] | run-gemm [prj-dir] [M K N] [bf16|i8] | run-multi [add-prj] [gemm-prj] [M K N] | run-pipe [prj-dir] [M K N] [iters] | run-chain [add-prj] [gemm-prj] [M K N] [reps] | run-q8 [gemm-prj] [rescale-prj] [M K N tile_m] [reps] | run-w4gemv [prj-dir] [M K] [group] [tsi] [iters] | run-w4layer [w4-dir] [layers] [iters] | run-w4ulayer [w4u-dir] [layers] [iters] | run-decode [dec-dir] [w4u-dir] [iters] [hy] [cpu] | run-lmhead [iters] | perf-calibrate [hy] [iters]>"
             );
             ExitCode::FAILURE
         }
@@ -3424,6 +3433,265 @@ fn cmd_run_w4ulayer(w4dir: &str, nlayers: usize, iters: usize) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// M8/P8: lm_head on NPU — decode token 路径最后一个 CPU 计算算子（hy
+/// vocab 120818，tied embed；pad 到 120832 = 32 行 ABI）。普适 w4gemvu
+/// PDI 在 10x M 下仍逐位同（下方 assert；只有 ctrl code 携带 M）。隔离
+/// 探针：golden step 输入，120832 全 logits 对拍 golden_lmhead（argmax +
+/// top-8 + rel_rms），solo xN + 同 op burst 拿 399 MiB 权重流的 per-op
+/// 读数（M 比任何投影形状大 10 倍 —— 大 M slot 流是否越过 45.6 GB/s 的
+/// slot 天花板，是 P6 预言的"未建模档"信号，报告见分晓）。
+fn cmd_run_lmhead(iters: usize) -> ExitCode {
+    let build = "/home/nzinfo/qwen/xnpu/build";
+    const M: usize = 120832;
+    const K: usize = 2048;
+    // B fill 槽数 F = tiles_per_col(=M/8/4) / TILES_PER_B(=16) = 236。
+    let f_slots: usize = (M / 8 / 4) / 16;
+
+    let (pdi, instr, cols) =
+        match load_fixture(&format!("{build}/w4gemvu_{M}x{K}.mlir.prj")) {
+            Some(f) => f,
+            None => {
+                eprintln!("load fixture w4gemvu_{M}x{K} failed (run the w4gemvu pytest first)");
+                return ExitCode::FAILURE;
+            }
+        };
+    // PDI 与 decode qkv 夹具逐位同 —— 普适内核前提（P6 陷阱：ctrl code
+    // 携带 M，PDI 不携带；PDI 不同 = 编译缓存陈旧）。
+    match load_fixture(&format!("{build}/w4gemvu_3072x2048.mlir.prj")) {
+        Some((qdi, _, _)) if qdi == pdi => {}
+        _ => {
+            eprintln!("lm_head PDI != qkv PDI — stale fixture, rebuild");
+            return ExitCode::FAILURE;
+        }
+    }
+    let wdata = match std::fs::read(format!("{build}/w4u_hy/lmhead.bin")) {
+        Ok(d) if d.len() == 8 * (M / 32) * W4U_ELEM => d,
+        Ok(d) => {
+            eprintln!("lmhead.bin: {} B, expected {}", d.len(), 8 * (M / 32) * W4U_ELEM);
+            return ExitCode::FAILURE;
+        }
+        Err(e) => {
+            eprintln!("read lmhead.bin: {e} (q4nx_import.py --lmhead)");
+            return ExitCode::FAILURE;
+        }
+    };
+    // golden_lmhead.bin: u32 n, u32 k, x bits u16[k], ref bits u16[n].
+    let g = match std::fs::read(format!("{build}/w4u_hy/golden_lmhead.bin")) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("read golden_lmhead.bin: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let u32at = |b: &[u8], o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+    if u32at(&g, 0) as usize != M || u32at(&g, 4) as usize != K || g.len() != 8 + 2 * K + 2 * M {
+        eprintln!("golden_lmhead.bin: bad header (rerun q4nx_import.py --lmhead)");
+        return ExitCode::FAILURE;
+    }
+    let rd_u16 = |b: &[u8], o: usize, n: usize| -> Vec<u16> {
+        b[o..o + 2 * n]
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect()
+    };
+    let x_bits = rd_u16(&g, 8, K);
+    let ref_bits = rd_u16(&g, 8 + 2 * K, M);
+    println!(
+        "lm_head: M={M} (vocab 120818 + 14 pad), K={K}, weights {} MiB, F={f_slots} B slots",
+        wdata.len() >> 20
+    );
+
+    let dev = match Device::open_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("open amdxdna device: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let md = match dev.aie_metadata() {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("AIE metadata: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let num_tiles = cols * md.core.row_count as u32;
+    let mut ctx = match HwContext::create(&dev, num_tiles) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("create hwctx: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(e) = ctx.configure_cus(&[(pdi.as_slice(), 0)]) {
+        eprintln!("configure_cus: {e}");
+        return ExitCode::FAILURE;
+    }
+
+    let mut live: Vec<(BufferObject, Mapping)> = Vec::new();
+    let w_va = match chain_tensor(&dev, &mut live, "w.lmhead", &wdata) {
+        Some(v) => v,
+        None => {
+            eprintln!("w.lmhead BO failed");
+            return ExitCode::FAILURE;
+        }
+    };
+    // x 复制进 F 个 K_MAX 槽（slot-stream 的 B fill 语义，同投影链）。
+    let mut xdata = vec![0u8; f_slots * W4U_K_MAX * 2];
+    for s in 0..f_slots {
+        for (j, b) in x_bits.iter().enumerate() {
+            xdata[s * W4U_K_MAX * 2 + j * 2..s * W4U_K_MAX * 2 + j * 2 + 2]
+                .copy_from_slice(&b.to_le_bytes());
+        }
+    }
+    let x_va = match chain_tensor(&dev, &mut live, "x_lm", &xdata) {
+        Some(v) => v,
+        None => {
+            eprintln!("x_lm BO failed");
+            return ExitCode::FAILURE;
+        }
+    };
+    let c_va = match chain_tensor(&dev, &mut live, "c_lm", &vec![0u8; M * 2]) {
+        Some(v) => v,
+        None => {
+            eprintln!("c_lm BO failed");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut op = match chain_op(&dev, "lmhead", &instr, 0, &[w_va, x_va, c_va]) {
+        Some(o) => o,
+        None => {
+            eprintln!("lmhead op setup failed");
+            return ExitCode::FAILURE;
+        }
+    };
+    let handles = vec![op.ctrl_bo.handle(), live[0].0.handle(), live[1].0.handle(), live[2].0.handle()];
+
+    let mut meta = OpMeta::new(
+        "lmhead",
+        "w4gemvu",
+        0,
+        (K * 2) as u64,
+        (M * 2) as u64,
+        (2 * M * K) as u64,
+    )
+    .with_tier(tier::SLOT_STREAM);
+    meta.bytes_stream = Some((8 * (M / 32) * W4U_ELEM) as u64);
+
+    // ---- 正确性：全 120832 logits 对拍（不进 perf 分布）----
+    let seq = match op.pkt.submit(&dev, &ctx, &handles) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("lmhead submit: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(e) = syncobj_timeline_wait(&dev, ctx.syncobj_handle, seq, 60_000_000_000) {
+        eprintln!("lmhead wait: {e}");
+        return ExitCode::FAILURE;
+    }
+    let _ = live[2].0.sync(SyncDirection::FromDevice, 0, (M * 2) as u64);
+    let cs = live[2].1.as_slice();
+    let mut sum_sq = 0f32;
+    let mut g_sq = 0f32;
+    let mut argmax_n = 0usize;
+    let mut argmax_g = 0usize;
+    let mut top_n: Vec<(usize, f32)> = Vec::new();
+    for i in 0..M {
+        let o = bf16_to_f32(u16::from_le_bytes([cs[i * 2], cs[i * 2 + 1]]));
+        let r = bf16_to_f32(ref_bits[i]);
+        sum_sq += (o - r) * (o - r);
+        g_sq += r * r;
+        if o > bf16_to_f32(ref_bits[argmax_n]) {
+            argmax_n = i;
+        }
+        if r > bf16_to_f32(ref_bits[argmax_g]) {
+            argmax_g = i;
+        }
+        top_n.push((i, o));
+    }
+    let rel_rms = (sum_sq / M as f32).sqrt() / (g_sq / M as f32).sqrt().max(1e-9);
+    top_n.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let gset: std::collections::BTreeSet<usize> = {
+        let mut idx: Vec<(usize, f32)> =
+            ref_bits.iter().enumerate().map(|(i, &b)| (i, bf16_to_f32(b))).collect();
+        idx.sort_by(|a, b| b.1.total_cmp(&a.1));
+        idx.into_iter().take(8).map(|(i, _)| i).collect()
+    };
+    let overlap = top_n.iter().take(8).filter(|(i, _)| gset.contains(i)).count();
+    println!(
+        "lm_head vs golden: rel_rms {:.4}, argmax NPU {} vs golden {}, top-8 overlap {}/8 -> {}",
+        rel_rms,
+        argmax_n,
+        argmax_g,
+        overlap,
+        if argmax_n == argmax_g && rel_rms < 0.05 { "PASS" } else { "FAIL" }
+    );
+
+    // ---- 计时：solo xN + 同 op burst ----
+    let mut rec = Recorder::new();
+    let mut rec_seq = 0u64;
+    for it in 0..iters {
+        let ts = std::time::Instant::now();
+        let seq = match op.pkt.submit(&dev, &ctx, &handles) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("solo submit: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        if syncobj_timeline_wait(&dev, ctx.syncobj_handle, seq, 60_000_000_000).is_err() {
+            eprintln!("solo wait timed out");
+            return ExitCode::FAILURE;
+        }
+        rec.solo(&meta, it as u32, ts, rec_seq);
+        rec_seq += 1;
+    }
+    const BURST_N: usize = 8;
+    let tb = std::time::Instant::now();
+    let mut last_seq = 0u64;
+    for it in 0..BURST_N {
+        match op.pkt.submit(&dev, &ctx, &handles) {
+            Ok(s) => {
+                last_seq = s;
+                rec.burst_submit(&meta, it as u32, rec_seq);
+                rec_seq += 1;
+            }
+            Err(e) => {
+                eprintln!("burst submit: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    if syncobj_timeline_wait(&dev, ctx.syncobj_handle, last_seq, 60_000_000_000).is_err() {
+        eprintln!("burst wait timed out");
+        return ExitCode::FAILURE;
+    }
+    rec.burst_done("lmhead", Mode::Burst, 0, tb, BURST_N as u32, BURST_N as u32);
+
+    let model = machine_model_or_default();
+    let title = format!("run-lmhead: hy-mt2 lm_head {M}x{K}, {iters} solo + {BURST_N} burst");
+    let (md_out, _summary) = xnpu_perf::render_markdown(&rec, &[meta], &model, &title);
+    println!("\n{md_out}");
+    let dir = "/home/nzinfo/qwen/xnpu/build/perf";
+    if std::fs::create_dir_all(dir).is_ok() {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let stem = format!("{dir}/lmhead_{ts}");
+        let json = xnpu_perf::trace_json(&rec, &model, &title, &_summary);
+        match std::fs::write(format!("{stem}.json"), json)
+            .and_then(|()| std::fs::write(format!("{stem}.md"), &md_out))
+        {
+            Ok(()) => println!("perf trace written: {stem}.json / .md"),
+            Err(e) => eprintln!("perf trace write failed: {e}"),
+        }
+    }
+
+    ExitCode::SUCCESS
+}
+
 /// M5a P6 收尾（P7 接线）：报告一律对最新校准渲染 —— perf-calibrate 的
 /// 产物 build/perf/machine_model.json 存在则 overlay 到默认值上；解析失败
 /// 退回默认值并提示，绝不阻塞测量本身。
@@ -4248,6 +4516,141 @@ fn cmd_run_decode(
         }
     }
 
+    // M8: lm_head on NPU（可选 —— 需要 q4nx_import --lmhead 的
+    // lmhead.bin + golden_lmhead.bin 和 w4gemvu_120832x2048 夹具）。PDI
+    // 就是同一个普适内核，只多一份携带 M=120832 的 ctrl code。BO 存
+    // live_lm（所有 submit 期间保活）。minicpm 无导出 → 自动跳过。
+    let mut live_lm: Vec<(BufferObject, Mapping)> = Vec::new();
+    let mut lm: Option<(ChainOp, Vec<u32>, OpMeta, Vec<u16>)> = (|| {
+        const LM_M: usize = 120832;
+        const LM_K: usize = 2048;
+        let (_, linstr, _) =
+            match load_fixture(&format!("{build}/w4gemvu_{LM_M}x{LM_K}.mlir.prj")) {
+                Some(f) => f,
+                None => {
+                    println!("lm_head: fixture absent — token 路径无 logits 算子");
+                    return None;
+                }
+            };
+        let wdata = match std::fs::read(format!("{w4dir}/lmhead.bin")) {
+            Ok(d) if d.len() == 8 * (LM_M / 32) * W4U_ELEM => d,
+            _ => {
+                println!("lm_head: lmhead.bin absent/stale — skipped (q4nx_import.py --lmhead)");
+                return None;
+            }
+        };
+        let g = match std::fs::read(format!("{w4dir}/golden_lmhead.bin"))
+            .or_else(|_| std::fs::read(format!("{decdir}/golden_lmhead.bin")))
+        {
+            Ok(d)
+                if d.len() == 8 + 2 * LM_K + 2 * LM_M
+                    && u32::from_le_bytes([d[0], d[1], d[2], d[3]]) as usize == LM_M =>
+            {
+                d
+            }
+            _ => {
+                println!("lm_head: golden_lmhead.bin absent/stale — skipped");
+                return None;
+            }
+        };
+        let bits = |o: usize, n: usize| -> Vec<u16> {
+            g[o..o + 2 * n]
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect()
+        };
+        let ref_bits = bits(8 + 2 * LM_K, LM_M);
+        let x_bits = bits(8, LM_K);
+        let f_slots = (LM_M / 8 / 4) / 16; // 236 个 K_MAX 槽的 B fill
+        let mut xdata = vec![0u8; f_slots * W4U_K_MAX * 2];
+        for s in 0..f_slots {
+            for (j, b) in x_bits.iter().enumerate() {
+                xdata[s * W4U_K_MAX * 2 + j * 2..s * W4U_K_MAX * 2 + j * 2 + 2]
+                    .copy_from_slice(&b.to_le_bytes());
+            }
+        }
+        let w_va = chain_tensor(&dev, &mut live_lm, "w.lmhead", &wdata)?;
+        let x_va = chain_tensor(&dev, &mut live_lm, "x_lm", &xdata)?;
+        let c_va = chain_tensor(&dev, &mut live_lm, "c_lm", &vec![0u8; LM_M * 2])?;
+        let op = match chain_op(&dev, "lmhead", &linstr, 0, &[w_va, x_va, c_va]) {
+            Some(o) => o,
+            None => {
+                eprintln!("lm_head op setup failed");
+                return None;
+            }
+        };
+        let handles = vec![
+            op.ctrl_bo.handle(),
+            live_lm[0].0.handle(),
+            live_lm[1].0.handle(),
+            live_lm[2].0.handle(),
+        ];
+        let mut meta = OpMeta::new(
+            "lmhead",
+            "w4gemvu",
+            0,
+            (LM_K * 2) as u64,
+            (LM_M * 2) as u64,
+            (2 * LM_M * LM_K) as u64,
+        )
+        .with_tier(tier::SLOT_STREAM);
+        meta.bytes_stream = Some((8 * (LM_M / 32) * W4U_ELEM) as u64);
+        println!(
+            "lm_head on NPU: M={LM_M} (399 MiB weights/token), CU0 同 PDI 第 5 个 ctrl code"
+        );
+        Some((op, handles, meta, ref_bits))
+    })();
+
+    // 一个 lm_head step：refill 236 个 x 槽 → submit → wait → 读 logits。
+    // it > 0 才记 solo（checked step 不进分布）。
+    let mut lm_run = |lm: &mut Option<(ChainOp, Vec<u32>, OpMeta, Vec<u16>)>,
+                  hidden: &[u16],
+                  it: u32,
+                  rec: &mut Recorder,
+                  rec_seq: &mut u64|
+     -> Option<Vec<u16>> {
+        const LM_M: usize = 120832;
+        let (op, handles, meta, _) = lm.as_mut()?;
+        let f_slots = (LM_M / 8 / 4) / 16;
+        {
+            let (xbo, xmap) = &mut live_lm[1];
+            let bytes = xmap.as_mut_slice();
+            for s in 0..f_slots {
+                for (j, b) in hidden.iter().enumerate() {
+                    bytes[s * W4U_K_MAX * 2 + j * 2..s * W4U_K_MAX * 2 + j * 2 + 2]
+                        .copy_from_slice(&b.to_le_bytes());
+                }
+            }
+            if let Err(e) = xbo.sync(SyncDirection::ToDevice, 0, xbo.size() as u64) {
+                eprintln!("lm x sync: {e}");
+                return None;
+            }
+        }
+        let ts = std::time::Instant::now();
+        let seq = match op.pkt.submit(&dev, &ctx, handles) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("lm_head submit: {e}");
+                return None;
+            }
+        };
+        if let Err(e) = syncobj_timeline_wait(&dev, ctx.syncobj_handle, seq, 60_000_000_000) {
+            eprintln!("lm_head wait: {e}");
+            return None;
+        }
+        if it > 0 {
+            rec.solo(meta, it, ts, *rec_seq);
+            *rec_seq += 1;
+        }
+        let _ = live_lm[2].0.sync(SyncDirection::FromDevice, 0, live_lm[2].0.size() as u64);
+        let cs = live_lm[2].1.as_slice();
+        Some(
+            (0..LM_M)
+                .map(|r| u16::from_le_bytes([cs[r * 2], cs[r * 2 + 1]]))
+                .collect(),
+        )
+    };
+
     // Host state: norms, caches, x0, goldens.
     let rd_u16file = |p: &str| -> Option<Vec<u16>> {
         let d = std::fs::read(p).ok()?;
@@ -4497,6 +4900,15 @@ fn cmd_run_decode(
         }
         .into_iter())
         .collect();
+    // M8: lm_head 进报告（若在）。
+    let metas: Vec<OpMeta> = match &lm {
+        Some((_, _, m, _)) => {
+            let mut v = metas;
+            v.push(m.clone());
+            v
+        }
+        None => metas,
+    };
     let mut rec = Recorder::new();
     let mut rec_seq = 0u64;
 
@@ -4799,6 +5211,63 @@ fn cmd_run_decode(
         println!("  largest diff @[{i}]: |err| {e:.4} on golden {w:.4} ({:.1}%)", 100.0 * e / w.abs().max(1e-9));
     }
 
+    // M8 lm_head 对拍：checked 步的 final hidden 喂 NPU lm_head，与
+    // golden logits 比 argmax / rel_rms / top-8 重叠（gate 同 run-lmhead）。
+    if lm.is_some() {
+        let logits = match lm_run(&mut lm, &sc.xn, 0, &mut rec, &mut rec_seq) {
+            Some(l) => l,
+            None => {
+                eprintln!("lm_head golden step failed");
+                return ExitCode::FAILURE;
+            }
+        };
+        let ref_bits = &lm.as_ref().unwrap().3;
+        let f32of = |b: u16| bf16_to_f32(b);
+        let argmax = |v: &Vec<u16>| -> usize {
+            let mut a = 0usize;
+            let mut b = f32of(v[0]);
+            for (i, x) in v.iter().enumerate() {
+                let t = f32of(*x);
+                if t > b {
+                    b = t;
+                    a = i;
+                }
+            }
+            a
+        };
+        let argmax_n = argmax(&logits);
+        let argmax_g = argmax(ref_bits);
+        let mut num = 0f64;
+        let mut den = 0f64;
+        for i in 0..120832 {
+            let d = f32of(logits[i]) - f32of(ref_bits[i]);
+            num += (d * d) as f64;
+            den += (f32of(ref_bits[i]) * f32of(ref_bits[i])) as f64;
+        }
+        let rel_rms = (num / den).sqrt() as f32;
+        let ids = |v: &Vec<u16>| -> Vec<usize> {
+            let mut t: Vec<(usize, f32)> =
+                (0..120832).map(|i| (i, f32of(v[i]))).collect();
+            t.sort_by(|a, b| b.1.total_cmp(&a.1));
+            t.into_iter().take(8).map(|(i, _)| i).collect()
+        };
+        let tn = ids(&logits);
+        let tg = ids(ref_bits);
+        let overlap = tn.iter().filter(|i| tg.contains(i)).count();
+        println!(
+            "lm_head vs golden: rel_rms {:.4}, argmax NPU {} vs golden {}, top-8 overlap {}/8 -> {}",
+            rel_rms,
+            argmax_n,
+            argmax_g,
+            overlap,
+            if argmax_n == argmax_g && rel_rms < 0.05 { "PASS" } else { "FAIL" }
+        );
+        if argmax_n != argmax_g || rel_rms >= 0.05 {
+            eprintln!("lm_head gate FAILED — token 路径结果不可信");
+            return ExitCode::FAILURE;
+        }
+    }
+
     // Timed iterations (steady state; caches are idempotent at fixed pos).
     t0 = std::time::Instant::now();
     for it in 1..=iters as u32 {
@@ -4813,12 +5282,22 @@ fn cmd_run_decode(
             eprintln!("timed decode step failed");
             return ExitCode::FAILURE;
         }
+        // M8: 每 token 的 final norm + lm_head（logits 也在 NPU 上）。
+        rms_norm_bf16(&x, &norms[2 * layers * 2048..][..2048], &mut sc.xn);
+        if lm.is_some()
+            && lm_run(&mut lm, &sc.xn, it, &mut rec, &mut rec_seq).is_none()
+        {
+            eprintln!("timed lm_head failed");
+            return ExitCode::FAILURE;
+        }
         rec.burst_done(
             "decode-step",
             Mode::Solo,
             it,
             tb,
-            (layers * 4 + if npu_attn { layers } else { 0 }) as u32,
+            (layers * 4
+                + if npu_attn { layers } else { 0 }
+                + if lm.is_some() { 1 } else { 0 }) as u32,
             1,
         );
     }
