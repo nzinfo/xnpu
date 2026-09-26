@@ -1050,3 +1050,27 @@ DMA 通道 ~5GB/s 是当前流上限**，8 列 → ~40GB/s 封顶；FLM 21.44ms
 - **下一杠杆排序**（更新）：①attention 同 PDI 融合或 S 感知 flowkv（13.4ms
   CPU + 终态全 NPU 要求）②层内 4 GEMV 融合/批量（消每 op 固定成本）③胶水
   NPU 化。纯 runlist 批量在 CPU-interlocked 链上无收益（每 op x 依赖前 op C）。
+
+## P15（2026-09-27）：CPU 侧两刀（位保真）—— E2E 49.6→41.0ms
+- **trace 分解**（P14 后）：设备 30.6ms + gap 18.6ms，其中 attention 前 gap
+  417.9µs×32=13.4ms、down 前 105.9µs、qkv/gateup 前 ~30/23µs。
+- **attention_bf16 重写（位保真）**：K/V 行每 kv head 转 f32 一次（组内 4 个
+  q head 共享——原来每次乘法都 bf16→f32，~8× 转换量）；q 每 head 转一次；
+  PV 改 [t 外 j 内] 顺序累加（每输出维的求和序不变 → 逐位同结果，hidden
+  rms 0.0492 / lm rel_rms 0.0278 与改前完全一致）。gap 417.9→192.9µs。
+- **w4u_read_c**：整 op C 读改成按列截面顺序遍历（w4u_c_at 每行 div/mod
+  +字节拼装是 C 读真成本），值与序不变。
+- **E2E**：**41.01ms/token（24.4 tok/s）** med 41.09，门全过；设备 solo 不变
+  （qkv 153/o 143/gateup 346/down 231/lm 2674µs）。gap 剩 10.3ms：attention
+  6.2（K/V staging+dot）+ down 前 2.7（swiglu 6144 次 expf 为主）+ 其余 1.4。
+- **设备侧结构定论**：Σ设备 30.6ms vs 纯流地板 18.9ms（1.015GB@53.6GB/s）
+  = **每 op 固定 ~90-100µs × 129 op**（marginal 拟合 0.335µs/块=55GB/s 在墙
+  上；intercept 拟合 o 143−128×0.335≈100，gateup 89，down 102）。固定成本
+  嫌犯 = ctrl/DPU 逐 fill-drain-wait 的发行时延（ctrl .bin 所有形状同 3248B
+  → 发行步数与 M 无关）。
+- **M6 架构判据（下会话主线）**：v5 自描述元素 + drain-wait 定序的 ctrl 使
+  **层内融合可行**——胶水算子成为元素口味（rms 需全向量：8 列冗余算+经
+  DDR 往返；swiglu 列内本地但 gate/up 配对要导出侧重排列；attention=flowkv
+  元素化）。每层 1-2 op 替代 4+胶水，消 ~95µs/op×~96 + 全部 CPU gap。
+  今晚不做；CPU 侧再抠（swiglu expf 向量化 ~2.7ms、f32 KV 缓存 ~2ms）皆为
+  脚手架，与终态（全 NPU）冲突，搁置。
