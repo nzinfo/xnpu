@@ -170,6 +170,46 @@ def verify_tie(q4, verbose=True):
     return rel
 
 
+def export_lmhead(q4, out, decdir):
+    """hy lm_head (tied embed, vocab 120818 -> padded 120832) as w4gemvu v2
+    packed weights + golden logits for the decode golden step.
+
+    Same treatment as every layer weight: FLM int4 -> f32 -> OUR amax/7
+    int4 ABI via the unchanged IRON packer (zero rows pad quantize to
+    q=0/scale=0). Golden x = decdir/golden_hidden.bin (the reference final
+    hidden decode_export emits) — ref = dequant(W) @ x, f32 dot, one bf16
+    rounding (spot_rows convention).
+
+    File: lmhead.bin (8*(120832/32)*13840 = 418,078,720 B = 399 MiB);
+    golden_lmhead.bin = u32 n, u32 k, x bits u16[k], ref bits u16[n].
+    """
+    head = q4.i8_matrix("lm_head.weight")  # (120818, 2048) f32
+    m_padded = 120832
+    assert head.shape == (120818, 2048)
+    W = np.zeros((m_padded, 2048), dtype=np.float32)
+    W[:120818] = head
+    del head
+    packed, w_dequant = quantize_and_pack(
+        np.ascontiguousarray(W), group_size=32, m_input=4, cols=8
+    )
+    assert len(packed) == 8 * (m_padded // 32) * SLOT_V2
+    packed_bytes = len(packed)
+    (out / "lmhead.bin").write_bytes(packed.tobytes())
+    del packed
+
+    x_bits = np.fromfile(decdir / "golden_hidden.bin", dtype="<u2")
+    assert x_bits.size == 2048, f"golden_hidden: {x_bits.size}"
+    x = torch.from_numpy((x_bits.astype(np.uint32) << 16).view(np.float32))
+    ref = (w_dequant.to(torch.float32) @ x).to(torch.bfloat16)
+    buf = bytearray()
+    buf += struct.pack("<II", m_padded, 2048)
+    buf += x_bits.astype("<u2").tobytes()
+    buf += ref.view(torch.uint16).numpy().astype("<u2").tobytes()
+    (out / "golden_lmhead.bin").write_bytes(bytes(buf))
+    print(f"lm_head: packed {packed_bytes} B -> lmhead.bin + golden_lmhead.bin "
+          f"(x = golden_hidden)")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="/home/nzinfo/qwen/xnpu/build/w4u_hy")
@@ -177,6 +217,9 @@ def main():
                     help="layer indices to import (default: all 32)")
     ap.add_argument("--with-embed", action="store_true",
                     help="also export the 495 MB bf16 embedding table")
+    ap.add_argument("--lmhead", action="store_true",
+                    help="also export lm_head (hy): lmhead.bin (399 MiB v2) "
+                         "+ golden_lmhead.bin for the decode golden step")
     ap.add_argument("--skip-tie-check", action="store_true")
     args = ap.parse_args()
 
@@ -187,6 +230,9 @@ def main():
 
     if not args.skip_tie_check:
         verify_tie(q4)
+
+    if args.lmhead:
+        export_lmhead(q4, out, Path("/home/nzinfo/qwen/xnpu/build/dec_hy"))
 
     meta = {
         "group_size": 32, "cols": 8, "layout": "v2", "layers": layers,

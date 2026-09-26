@@ -658,3 +658,79 @@ perf-calibrate 深度扫描（8/16/32/64）——**P6 的"深队列背压"假设
   perf-calibrate（<10s）取当日基线。
 - 时序测试 flake 名字未捕获（见坑 4）。
 - lm_head w4 = seq-dma 立档 + M4 收尾双收益，待排期。
+
+## P8（2026-09-26）lm_head w4 上 NPU：全算子 NPU 化收官 + 102% 未建模层级信号实锤
+
+### 设计思路
+
+- **复用普适 w4gemvu 内核，零新设备代码**。P7 已证 PDI 与形状无关（K 运行时
+  自描述）；本档补证 **M 也只在 ctrl code 里**：w4gemvu_120832x2048 与
+  w4gemvu_3072x2048 的 main.pdi md5 相同（3b8c7213…），夹具 .bin 却不同
+  （M 编进 ctrl 指令序列）。→ lm_head = 同一 CU 的第 5 份 ctrl code。
+- **M=120818 → 120832**：vocab 补零到 32 行 ABI（cols8×4），pad 行量化为
+  q=0/scale=0，复用 IRON packer 不改一行。
+- **权重口径**：FLM q4nx 里 lm_head 已是 int4（verify_tie 证与 tied embed
+  到 int4 误差），仍走"f32 → 我们 amax/7 重量化"——与 128 个层权重同待遇，
+  对比目标就是 FLM。
+- **golden 语义**：x = dec_hy/golden_hidden.bin（参考 final hidden，逐位
+  验证过）；ref = dequant(w4) @ x，f32 点积单次 bf16 舍入（spot_rows 约定）。
+  golden top1=25868（9.25），top1–top2 差 0.438（4.7%）→ argmax 门有效。
+- **成本预告**：lmhead.bin = 8×(120832/32)×13840 = 418,078,720 B（399 MiB，
+  ELEM 按 K_MAX=6144 编 → 3× K-padding 浪费）。slot-stream 45.6 GB/s 下
+  ~9.2 ms/token 预期。
+
+### 尝试步骤（含失败）
+
+1. IRON test.py 加 (120832,2048) → pytest 5/5 PASS（14.8s，纯 host 侧
+   编译+参考对拍）。
+2. q4nx_import.py `--lmhead`：export_lmhead 导出 lmhead.bin（418,078,720 B，
+   md5 1bf38aaf…）+ golden_lmhead.bin（245,768 B）。
+3. `run-lmhead` 独立探针（Rust）：399 MiB W BO + 236 槽 x BO（每槽
+   K_MAX 宽，replicate）+ 241,664 B 输出；submit→wait→全 logits 对拍
+   （argmax/rel_rms/top-8）→ solo×4 + burst×8。**首次上板即 PASS**。
+4. run-decode 集成：`lm_run` 每 token 步（refill 236 槽 → ToDevice →
+   submit → wait → FromDevice），checked 步后对拍、timed 循环计入
+   burst_done 的 n_submits，lmhead 进 per-op 报告；minicpm 无文件自动跳过。
+
+### 坑（全部踩到）
+
+- **目录约定分裂**：golden_lmhead.bin 导到 w4u_hy（与 lmhead.bin 一对），
+  run-decode 却去 decdir 找 → 首次 E2E 静默跳过 lm_head（打印保留，153.9
+  ms/token 是不含 lm 的）。修复：w4dir 优先 decdir 兜底。教训：**导出物
+  消费方在写导出端时就该对齐路径**。
+- **pos_args 吞数字**：`run-decode hy 4` 把 4 当 decdir（"read 4/norms.bin
+  failed"）。iters 是第 3 个位置参数，用默认即可。
+- **perf-calibrate 默认 minicpm 形状集**会覆写 machine_model.json 的
+  strided 档（0.98 hy → 0.246 minicpm，flowkv 视角差 4×）。E2E 前必须
+  `perf-calibrate hy`。machine_model.json 无 arch 命名空间——跨架构互踩，
+  开放问题。
+- Rust 侧小坑：u32le helper 不存在（内联 from_le_bytes）；pkt.submit 要
+  &mut（gemv 的 `&mut ops[i]` 模式）；FnMut 闭包绑定要 mut。
+
+### 结果
+
+- **探针**：rel_rms 0.0000、argmax 25868==25868、top-8 8/8 → PASS；
+  burst 8,955.8 µs/op（solo 9,007.5，ovh 51.8）= **46.68 GB/s =
+  校准 slot-stream 天花板的 102%**。
+- **E2E**（perf-calibrate hy 后）：链上 lmhead solo 9,107 µs = 45.91 GB/s
+  （100%）；logits rel_rms 0.0097（探针用精确 golden_hidden，链上是实际
+  decode hidden，0.9% rms 漂移一致）、argmax/top-8 全对 → PASS；
+  **steady 165.2 ms/token（6.1 tok/s）**，同批无 lm 153.9 → Δ+11.3 ms
+  ≈ 9.0 ms 算子 + 236 槽 refill/sync host 侧成本。
+- **102% 的解读**：P6 预言的"未建模层级"信号坐实——399 MiB 大 M 流的
+  持续带宽超小形状标定 45.7（gateup 53 MiB 测的）。要么天花板随 M 增长
+  （更长流水摊开 ramp），要么 seq-dma 档（52，FLM 下界）才是大流归属。
+  报告如实标 102%，框架不改（诚实过期标记正是设计行为）。
+- decode 链 161 submits/token：128 w4gemvu（CU0）+ 32 flowkv（CU1）+
+  1 lmhead（CU0）——**"全算子 NPU 化优先"收官**；CPU 只剩 rope/qk-norm/
+  kv-append/norms/swiglu/argmax（~5% 时间）。
+- L20 首次分歧打印（19/2048 超容差）两跑完全一致 → 确定性容差边缘，
+  非 flake；final hidden PASS（rms 0.9%）。
+
+### 遗留
+
+- per-K ELEM 内核（M3b）：lmhead.bin 399 MiB 里 2/3 是 K-padding 浪费，
+  K=2048 专用 ELEM 可砍到 ~133 MiB → lm_head ~3 ms，链 −6 ms/token。
+- 跑间漂移根因（全局设备态）未明；machine_model.json 跨架构互踩；
+  时序 flake 名字未捕获；seq-dma 自测内核仍未立档（lm_head 是其天然
+  载荷但归 slot-stream 层）。
