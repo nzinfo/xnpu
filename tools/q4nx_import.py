@@ -19,18 +19,23 @@ The manifest carries no logical dims — the projection table below supplies
 M and K per tensor (validated: every I8 shape[0] matches ceil(M/32)*ceil(K/256)).
 
 Output contract matches w4_import.py exactly (layer{n:02d}_{shape}.bin in
-the w4gemvu v3 COMPACT-BLOCK layout, golden_{...}.bin spot checks,
-meta.json) so the Rust loader needs only constant updates (ELEM 13888,
-padded M). Padded Ms satisfy the v3 block ABI (K=2048 -> M % 192 == 0 and
-blocks even; K=6144 -> M % 64 == 0): o 2048 -> 2112, lm_head 120818 ->
-120960 (pad rows are zero weights: q=0/scale=0 -> zero outputs, dropped
-on read).
+the w4gemvu v4 MATRIX-UNIT-TILE layout, golden_{...}.bin spot checks,
+meta.json) so the Rust loader needs only constant updates (ELEM 18560,
+padded M). v4 ABI: M % 256 == 0 — o_proj needs NO pad now (v3 padded to
+2112); lm_head 120818 -> 121088 (pad rows are zero weights: q=0/scale=0
+-> zero outputs, dropped on read).
 
-hy-mt2 decode shapes per layer (real -> padded M):
+v4 numerics ABI: the activation is quantized int8 per-group-32 (scale
+d = amax/127 bf16). Goldens bake this in: ref mirrors the device math
+(per-2048-chunk partials rounded bf16, then summed for K=6144) against
+x_dequant = q*d — the Rust engine quantizes the same bf16 x bit-exactly
+(deterministic amax/round_ties_even path in both).
+
+hy-mt2 decode shapes per layer (real = padded M, all % 256 == 0):
   qkv     3072x2048  cat(q 2048, k 512, v 512)
-  o       2048->2112x2048  o_proj (pads to pack 3 tiles/block, even blocks)
+  o       2048x2048  o_proj (v4 unpads v3's 2112)
   gate_up 12288x2048 cat(gate 6144, up 6144)
-  down    2048x6144  down_proj (1 tile/block + 2 zero-row calls)
+  down    2048x6144  down_proj (3 chunk-blocks per tile, host sums)
 
 bf16.safetensors next to the .bins carries the norms (input/post/q_norm/
 k_norm/final) for decode_export; --with-embed adds the 495 MB tied
@@ -58,9 +63,10 @@ _w4uref = importlib.util.module_from_spec(_SPEC_V2)
 assert _SPEC_V2.loader is not None
 _SPEC_V2.loader.exec_module(_w4uref)
 quantize_and_pack = _w4uref.quantize_and_pack
+quantize_vector = _w4uref.quantize_vector
 blocks_per_col = _w4uref.blocks_per_col
-tiles_per_block = _w4uref.tiles_per_block
-ELEM = _w4uref.ELEM  # 13888 v3: one compact block
+chunks_per_tile = _w4uref.chunks_per_tile
+ELEM = _w4uref.ELEM  # 18560 v4: one 16-row x 2048 matrix-unit tile
 
 MODEL_DIR = Path("/home/nzinfo/.config/flm/models/Hy-MT2-1.8B-NPU2")
 
@@ -77,17 +83,35 @@ PROJ = {
 # match Rust W4U_SHAPES (which carries the padded M). Pad rows are zeros.
 SHAPES = {
     "qkv": ([("q_proj", 2048), ("k_proj", 512), ("v_proj", 512)], 3072, 2048, 3072),
-    "o": ([("o_proj", 2048)], 2048, 2048, 2112),
+    "o": ([("o_proj", 2048)], 2048, 2048, 2048),
     "gateup": ([("gate_proj", 6144), ("up_proj", 6144)], 12288, 2048, 12288),
     "down": ([("down_proj", 2048)], 2048, 6144, 2048),
 }
 N_LAYERS = 32
-LM_M_PAD = 120960  # 120818 -> 1260 even blocks of 3 tiles
+LM_M_PAD = 121088  # 120818 -> 946 even blocks of one 16-row tile
 
 
 def packed_size(m_padded, k):
-    """v3 packed bytes = 8 cols * blocks_per_col * ELEM."""
-    return 8 * blocks_per_col(m_padded, k, 4, 8) * ELEM
+    """v4 packed bytes = 8 cols * blocks_per_col (chunk-major) * ELEM."""
+    return 8 * blocks_per_col(m_padded, k, 16, 8) * ELEM
+
+
+def gemv_ref(w_dequant, x_bf16):
+    """Mirror the v4 device math: per-2048-chunk partials against the
+    QUANTIZED x (q*d), each rounded bf16, summed for K=6144 (the host
+    sums the 3 chunk partials the kernel emits)."""
+    q, d, x_deq = quantize_vector(x_bf16)
+    K = x_bf16.numel()
+    chunks = chunks_per_tile(K)
+    if chunks == 1:
+        return (w_dequant.to(torch.float32) @ x_deq).to(torch.bfloat16)
+    Wf = w_dequant.to(torch.float32)
+    out = torch.zeros(w_dequant.shape[0], dtype=torch.bfloat16)
+    partials = torch.empty(chunks, w_dequant.shape[0], dtype=torch.bfloat16)
+    for c in range(chunks):
+        partials[c] = (Wf[:, c * 2048 : (c + 1) * 2048]
+                       @ x_deq[c * 2048 : (c + 1) * 2048]).to(torch.bfloat16)
+    return partials.sum(dim=0).to(torch.bfloat16)
 
 
 class Q4nx:
@@ -146,12 +170,10 @@ class Q4nx:
 
 
 def spot_rows(m, k, w_dequant, x_bf16):
-    """Reference outputs for a few rows: f32 dot of dequant W against the
-    deterministic x, one bf16 rounding — same tolerance tier as w4_import."""
+    """Reference outputs for a few rows: v4 device math (quantized x,
+    chunk partials summed) — same tolerance tier as w4_import."""
     rows = sorted({0, 1, m // 2, m - 2, m - 1})
-    ref = (w_dequant[rows].to(torch.float32) @ x_bf16.to(torch.float32)).to(
-        torch.bfloat16
-    )
+    ref = gemv_ref(w_dequant[rows], x_bf16)
     return rows, ref.view(torch.uint16).numpy()
 
 
@@ -204,7 +226,7 @@ def export_lmhead(q4, out, decdir):
     W[:120818] = head
     del head
     packed, w_dequant = quantize_and_pack(
-        np.ascontiguousarray(W), group_size=32, m_input=4, cols=8
+        np.ascontiguousarray(W), group_size=32, m_input=16, cols=8
     )
     assert len(packed) == packed_size(m_padded, 2048)
     packed_bytes = len(packed)
@@ -213,8 +235,9 @@ def export_lmhead(q4, out, decdir):
 
     x_bits = np.fromfile(decdir / "golden_hidden.bin", dtype="<u2")
     assert x_bits.size == 2048, f"golden_hidden: {x_bits.size}"
-    x = torch.from_numpy((x_bits.astype(np.uint32) << 16).view(np.float32))
-    ref = (w_dequant.to(torch.float32) @ x).to(torch.bfloat16)
+    x = (x_bits.astype(np.uint32) << 16).view(np.float32)
+    x = torch.from_numpy(x).to(torch.bfloat16)
+    ref = gemv_ref(w_dequant, x)
     buf = bytearray()
     buf += struct.pack("<II", m_padded, 2048)
     buf += x_bits.astype("<u2").tobytes()
@@ -232,7 +255,7 @@ def main():
     ap.add_argument("--with-embed", action="store_true",
                     help="also export the 495 MB bf16 embedding table")
     ap.add_argument("--lmhead", action="store_true",
-                    help="also export lm_head (hy): lmhead.bin (133.5 MiB v3) "
+                    help="also export lm_head (hy): lmhead.bin (v4) "
                          "+ golden_lmhead.bin for the decode golden step")
     ap.add_argument("--skip-tie-check", action="store_true")
     args = ap.parse_args()
@@ -249,7 +272,7 @@ def main():
         export_lmhead(q4, out, Path("/home/nzinfo/qwen/xnpu/build/dec_hy"))
 
     meta = {
-        "group_size": 32, "cols": 8, "layout": "v3", "layers": layers,
+        "group_size": 32, "cols": 8, "layout": "v4", "layers": layers,
         "model": "hy-mt2-1.8b", "shapes": {},
         # architecture facts decode_export needs (from FLM config.json)
         "arch": {"n_layers": 32, "hidden": 2048, "inter": 6144,
@@ -284,10 +307,10 @@ def main():
             # f32 in, re-quantized to OUR w4 ABI (amax/7): we inherit FLM's
             # int4 weights as ground truth — the comparison target IS FLM.
             packed, w_dequant = quantize_and_pack(
-                np.ascontiguousarray(W), group_size=32, m_input=4, cols=8
+                np.ascontiguousarray(W), group_size=32, m_input=16, cols=8
             )
             assert len(packed) == packed_size(m_padded, k), (
-                f"layer {n} {shape}: v3 packed is {len(packed)} bytes"
+                f"layer {n} {shape}: v4 packed is {len(packed)} bytes"
             )
             packed.tofile(out / f"layer{n:02d}_{shape}.bin")
             # spot rows stay inside the REAL rows (pad rows are trivially 0)

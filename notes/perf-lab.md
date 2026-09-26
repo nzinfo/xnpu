@@ -869,3 +869,77 @@ solo 就 2.12ms/层——**即使 host/attention 全免费也 77ms 设备下限*
 正好把投影 68→14ms、lm 9→2.7ms。**P11 = w4gemvu 内层循环重写**，
 这是通往"不弱于 FLM"的主线；runlist 批量提交（−4ms）与 S-aware
 flowkv 退居其后。
+
+## P11：w4gemvu v4 矩阵单元内核 —— 投影设备时间 2.2×，E2E 87.6→58.4ms
+
+**动机**（P10 结论）：v3 内层每 32 MAC ≈ 10 条向量指令，发射瓶颈。
+aie2p 有矩阵单元：`mmul<4,16,16,int8,int4>` = `mac_4x16_16x16_conf`，
+一条指令 1024 MAC。探针实测 131072 MAC/call（16× v3 块的 8192）约
+1.3µs ⇒ ~100 GMAC/s/core，**每 MAC ~29–32× 于 v3 向量路径** → v4 把
+GEMV 整个搬到矩阵单元。
+
+### 设计（五件套 + 导入器 + Rust）
+
+- **数值 ABI 变更**：激活改 int8 per-group-32 对称量化（d=amax/127
+  bf16，q∈[−127,127]），内积变**精确 int32**（|qw·qx|·32 ≤ 2^15），
+  sf·d 在 f32 域后乘累加（partial 可达 2^15，bf16 域会溢出/失精度；
+  aie_api 无 bf16→f32 向量重载，用 `mul(sfb,db).to_vector<float>()`
+  ——两 bf16 之积在 f32 精确）。golden 对量化后的 x 计算；Rust
+  `w4u_quantize_x` 必须与 torch `quantize_vector` 逐位一致（RNE bf16
+  + round_ties_even）。
+- **块 = 18560B = 一个 16 行 × 2048k tile**：[0,16384) nibble 按 B 操作
+  数序（组主序，元素 g*256+k*16+n，字节打包行 n,n+1）；[16384,18432)
+  sf_t 转置 bf16[64][16]（行 n 的组 g scale 在 g*16+n，一次 32B 载入）；
+  [18552,18556) K 头（恒 2048，guard）。内核每块一次调用：2×（载 x16
+  int8 复制 4 份成 A[4×16] + 载 B 256×int4 + 2 条 mm.mac），64 组循环。
+- **K=6144**：每 tile 流 3 个 chunk-块（chunk 主序，一个 B 槽的 2 块
+  共享同一 x chunk），C 全行有效，主机 f32 求和 3 个 chunk partial 后
+  舍入 bf16。B 槽 6528B = x int8(6144，活 chunk 在 0..2048) + d bf16
+  [192]（活 64 在 6144）。ABI 统一 **M%256==0**（o 2048 免补、lm
+  120818→121088）。
+- 导入器 v4（`gemv_ref` 镜像设备分块求和）；Rust 常量/打包/C 收拢
+  helper 化（`w4u_quantize_x`/`w4u_pack_slots`/`w4u_c_at`）。
+
+### 踩坑（按时间序，都是硬约束）
+
+1. **`concat` 两半必须等宽**：`concat(x0, concat(x0,x0))` 非法 →
+   `concat(concat(x0,x0), concat(x0,x0))`。
+2. **ELEM=18448（%32=16）**：奇数元素缓冲的 scale 载入读到垃圾
+   （1e18 级值）——诊断内核把 K 头/nibble 和/sf 和回显到 c_out 证明
+   **输入全健康**，垃圾产生于计算内。
+3. **ELEM=18464（%32==0 但 ≡16 mod 64）**：scale 对了、nibble 流仍
+   垃圾（有界错值）。aie2p（arch 21）`ld_st.hpp` vector_ldst_align：
+   128b→16B、256b→32B、其余 **64B**；`load_v<256>` int4 = 1024 位
+   ⇒ 需 64B 对齐，而 depth-2 fifo 两元素缓冲在 base 与 base+ELEM。
+   **ELEM%64==0 是硬约束**，18560 收敛（18448/18464/18560 三指纹）。
+4. **K=6144 golden 失配**：我按全 M chunk 截面排 C，实际 drain 按列
+   生产序（col*3*rpc + c*rpc + w）——reference 的 shuffle/unshuffle
+   与 Rust `w4u_c_at` 都按**每列 chunk 主序**重写后通过。
+5. 诊断 pytest 必须放 IRON 树内（conftest 的 aie_context fixture），
+   用完删除（test_debug_tmp.py）。
+
+### 结果
+
+- pytest 30/30 全过（6 形状 × 含 metrics）。
+- **per-op solo（含 ~54µs submit，链上）**：qkv 3072 180µs/19.8GB/s ·
+  o 157.5/15.0 · gateup 447/31.7 · down 276/25.6 · lm 3614/38.9。
+  对比 v3（P10）：qkv 317 · o 254 · gateup 1014 · down 539 ·
+  lm 9118 —— 投影层设备时间 **2.2×**，lm 2.5×。
+- **E2E（CPU attention）：58.41 ms/token（17.1 tok/s）**，v3 87.64 →
+  −33%。门全过：argmax 25868 ✓ top-8 8/8 ✓ lm rel_rms 0.0258 ✓
+  final hidden rms 1.8%。层 16 起 19/2048 出 1% 容差（int8 激活量化
+  漂移，worst rel 9.6 在小值上）——终局门不受影响，留观。
+- **NPU attention 路径 130.7ms 倒退**：flowkv strided 档 1.07GB/s
+  （2.1MB/1.97ms）×32 + w4gemvu(CU0)↔flowkv(CU1) 列冲突把 o solo
+  157→766µs（≈650µs CU 切换税 × 64 次/层序）。CPU attention 反而快
+  2.2×——attention 回 NPU 必须走**同 PDI 列内融合**，不能双 CU 交替。
+
+### 差距分解（58.41 vs FLM 21.44）
+
+设备 Σsolo ≈ 37.6ms（扣 submit 129×54µs≈7ms → 设备 ~30.6ms），
+CPU glue（rope/attn/norms/swiglu/量化打包/clflush）≈ 20.8ms。
+per-column A 流实测 2.9–4.9 GB/s（lm_head 4.9 封顶）：**单 shim
+DMA 通道 ~5GB/s 是当前流上限**，8 列 → ~40GB/s 封顶；FLM 21.44ms
+× 1.015GB 流量 ⇒ ≥47GB/s —— 他们必然用了**每 shim 双通道**。
+**P12 主线：A 流双通道（每列 2 fifo 交错元素）→ 期望投影/lm 设备
+~2×**；其次 runlist 批量提交（−5-7ms）、attention 同 PDI 融合。
