@@ -943,3 +943,86 @@ DMA 通道 ~5GB/s 是当前流上限**，8 列 → ~40GB/s 封顶；FLM 21.44ms
 × 1.015GB 流量 ⇒ ≥47GB/s —— 他们必然用了**每 shim 双通道**。
 **P12 主线：A 流双通道（每列 2 fifo 交错元素）→ 期望投影/lm 设备
 ~2×**；其次 runlist 批量提交（−5-7ms）、attention 同 PDI 融合。
+
+## P12（2026-09-27）：A 流通道数假设证伪 + B 流才是真凶
+- **假设**（P11 遗留）：per-column A 流 ~4.9 GB/s = 单 shim DMA 通道上限；
+  16 通道（每列 2 fifo）→ ~2×。
+- **探针设计**（design_2ch.py/test_2ch.py，PERF-ONLY）：B 流整体删除，
+  权重按列切成 N_channel 段线性 fill（channels=1 → A 占 shims0-3 共 8 通道；
+  channels=2 → A0 shims0-3 + A1 shims4-7 = 16 通道，npu_insts 实证）。
+  fifo 元素=9280B（半块，%64==0）——内核 K 头守卫（w4gemvu.cc:80，读 +18552
+  落在相邻 L1 buffer，垃圾≠2048）走零行路径：**线上字节与生产完全一致、
+  核侧每元素几条指令**。2×18560×2 fifo 的 L1 放不下 → 半元素是探针成立的
+  前提（4×18560=74KB > 64KB tile 内存）。
+- **三处编译墙全记录**：①多元素 fifo L1 超限（元素必须 ≤~15.5KB）；
+  ②多非平凡维 tap 降成**单个 BD**（每维 size 字段 10 位 ≤1023，rescale 老墙）
+  且 **BD 维数上限 4**（2 tensor 维 + 至多 2 非平凡维）→ 交错 tap 不可能，
+  改**按列线性分段**（自动链式 BD，生产同款，17MB 实证）；
+  ③**C 数量必须=每 fifo 元素数**——channels=1 时核产 2×blocks 个 C 而 drain
+  只要 blocks → C fifo 满死锁（fill 不完成→task_group 永等）。修=统一
+  c_rows=cols×(seg/9280)×16。
+- **结果（pytest 同 harness，5 iter 中位）**：
+  | shape | 生产 v4 | 1ch 无B | 2ch 无B |
+  |---|---|---|---|
+  | o 2048×2048 | 207µs | 135 | 140 |
+  | gateup 12288 | ~390* | 362 | 398 |
+  | down 2048×6144 | ~210* | 221 | 258 |
+  | lm 121088 | 3724 (36.7GB/s) | **2620 (53.6)** | 2674 |
+  | 边际速率(o→lm 拟合) | 39.3 GB/s | **55.6** | 55.2 |
+  (*E2E solo 扣 submit 估计，非同 harness)
+- **结论一（假设证伪）**：1ch ≡ 2ch（噪声内）→ 8 通道已到墙；
+  v4 的 36.7 不是通道数限制，**B 流本身**（313KB 槽 + 逐槽锁握手 + A 流
+  2D 跨槽 tap）拖掉 ~30%。
+- **结论二（墙的坐标）**：~55 GB/s ≈ FLM 层融合实测 48-64、seq-dma 校准
+  52 → 这是器件级权重流天花板（DDR/NOC），不是通道数。FLM 没有通道魔法，
+  他们的优势=每层 1 个融合内核（33 run/token vs 我们 129）。
+- **v5 设计裁决**：单 fifo/列（ELEM 18560 保持，无 L1 困难）+ **B 流删除**：
+  x 作为 A fifo 的**先导元素**（fill#1 从独立 X 张量读同一 18560B 区域×8 列）
+  → 核 prologue `w4gemvu_xload` 拷入 .bss（6528B：x8+d），主循环读 .bss。
+  副产收益：F 槽复制 memcpy（P10 曾 24MB/token）整体消失；权重 BO 纯块
+  连续 → 单线性 fill/列（最快形态）。预期 E2E −7~8ms（权重流 25.8→18.3ms）。
+- 探针文件保留（可复用 harness），随 v5 提交。
+
+## P13（2026-09-27）：v5 落地 —— 计算墙现形、v5.2 预构建 A 操作数、E2E 58.4→56.9ms
+- **v5 机器全绿但慢于预期**：B 流删除版（单 A fifo/列 ELEM 18560 depth2，
+  x 先导元素 K=0 + 块自描述 K=2048/chunk 字），30/30 pytest 金标 PASS
+  （x_stage .bss 24960B 放置核验 _ZL7x_stage@0x79580）。但全量 v5 每形状
+  比 P12 1ch 探针高 ~30%（lm 3658 vs 2620µs）。
+- **v5s 探针定位（test_v5s.py）**：把每个权重块 K 头改成垃圾值 0xBEEF——
+  内核守卫走零行路径（几条指令），X 元素仍活（真实 staging+1 零 C）。
+  线上字节/fill/drain/内核镜像全同。结果 lm 2645 ≈ P12 探针 2620 →
+  **v5 填充机器（X fill 插入、2D C tap、18560B BD）成本≈0，差距=计算暴露**。
+- **计算墙的坐标**：稳态节拍 = max(fill, compute)。fill 2.77µs/块
+  （53.6GB/s 器件墙）；v5.0 每块计算 ≈3.8µs → **计算受限**，每块暴露
+  ~1.07µs。P11 的 ~100 GMAC/s/核过于乐观：有效 8.4 GMAC/s。
+  mac_4x16_16x16 在 M=4（aie2p int8xint4 唯一形状）烧 4× 冗余 A 行——
+  GEMV rank-1 浪费是内在的。v4 的 3.93µs 节拍其实是 B 流+计算同时受限。
+- **v5.1 反例（代码生成教训）**：外层 g4/内层 j 运行时 j → extract<16>(j)
+  每组 vshuffle + d[g] 栈溢出（`p4=sp-0xc0`、动态标量载入）。o 反而从
+  180 涨到 199、down 341。**规则：只有扁平 g 循环 + g 的地址算术可靠**。
+- **v5.3 系列反例**：lambda+sfb4 extract 批处理 → 金标碎（16+ 行错）；
+  带向量/累加引用的 helper 函数编译过但**核挂死**（栈 0x400/ABI 破坏，
+  挂 ~7min 到超时）。全部回退。
+- **v5.2 终版**：staging 时一次性预构建复制 A 操作数 [x0x0x0x0]/[x1x1x1x1]
+  进 .bss（x_stage 24960B），热循环 A 侧 = 2 个裸 load_v<64> + 融合
+  aie::mac(acc, rf, sfd)。暴露 1.07 → ~0.5-0.6µs/块；o 到地板（~155µs），
+  down 299→264。
+- **pytest 中位（干净窗口）**：qkv ~222 / o ~155-212 / gateup ~457-474 /
+  down ~264-295 / lm ~3530（宿主负载 11.5 时 lm 噪声 3479-3990——E2E 设备
+  时间才是决定性指标）。地板（v5s=P12）：o 135-155 / gateup 362-389 /
+  down 221-237 / lm 2620-2645。
+- **Rust E2E v5 改装**（main.rs）：w4u_pack_slots→w4u_build_x_elem（单
+  ELEM：q 全 chunk @0..K、d@K_MAX、K=0@ELEM-8）；w4u_c_rows=8×(blocks+2)×16
+  （标量行，BD 4B 对齐 → 每列截面偶数元素、+1 pad 元素）；w4u_c_at 新索引
+  （跳 16 零行，K=6144 f32 求和）；x BO 两槽→两个 ELEM；f/qkv_f/W4U_B_SLOT
+  全删。**夹具坑**：build/ 的 .prj 是 00:08 旧版（C 截面修复+v5.2 内核之前），
+  PDI/ctrl 都要重拷 IRON/build —— 陈旧 ctrl 不会报错只会算错。
+- **E2E（run-decode hy cpu，5 iter）**：稳态 **56.93ms/token（17.6 tok/s）**，
+  med 55.17 / min 54.45。全门 PASS：hidden rms 0.0483（1.8%）、lm argmax
+  25868==golden、top-8 8/8、rel_rms 0.0258。solo 中位 qkv 172.5 / o 156.0 /
+  gateup 428.0 / down 270.0 / lmhead 3439µs。vs v4 58.41 → **−1.5ms**，
+  小于 solo 差值预测（~4ms）——链上本已深流水（Δ=−58ms），单 op 收益被
+  非 solo 段稀释；且 E2E 中下一 op 的 fill 可盖住 op 尾部计算暴露。
+- **下一步**（按预期收益排序）：runlist 批量提交（129 submit×54µs ≈7ms
+  host 开销）；attention 同 PDI 融合（FLM 33 run/token vs 我们 129）；
+  CPU 侧胶水（rope/norm/swiglu 每层 ~0.2ms×32）。
