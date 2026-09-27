@@ -1074,3 +1074,93 @@ DMA 通道 ~5GB/s 是当前流上限**，8 列 → ~40GB/s 封顶；FLM 21.44ms
   元素化）。每层 1-2 op 替代 4+胶水，消 ~95µs/op×~96 + 全部 CPU gap。
   今晚不做；CPU 侧再抠（swiglu expf 向量化 ~2.7ms、f32 KV 缓存 ~2ms）皆为
   脚手架，与终态（全 NPU）冲突，搁置。
+
+## P16（2026-09-27）：M6 融合 rms-pair 机制点亮 —— 层内融合首证 + STACK LAW 实锤
+- **目标**：op1(gemv)→add-residual+rms+逐组32 int8量化→op2(gemv) 合一 exec，
+  拿掉 per-op 固定 ~95µs 与 CPU gap（P15 判据：v5 自描述元素 + drain-wait
+  定序使融合可行）。
+- **机制（landed）**：K=1 元素（tg2 首 fill）= C 窗口 [res | headers]——tg1 的
+  drain 已落到 C，DPU 程序序即跨 op 屏障；stage1 把分块 partial 紧凑化 +
+  residual 暂存到死区。K=3 元素（op2 权重 fill 的头）= rms 权重；fifo 序即
+  屏障，胶水先于一切 op2 块运行；op2 完全没有 X fill（内核直接预构建 A
+  操作数）。8 核冗余跑全 2048 行胶水。
+- **ctrl 律**：两 task group 都必须是 4 fill + 2 drain 的 v5 形状——S2MM
+  drain 的 queue 值钉在通道 slot 4/5，前置 fill 超 4 个即 value/描述符地址
+  失配挂死（首次尝试整跑挂死的根因）。
+- **STACK LAW（0x400）**：peano linker 每核只给 0x400 栈窗，A-fifo buffer
+  直接叠在栈顶上方；帧 = 序言一条 `paddxm [sp], #N`。单体 M6 内核 0x440 >
+  0x400 → 溢出写坏 fifo 流 → 首次 exec 即挂。修法：0x20 dispatcher 读 K 头
+  tail-call 各 noinline 口味（热路径保 0x340）。
+- **标量胶水结果**：正确（golden 镜像 f32 语义）但 **1673µs**——probe（关
+  胶水口味）机制地板 **497µs**，胶水占 **1176µs**：peano 每 f32 标量 op 都是
+  soft call，~15/行×2048 行/核。→ 融合的胜负手在胶水向量化（P17）。
+
+## P17（2026-09-27）：胶水向量化 + P17b 帧成本定律 —— 双参数全过，o+gateup 485µs
+- **向量化（只用实证可降形的 op）**：mul(bf16,bf16)→accfloat（bf16→f32 的
+  精确 trick）、mac(accfloat, f32vec, f32vec)（裸 acc+acc 非法，经 mac 过
+  桥）、to_vector、load_v/store_v、concat、broadcast、set_rounding(conv_even)。
+  首版单体向量化 **483µs @ 34.74GB/s**（超地板 497 之下、破 split 506）但
+  op2 区全错：帧 **0x480 > 0x400**，STACK LAW 二次咬人——溢出写坏胶水期
+  间暂存在栈上方 A-fifo 的 op2 权重元素。
+- **P17b 帧成本解剖（离线 clang+objdump 秒级迭代，~22 个消融变体）**：
+  to_fixed<int32>(f32vec) ≈ **0x600 禁用**；abs/reduce_max +0x140；同函数内
+  标量读向量 store +0x140（跨函数免费）；int min/max +0x80；纯向量函数
+  **0x0 帧**；帧大小非单调（小扰动会随机变胖 0x480→0x5c0）。soft 除/rsqrt
+  本身不是驱动者。
+- **两个语义精确的替换**（golden 不动）：(1) int8 取整 = invd 缩放后加魔数
+  1.5·2²³（该指数下 ulp=1 → conv_even 加法即 RNE 到尾数里的整数），q = bits
+  − 0x4B400000 再标量 clip（先取整后 clip，宿主同序）；(2) amax = 对
+  (bits & 0x7fffffff) 取**整数 max**——非负 IEEE 浮点位序=值序，精确等于
+  f32 max|x|，零浮点 op。
+- **编译坑（>10min 卡死 clang）**：u32 循环与 soft-float 调用混在同一函数
+  （v22 stage2c）；load_v/mac 环里 broadcast 运行时载入的标量。对策：int 与
+  float 各自成 stage；逐组 invd **复制展开**（f32[64][32]）使缩放 pass 纯
+  load_v/mac/store_v。
+- **终态结构**：stage2a(h2+sumsq, 0x0) → 2b(xn 向量, **0x200**) → 2c(整数
+  amax, 0x40) → 2d(d+invd, 0x40) → 2e(缩放+魔数, 0x0) → 2f(q 提取+预建,
+  0x0)，0x40 sequencer；最坏链 dispatcher+0x40+0x200 ≈ 0x280 < 0x400。
+- **结果（两参数 5/5 全过）**：o+gateup **485.6µs @ 34.55GB/s**（med ~513，
+  split 506 之下/持平）；down+qkv **med 394µs**（best 372.7，split 409 之下）
+  。正确性 = golden 镜像（tol rel 0.07 / abs 0.7）。旧标量融合 1673µs →
+  3.4×。
+- **结论**：层内融合机制+向量化胶水成立；下一层收益在把两个融合对塞进
+  decode 链（E2E 每 op 固定成本 ~95µs×可消 2 个/层 + gap）与 attention/
+  swiglu 元素化（M5 计划遗留）。
+
+## P18（2026-09-27）：融合对进 decode 链（run-decode fused）—— E2E 41.7→37.5ms
+- **接线设计**：`run-decode hy fused`（hy-only，qkv_m 3072 形状契约用
+  `assert!` 非 debug_assert——release 会编译掉）。PDI 分槽：plain w4gemvu
+  CU0 slot0 + w4gemvuf CU1 slot1；npu_attn 时 flowkv 再挪 CU2 slot2（三
+  PDI 三 CU 共存首证）。链拓扑：L0 qkv plain → 每层 pair A(o→ln2_n→
+  gateup) → n<L−1 时 pair B(down→ln1_{n+1}→qkv(n+1)，留在 Scratch.qkv
+  供下层) → 尾层 down plain。63 对（32A+31B）替掉 126 个 split exec：
+  w4gemvu 族 128→65 exec/token（cpu 模式总 op 129→66）。
+- **宿主侧每对契约**：act 量化进共享 x 元素 BO（与 plain 同路）；residual
+  4KB sync 进 C 行 [c_rows1..+2048)；K=1/blocks1 头部 setup 期一次性写好
+  （chain_tensor 全 BO sync 捎带）；handles=[ctrl,p1,p2,x,c]（rt.sequence
+  (A1,A2,X,C)）；读回：op1 区 = plain v5 布局同 `w4u_read_c`，op2 区 =
+  9280 行窗口后每列 section2、跳 2 个 16 行哑元。
+- **数值口径**：宿主残差链 bit-exact 于 split（同 w4u_read_c 值 + 同
+  add_bf16）——残差流零漂移；唯一差别是 op2 量化输入携带 NPU 胶水 h2 的
+  f32 少一次舍入（≤1 ulp）。实测 fused final rms **1.3%**（baseline 1.9%）
+  ，lm argmax 同 token、top-8 8/8——两门全过且反而略好。
+- **闭包借用架构（编译约束留痕）**：`live` 改为 gemv/gemv_pair/
+  decode_step 的参数（无闭包捕获）；`live_fused`+`fst` 仅被 gemv_pair 捕获
+  ；gemv_pair 内先 `fst.as_ref()` 读常量（NLL 结束借用）再 `as_mut` 取
+  ops/handles 字段不相交借用。
+- **踩坑**：(1) build/ 顶层 root 属主，fixture `sudo cp`（无密码 sudo 实证
+  ）。(2) op 计数公式首写 2L−3=61 错——真实 63=2L−1（每对净消 1 exec），
+  burst_done/E2E 打印两处修正。(3) NPU-attention 基线 121ms/token 与 P15
+  的 41ms 不可比——41ms 是 **cpu attention** 口径（129 op）；npu 口径被
+  flowkv strided ~2ms×32 支配。A/B 必须同口径。
+- **结果（四配置）**：cpu 41.72→**37.55 ms/token（24.0→26.7 tok/s，
+  −10.2%）**，双门 PASS；npu 121.30→118.38（同省 ~3ms，flowkv 主导）。
+  链上 per-op solo：fused_o_gateup **472µs**（独立 485）、fused_down_qkv
+  **369µs**（394）——独立对性能在链上复现。尾层 down solo 741µs（n=5，
+  CU1→CU0 切换后首 exec，待查）。
+- **收支分析**：省 4.2ms vs 理论 63×~95µs≈6ms——差额 = 尾层 down 变慢
+  ~0.5ms + 每对新增 host sync（4KB residual ToDevice + 全 C BO FromDevice
+  ioctl ~44KB）。
+- **下一步**：attention/swiglu 元素化（M5 遗留）——cpu 口径剩余 gap =
+  CPU attention 6.2ms + swiglu 2.7ms；npu 口径瓶颈 = flowkv strided 1GB/s
+  需重排布。
