@@ -190,12 +190,19 @@ fn main() -> ExitCode {
         Some("run-decode") => {
             // Positional [dec-dir] [w4-dir] [iters] plus flag tokens anywhere:
             // "hy" selects the hy-mt2 arch profile (M5c), "cpu" keeps the
-            // Rust scalar attention (A/B path; default is NPU attention).
+            // Rust scalar attention (A/B path; default is NPU attention),
+            // "fused" runs the M9/P18 fused rms-pair chain (hy only: pair
+            // geometry needs qkv_m == 3072).
             let is_hy = args.iter().any(|s| matches!(s.as_str(), "hy" | "hy-mt2"));
             let arch: &DecArch = if is_hy { &DEC_HY } else { &DEC_MINICPM };
+            let fused = args.iter().any(|s| s.as_str() == "fused");
+            if fused && !is_hy {
+                eprintln!("fused rms-pairs need the hy arch (qkv_m 3072)");
+                return ExitCode::FAILURE;
+            }
             let pos_args: Vec<&String> = args[1..]
                 .iter()
-                .filter(|s| !matches!(s.as_str(), "cpu" | "hy" | "hy-mt2"))
+                .filter(|s| !matches!(s.as_str(), "cpu" | "hy" | "hy-mt2" | "fused"))
                 .collect();
             let decdir = pos_args
                 .first()
@@ -210,7 +217,7 @@ fn main() -> ExitCode {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(5);
             let npu_attn = !args.iter().any(|s| s.as_str() == "cpu");
-            cmd_run_decode(arch, &decdir, &w4dir, iters, npu_attn)
+            cmd_run_decode(arch, &decdir, &w4dir, iters, npu_attn, fused)
         }
         Some("run-lmhead") => {
             // M8/P8: hy lm_head on NPU — isolated probe (correctness + perf).
@@ -2953,6 +2960,49 @@ fn w4u_c_at(cs: &[u8], row: usize, k: usize, m: usize) -> u16 {
 /// lm_head padded M: vocab 120818 -> 946 even blocks of one 16-row tile.
 const W4U_LM_M: usize = 121088;
 
+/// M9/P18 fused rms-pair geometry (IRON op_fused.py). The rms window
+/// element is ELEM-sized and reads C rows [0..9280): [8 op1 sections |
+/// residual M1=2048 bf16 | pad | u32 K=1 at ELEM-8, u32 blocks1 at
+/// ELEM-4 (u16 rows 9276..9279 = [1, 0, blocks1, 0])]. Op2 sections
+/// start at row 9280, per column section2 = (blocks2+2)*16 rows, data
+/// after the 2 dummy 16-row elements.
+const W4UF_WINDOW_ROWS: usize = W4U_ELEM / 2; // 9280
+
+/// M9/P18: pack the fused op2 weight stream — per column [K=3 w element
+/// | that column's plain v5 blocks] (op_fused.py build_packed2). The w
+/// element: rms weight M1 bf16 at bytes [0..4096), pad, K=3 u32 at
+/// ELEM-8, blocks1 u32 at ELEM-4; every column carries the same element
+/// (fifo order runs the glue before op2's blocks).
+fn w4uf_build_packed2(blocks: &[u8], w_bits: &[u16], blocks1: usize, blocks2: usize) -> Vec<u8> {
+    assert!(blocks.len() == 8 * blocks2 * W4U_ELEM);
+    assert!(w_bits.len() == 2048);
+    let per_col = (1 + blocks2) * W4U_ELEM;
+    let mut out = vec![0u8; 8 * per_col];
+    for col in 0..8 {
+        let base = col * per_col;
+        for (i, &w) in w_bits.iter().enumerate() {
+            out[base + i * 2..base + i * 2 + 2].copy_from_slice(&w.to_le_bytes());
+        }
+        out[base + W4U_ELEM - 8..base + W4U_ELEM - 4].copy_from_slice(&3u32.to_le_bytes());
+        out[base + W4U_ELEM - 4..base + W4U_ELEM].copy_from_slice(&(blocks1 as u32).to_le_bytes());
+        let src = col * blocks2 * W4U_ELEM;
+        out[base + W4U_ELEM..base + per_col].copy_from_slice(&blocks[src..src + blocks2 * W4U_ELEM]);
+    }
+    out
+}
+
+/// M9/P18: the fused pair's C tensor pre-run seed — zeros plus the rms
+/// window's write-once header words (op_fused.py build_c_init; the
+/// residual rows are re-seeded per exec by the caller, the drains never
+/// touch either region).
+fn w4uf_build_c_init(c_rows: usize, blocks1: usize) -> Vec<u8> {
+    let mut out = vec![0u8; c_rows * 2];
+    let h = W4UF_WINDOW_ROWS * 2 - 8; // u32 K=1 at ELEM-8
+    out[h..h + 4].copy_from_slice(&1u32.to_le_bytes());
+    out[h + 4..h + 8].copy_from_slice(&(blocks1 as u32).to_le_bytes());
+    out
+}
+
 /// M3b: the same 42-layer projection chain on the UNIVERSAL w4gemvu kernel.
 /// All four shapes share one PDI (the kernel reads K from the block tail at
 /// runtime), so the whole chain runs on ONE CU and differs only in ctrl
@@ -4545,14 +4595,16 @@ fn cmd_run_decode(
     w4dir: &str,
     iters: usize,
     npu_attn_req: bool,
+    fused: bool,
 ) -> ExitCode {
     let build = "/home/nzinfo/qwen/xnpu/build";
     let layers = arch.layers;
     let shapes = arch.shapes();
     let npu_attn = npu_attn_req;
     println!(
-        "decode chain: {name} {layers} layers, w4gemvu projections on CU0 + {} attention{}, {iters} iters",
-        if npu_attn { "flowkv NPU (CU1)" } else { "Rust scalar" },
+        "decode chain: {name} {layers} layers, w4gemvu projections on CU0{} + {} attention{}, {iters} iters",
+        if fused { " + fused rms-pairs on CU1" } else { "" },
+        if npu_attn { "flowkv NPU" } else { "Rust scalar" },
         if npu_attn { "" } else { " (cpu mode)" },
         name = arch.name,
     );
@@ -4576,6 +4628,31 @@ fn cmd_run_decode(
             return ExitCode::FAILURE;
         }
     }
+
+    // M9/P18 fused rms-pair fixtures (IRON w4gemvuf_*): pair A =
+    // o(K1=2048) -> ln2_n -> gateup(M2=12288), pair B = down(K1=6144)
+    // -> ln1_{n+1} -> qkv(M2=3072). Own CU slot; the ctrl code takes
+    // FOUR tensor BOs (rt.sequence order A1, A2, X, C) — chain_op
+    // already appends any number of tensor VAs.
+    let fused_fx: Option<Vec<(Vec<u8>, Vec<u8>, u32)>> = if fused {
+        let stems = [
+            "w4gemvuf_2048x2048_12288x2048", // pair A
+            "w4gemvuf_2048x6144_3072x2048",  // pair B
+        ];
+        let mut v = Vec::new();
+        for st in stems {
+            match load_fixture(&format!("{build}/{st}.mlir.prj")) {
+                Some(f) => v.push(f),
+                None => {
+                    eprintln!("load fixture {st} failed (run the fused pytest first)");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        Some(v)
+    } else {
+        None
+    };
 
     // M4a flowkv fixture: same 8-col QoS partition, its own CU (func 1).
     let fk_fixture = if npu_attn {
@@ -4619,9 +4696,21 @@ fn cmd_run_decode(
     // Both PDIs take cu_func 0 — the CU slot is the index in this list and
     // is selected per op via set_cu (the run-multi pattern; func != 0 makes
     // the fw look up a DPU function the PDI doesn't have and the op never
-    // runs).
+    // runs). Fused mode inserts the w4gemvuf PDI at slot 1, pushing flowkv
+    // to slot 2 (fk_cu).
+    let fk_cu: u32 = if fused { 2 } else { 1 };
     let cus: Vec<(&[u8], u8)> = if npu_attn {
-        vec![(fixtures[0].0.as_slice(), 0), (fk_fixture.0.as_slice(), 0)]
+        if let Some(ffx) = &fused_fx {
+            vec![
+                (fixtures[0].0.as_slice(), 0),
+                (ffx[0].0.as_slice(), 0),
+                (fk_fixture.0.as_slice(), 0),
+            ]
+        } else {
+            vec![(fixtures[0].0.as_slice(), 0), (fk_fixture.0.as_slice(), 0)]
+        }
+    } else if let Some(ffx) = &fused_fx {
+        vec![(fixtures[0].0.as_slice(), 0), (ffx[0].0.as_slice(), 0)]
     } else {
         vec![(fixtures[0].0.as_slice(), 0)]
     };
@@ -4880,6 +4969,166 @@ fn cmd_run_decode(
     let pos = 100usize;
     let (rc, rs) = rope_table(pos, arch.rope_base);
 
+    // M9/P18 fused rms-pair state (hy only). Pair A(n) = o(n) -> ln2_n ->
+    // gateup(n); pair B(n) = down(n) -> ln1_{n+1} -> qkv(n+1), n < L-1
+    // (layer 0's qkv and the last layer's down have nothing to fuse with
+    // and stay on the plain CU). live_fused layout: base 6n = [p1a, p2a,
+    // c_a] and 6n+3 = [p1b, p2b, c_b]; fst.ops = [A(0), B(0), A(1), ...,
+    // A(L-1)] (A(n) at 2n, B(n) at 2n+1). packed1 is the plain v5 weight
+    // stream as-is; packed2 interleaves the K=3 rms-weight element per
+    // column; C carries write-once headers (seeded here) + the per-token
+    // residual (seeded per exec in gemv_pair).
+    struct FusedState {
+        ops: Vec<ChainOp>,
+        handles: Vec<Vec<u32>>,
+        k1: [usize; 2],
+        m2: [usize; 2],
+        c_rows1: [usize; 2],
+        section2: [usize; 2],
+    }
+    let mut live_fused: Vec<(BufferObject, Mapping)> = Vec::new();
+    let mut fst: Option<FusedState> = if fused {
+        let (qa, qb) = (
+            fused_fx.as_ref().unwrap()[0].1.as_slice(),
+            fused_fx.as_ref().unwrap()[1].1.as_slice(),
+        );
+        // hy shape contract (pair geometry is compiled into the ctrl code):
+        // qkv 3072x2048, o 2048x2048, gateup 12288x2048, down 2048x6144.
+        let (mq, mo, mg, md, kd) =
+            (shapes[0].m, shapes[1].m, shapes[2].m, shapes[3].m, shapes[3].k);
+        assert!(mq == 3072 && mo == 2048 && mg == 12288 && md == 2048 && kd == 6144);
+        let blocks1 = [w4u_blocks(2048, 2048), w4u_blocks(2048, 6144)]; // [16, 48]
+        let blocks2 = [w4u_blocks(mg, 2048), w4u_blocks(mq, 2048)]; // [96, 24]
+        let c_rows1 = [8 * (blocks1[0] + 2) * 16, 8 * (blocks1[1] + 2) * 16]; // [2304, 6400]
+        let section2 = [(blocks2[0] + 2) * 16, (blocks2[1] + 2) * 16]; // [1568, 416]
+        let c_rows =
+            [W4UF_WINDOW_ROWS + 8 * section2[0], W4UF_WINDOW_ROWS + 8 * section2[1]];
+        let mut ops = Vec::with_capacity(2 * layers - 1);
+        let mut handles = Vec::with_capacity(2 * layers - 1);
+        let mut mk_pair = |n: usize,
+                           pi: usize,
+                           instr: &[u8],
+                           p1: Vec<u8>,
+                           p2: Vec<u8>,
+                           live_fused: &mut Vec<(BufferObject, Mapping)>|
+         -> bool {
+            let cdata = w4uf_build_c_init(c_rows[pi], blocks1[pi]);
+            let (p1_va, p2_va, c_va) = (
+                match chain_tensor(&dev, live_fused, &format!("f{pi}L{n:02}.p1"), &p1) {
+                    Some(v) => v,
+                    None => return false,
+                },
+                match chain_tensor(&dev, live_fused, &format!("f{pi}L{n:02}.p2"), &p2) {
+                    Some(v) => v,
+                    None => return false,
+                },
+                match chain_tensor(&dev, live_fused, &format!("f{pi}L{n:02}.c"), &cdata) {
+                    Some(v) => v,
+                    None => return false,
+                },
+            );
+            // X rides the SHARED plain x element BO (all columns read the
+            // same ELEM — quantized per exec by gemv_pair).
+            let x_va = live[if pi == 1 { 1 } else { 0 }].1.as_ptr() as u64;
+            match chain_op(
+                &dev,
+                &format!("fused{}L{n:02}", if pi == 0 { "A" } else { "B" }),
+                instr,
+                1,
+                &[p1_va, p2_va, x_va, c_va],
+            ) {
+                Some(op) => {
+                    let ci = n * 6 + 2 + pi * 3;
+                    handles.push(vec![
+                        op.ctrl_bo.handle(),
+                        live_fused[ci - 2].0.handle(),
+                        live_fused[ci - 1].0.handle(),
+                        live[if pi == 1 { 1 } else { 0 }].0.handle(),
+                        live_fused[ci].0.handle(),
+                    ]);
+                    ops.push(op);
+                    true
+                }
+                None => false,
+            }
+        };
+        let rd_w = |stem: String| -> Option<Vec<u8>> {
+            let d = std::fs::read(format!("{w4dir}/{stem}")).ok()?;
+            Some(d)
+        };
+        for n in 0..layers {
+            // pair A: packed1 = o blocks; packed2 = [w elem | gateup blocks],
+            // rms weight = ln2_n.
+            let p1a = match rd_w(format!("layer{n:02}_{}.bin", shapes[1].name)) {
+                Some(d) if d.len() == 8 * blocks1[0] * W4U_ELEM => d,
+                _ => {
+                    eprintln!("fused: layer{n:02}_o absent/stale");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let g = match rd_w(format!("layer{n:02}_{}.bin", shapes[2].name)) {
+                Some(d) if d.len() == 8 * blocks2[0] * W4U_ELEM => d,
+                _ => {
+                    eprintln!("fused: layer{n:02}_gateup absent/stale");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let p2a = w4uf_build_packed2(
+                &g,
+                &norms[(2 * n + 1) * 2048..][..2048],
+                blocks1[0],
+                blocks2[0],
+            );
+            if !mk_pair(n, 0, qa, p1a, p2a, &mut live_fused) {
+                eprintln!("fused pair A layer{n} setup failed");
+                return ExitCode::FAILURE;
+            }
+            if n + 1 < layers {
+                // pair B: packed1 = down blocks; packed2 = [w elem | NEXT
+                // layer's qkv blocks], rms weight = ln1_{n+1}.
+                let p1b = match rd_w(format!("layer{n:02}_{}.bin", shapes[3].name)) {
+                    Some(d) if d.len() == 8 * blocks1[1] * W4U_ELEM => d,
+                    _ => {
+                        eprintln!("fused: layer{n:02}_down absent/stale");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                let q = match rd_w(format!("layer{:02}_{}.bin", n + 1, shapes[0].name)) {
+                    Some(d) if d.len() == 8 * blocks2[1] * W4U_ELEM => d,
+                    _ => {
+                        eprintln!("fused: layer{:02}_qkv absent/stale", n + 1);
+                        return ExitCode::FAILURE;
+                    }
+                };
+                let p2b = w4uf_build_packed2(
+                    &q,
+                    &norms[(2 * (n + 1)) * 2048..][..2048],
+                    blocks1[1],
+                    blocks2[1],
+                );
+                if !mk_pair(n, 1, qb, p1b, p2b, &mut live_fused) {
+                    eprintln!("fused pair B layer{n} setup failed");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        println!(
+            "fused rms-pairs: {} pair A (o->ln2->gateup) + {} pair B (down->ln1'->qkv') execs/token on CU1",
+            layers,
+            layers - 1
+        );
+        Some(FusedState {
+            ops,
+            handles,
+            k1: [2048, 6144],
+            m2: [mg, mq],
+            c_rows1,
+            section2,
+        })
+    } else {
+        None
+    };
+
     // M4a NPU-attention state. Layouts must match
     // iron/operators/flowkv_decode: KV cache = (kv heads, 1024 pos, [K|V],
     // 128) interleaved per layer; Q element = [Q_group | angles (128
@@ -5001,7 +5250,7 @@ fn cmd_run_decode(
                 &dev,
                 &format!("fkL{n:02}"),
                 &fk_fixture.1,
-                1,
+                fk_cu,
                 &[kv[n].1.as_ptr() as u64, q_va, o_va],
             ) {
                 Some(op) => {
@@ -5015,7 +5264,7 @@ fn cmd_run_decode(
             }
         }
         println!(
-            "flowkv: {} kv cache BOs ({} KiB each), q {} B, o {} B, {} ops on CU1",
+            "flowkv: {} kv cache BOs ({} KiB each), q {} B, o {} B, {} ops on CU{fk_cu}",
             layers,
             arch.kv * FK_CAP * 2 * 128 * 2 / 1024,
             q_bytes_total,
@@ -5058,7 +5307,7 @@ fn cmd_run_decode(
                 let mut m = OpMeta::new(
                     "flowkv",
                     "attn",
-                    1,
+                    fk_cu,
                     nkv * s_pos * 2 * 128 * 2 + nkv * fk_stride as u64 * 2, // S 行 KV + q
                     (16 * 128 * 2) as u64,
                     (16 * s_pos * 128 * 2 * 2) as u64,
@@ -5084,14 +5333,38 @@ fn cmd_run_decode(
         }
         None => metas,
     };
+    // M9/P18: fused pair metas (CU1; reported alongside the split shapes
+    // they replace). bytes_stream = the real weight stream incl. each
+    // column's K=3 w element.
+    let metas_fused: Vec<OpMeta> = [
+        ("fused_o_gateup", 2048usize, 12288usize, 16usize, 96usize),
+        ("fused_down_qkv", 6144, 3072, 48, 24),
+    ]
+    .iter()
+    .map(|&(nm, k1, m2, b1, b2)| {
+        let mut m = OpMeta::new(
+            nm,
+            "w4gemvu",
+            1,
+            (W4U_ELEM + 4096) as u64, // x element + residual seed
+            ((W4UF_WINDOW_ROWS + 8 * (b2 + 2) * 16) * 2) as u64,
+            (2 * (2048 * k1 + m2 * 2048)) as u64,
+        )
+        .with_tier(tier::SLOT_STREAM);
+        m.bytes_stream = Some((8 * (b1 + 1 + b2) * W4U_ELEM) as u64);
+        m
+    })
+    .collect();
     let mut rec = Recorder::new();
     let mut rec_seq = 0u64;
 
     // One w4gemvu call: replicate x into the vector BO, submit, wait, read c.
+    // `live` is an ARG (not a capture) so gemv and gemv_pair coexist.
     let mut gemv = |ops: &mut [ChainOp],
                     i: usize,
                     si: usize,
                     x: &[u16],
+                    live: &mut Vec<(BufferObject, Mapping)>,
                     it: u32,
                     rec: &mut Recorder,
                     rec_seq: &mut u64|
@@ -5139,6 +5412,97 @@ fn cmd_run_decode(
         Some(w4u_read_c(cs, k, m))
     };
 
+    // M9/P18: one fused rms-pair exec — op1 gemv -> K=1 window element
+    // (compact partials + residual, read BACK from C) -> K=3 w element
+    // (add+rms+per-group-32 int8 quantize, prebuilds op2's A-operands) ->
+    // op2 gemv, all inside ONE NPU exec. Host work per call: quantize
+    // op1's activation into the SHARED x element BO (identical to the
+    // split path), seed this pair's residual rows in C (rows
+    // [c_rows1..c_rows1+2048) — never touched by the drains), submit
+    // [ctrl, p1, p2, x, c], then read op1's plain-layout sections and
+    // op2's sections past the 9280-row window. The host residual-add
+    // (out1) is bit-exact with the split chain — the same add_bf16 on
+    // the same w4u_read_c values — so the E2E residual stream drifts
+    // nowhere; only op2's quantized input carries the NPU glue's <=1-ulp
+    // f32-vs-bf16 glue deltas (P18 analysis).
+    let mut gemv_pair = |pi: usize, // 0 = pair A (o->gateup), 1 = pair B (down->qkv)
+                         n: usize, // layer index of op1
+                         act: &[u16], // op1 activation (pre-gemv)
+                         res: &[u16], // residual (pre-add hidden)
+                         out1: &mut [u16], // post-add hidden (host add)
+                         out2: &mut [u16], // op2 output (m2)
+                         live: &mut Vec<(BufferObject, Mapping)>,
+                         it: u32,
+                         rec: &mut Recorder,
+                         rec_seq: &mut u64|
+     -> bool {
+        let (k1, m2, c_rows1, section2) = {
+            let fs = fst.as_ref().unwrap();
+            (fs.k1[pi], fs.m2[pi], fs.c_rows1[pi], fs.section2[pi])
+        };
+        let vi = if k1 == 6144 { 1 } else { 0 };
+        {
+            let (bo, map) = &mut live[vi];
+            let (q, d) = w4u_quantize_x(act, k1);
+            map.as_mut_slice()[..W4U_ELEM].copy_from_slice(&w4u_build_x_elem(&q, &d, k1));
+            if let Err(e) = bo.sync(SyncDirection::ToDevice, 0, W4U_ELEM as u64) {
+                eprintln!("fused x sync (L{n} p{pi}): {e}");
+                return false;
+            }
+        }
+        {
+            let ci = n * 6 + 2 + pi * 3;
+            let (bo, map) = &mut live_fused[ci];
+            let bytes = map.as_mut_slice();
+            let r0 = c_rows1 * 2;
+            for j in 0..2048 {
+                bytes[r0 + j * 2..r0 + j * 2 + 2].copy_from_slice(&res[j].to_le_bytes());
+            }
+            if let Err(e) = bo.sync(SyncDirection::ToDevice, r0 as u64, 4096) {
+                eprintln!("fused res sync (L{n} p{pi}): {e}");
+                return false;
+            }
+        }
+        let oi = n * 2 + pi;
+        let ts = std::time::Instant::now();
+        let fs = fst.as_mut().unwrap();
+        let op = &mut fs.ops[oi];
+        let seq = match op.pkt.submit(&dev, &ctx, &fs.handles[oi]) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("fused submit (L{n} p{pi}, op {oi}): {e}");
+                return false;
+            }
+        };
+        if let Err(e) = syncobj_timeline_wait(&dev, ctx.syncobj_handle, seq, 10_000_000_000) {
+            eprintln!("fused wait (L{n} p{pi}, seq {seq}): {e}");
+            return false;
+        }
+        if it > 0 {
+            rec.solo(&metas_fused[pi], it, ts, *rec_seq);
+            *rec_seq += 1;
+        }
+        let ci = n * 6 + 2 + pi * 3;
+        let (c_bo, c_map) = &live_fused[ci];
+        let _ = c_bo.sync(SyncDirection::FromDevice, 0, c_bo.size() as u64);
+        let cs = c_map.as_slice();
+        // op1 sections are the PLAIN v5 C layout — same read the split
+        // path does (K=6144 sums the 3 chunk partials in f32).
+        let o1 = w4u_read_c(cs, k1, 2048);
+        add_bf16(res, &o1, out1);
+        // op2 sections: past the window, per column section2 rows, data
+        // after the 2 dummy 16-row glue elements.
+        let rpc2 = m2 / 8;
+        for col in 0..8 {
+            let base = (W4UF_WINDOW_ROWS + col * section2 + 2 * W4U_TILE_ROWS) * 2;
+            for r in 0..rpc2 {
+                let off = base + r * 2;
+                out2[col * rpc2 + r] = u16::from_le_bytes([cs[off], cs[off + 1]]);
+            }
+        }
+        true
+    };
+
     // The decode step. Scratch lives outside the closure (passed per call)
     // so the final-norm block can reuse xn after the last call.
     struct Scratch {
@@ -5148,6 +5512,7 @@ fn cmd_run_decode(
         attn: Vec<u16>,
         gu: Vec<u16>,
         sw: Vec<u16>,
+        qkv: Vec<u16>, // P18: pair B(n-1) leaves qkv(n) here
     }
     let mut sc = Scratch {
         xn: vec![0u16; 2048],
@@ -5156,6 +5521,7 @@ fn cmd_run_decode(
         attn: vec![0u16; 2048],
         gu: vec![0u16; 12288],
         sw: vec![0u16; 6144],
+        qkv: vec![0u16; arch.qkv_m],
     };
     let mut x = x0.clone();
     let mut first_bad: Option<usize> = None;
@@ -5164,6 +5530,7 @@ fn cmd_run_decode(
                        vcache: &mut [u16],
                        x: &mut Vec<u16>,
                        sc: &mut Scratch,
+                       live: &mut Vec<(BufferObject, Mapping)>,
                        fk: &mut Option<FkState>,
                        check: bool,
                        it: u32,
@@ -5171,11 +5538,19 @@ fn cmd_run_decode(
                        rec_seq: &mut u64|
      -> bool {
         for n in 0..layers {
-            let Scratch { xn, qr, kr, attn, gu, sw } = sc;
-            rms_norm_bf16(x, &norms[n * 2 * 2048..][..2048], xn);
-            let qkv = match gemv(ops, n * 4, 0, xn, it, rec, rec_seq) {
-                Some(v) => v,
-                None => return false,
+            let Scratch { xn, qr, kr, attn, gu, sw, qkv: scq } = sc;
+            // P18 fused: layer n>0's qkv came from pair B(n-1) — its ln1_n
+            // rms ran in the NPU glue, the result rides Scratch.qkv.
+            let qkv_owned;
+            let qkv: &[u16] = if n == 0 || !fused {
+                rms_norm_bf16(x, &norms[n * 2 * 2048..][..2048], xn);
+                qkv_owned = match gemv(ops, n * 4, 0, xn, live, it, rec, rec_seq) {
+                    Some(v) => v,
+                    None => return false,
+                };
+                &qkv_owned
+            } else {
+                scq.as_slice()
             };
             let kdim = arch.kv * 128;
             rope_apply(&qkv[..2048], &rc, &rs, arch.heads, qr);
@@ -5284,24 +5659,51 @@ fn cmd_run_decode(
                     );
                 }
             }
-            let o = match gemv(ops, n * 4 + 1, 1, attn, it, rec, rec_seq) {
-                Some(v) => v,
-                None => return false,
-            };
-            add_bf16(x, &o, xn); // x = x + o (reuse xn as scratch)
-            std::mem::swap(x, xn);
-            rms_norm_bf16(x, &norms[(n * 2 + 1) * 2048..][..2048], xn);
-            *gu = match gemv(ops, n * 4 + 2, 2, xn, it, rec, rec_seq) {
-                Some(v) => v,
-                None => return false,
-            };
-            swiglu_bf16(gu, sw);
-            let d = match gemv(ops, n * 4 + 3, 3, sw, it, rec, rec_seq) {
-                Some(v) => v,
-                None => return false,
-            };
-            add_bf16(x, &d, xn);
-            std::mem::swap(x, xn);
+            if fused {
+                // P18 pair A: o(n) -> ln2_n rms -> gateup(n) in ONE exec.
+                // The host rebuilds the post-add hidden from op1's
+                // plain-layout C sections via the SAME add_bf16 the split
+                // path uses — the residual stream stays bit-exact.
+                if !gemv_pair(0, n, attn, x, xn, gu, live, it, rec, rec_seq) {
+                    return false;
+                }
+                std::mem::swap(x, xn); // x = x + o
+                swiglu_bf16(gu, sw);
+                if n + 1 < layers {
+                    // P18 pair B: down(n) -> ln1_{n+1} rms -> qkv(n+1),
+                    // left in Scratch.qkv for the next layer iteration.
+                    if !gemv_pair(1, n, sw, x, xn, scq, live, it, rec, rec_seq) {
+                        return false;
+                    }
+                    std::mem::swap(x, xn);
+                } else {
+                    let d = match gemv(ops, n * 4 + 3, 3, sw, live, it, rec, rec_seq) {
+                        Some(v) => v,
+                        None => return false,
+                    };
+                    add_bf16(x, &d, xn);
+                    std::mem::swap(x, xn);
+                }
+            } else {
+                let o = match gemv(ops, n * 4 + 1, 1, attn, live, it, rec, rec_seq) {
+                    Some(v) => v,
+                    None => return false,
+                };
+                add_bf16(x, &o, xn); // x = x + o (reuse xn as scratch)
+                std::mem::swap(x, xn);
+                rms_norm_bf16(x, &norms[(n * 2 + 1) * 2048..][..2048], xn);
+                *gu = match gemv(ops, n * 4 + 2, 2, xn, live, it, rec, rec_seq) {
+                    Some(v) => v,
+                    None => return false,
+                };
+                swiglu_bf16(gu, sw);
+                let d = match gemv(ops, n * 4 + 3, 3, sw, live, it, rec, rec_seq) {
+                    Some(v) => v,
+                    None => return false,
+                };
+                add_bf16(x, &d, xn);
+                std::mem::swap(x, xn);
+            }
             if check {
                 let g = match rd_u16file(&format!("{decdir}/golden_L{n:02}.bin")) {
                     Some(v) => v,
@@ -5334,8 +5736,8 @@ fn cmd_run_decode(
     {
         let mut ops2 = std::mem::take(&mut ops);
         let ok = decode_step(
-            &mut ops2, &mut kcache, &mut vcache, &mut x, &mut sc, &mut fk, true, 0,
-            &mut rec, &mut rec_seq,
+            &mut ops2, &mut kcache, &mut vcache, &mut x, &mut sc, &mut live, &mut fk,
+            true, 0, &mut rec, &mut rec_seq,
         );
         ops = ops2;
         if !ok {
@@ -5449,8 +5851,8 @@ fn cmd_run_decode(
         let tb = std::time::Instant::now();
         let mut ops2 = std::mem::take(&mut ops);
         let ok = decode_step(
-            &mut ops2, &mut kcache, &mut vcache, &mut x, &mut sc, &mut fk, false, it,
-            &mut rec, &mut rec_seq,
+            &mut ops2, &mut kcache, &mut vcache, &mut x, &mut sc, &mut live, &mut fk,
+            false, it, &mut rec, &mut rec_seq,
         );
         ops = ops2;
         if !ok {
@@ -5470,7 +5872,7 @@ fn cmd_run_decode(
             Mode::Solo,
             it,
             tb,
-            (layers * 4
+            (layers * 4 - if fused { 2 * layers - 1 } else { 0 }
                 + if npu_attn { layers } else { 0 }
                 + if lm.is_some() { 1 } else { 0 }) as u32,
             1,
@@ -5491,8 +5893,16 @@ fn cmd_run_decode(
             "GQA-attention"
         },
         if arch.qk_norm { "+qk-norm" } else { "" },
-        layers * 4,
-        if npu_attn {
+        layers * 4 - if fused { 2 * layers - 1 } else { 0 },
+        if fused && npu_attn {
+            format!(
+                " on CU0 + {} fused rms-pairs on CU1 + {} flowkv attention on CU{fk_cu}",
+                2 * layers - 1,
+                layers
+            )
+        } else if fused {
+            format!(" on CU0 + {} fused rms-pairs on CU1", 2 * layers - 1)
+        } else if npu_attn {
             format!(" on CU0 + {} flowkv attention on CU1", layers)
         } else {
             " on 1 CU".to_string()
