@@ -2043,3 +2043,82 @@ BD 写+push 整块搬到 tg1 sync 之前（消费序破坏 → 数值垃圾，PE
 若 pair → ~360-400µs 则「跨组 enqueue-ahead」就是 FLM 的 309-TCT 图的
 本质，剩余差距的工程路线随之确定（FLM：独立 fill 早发 + 依赖只约束
 窗/激活，整层 1 组）。
+
+### P27-4（2026-09-29⑥）ctrl 手术三连：enqueue-ahead 全部 NULL —— task group 是调度成本的原子
+
+**工具链**：`tools/hoist_probe.py`（P23 walk 规则 + BD 空间语义分类），
+对编译好的 pair ctrl bin 做指令级重排，产物 .hs/.hs2/.hs3；引擎侧加
+`XNPU_SKIP_GATES`（跳过 checked 步 lm_head 门的 hard-fail，PERF-ONLY run
+专用，与 XNPU_TWOCU 同款开关风格）。A/B 全部 interleaved 同热板窗口
+（P21-5 律），3 轮交替、每轮 4 iters，读 HostProf 的 A:wait/B:wait。
+
+**手术设计（三档递进）**：
+
+1. **.hs（输入侧）**：tg2 的 MM2S 机器（4 shim × [4 BLKWR + 4 DDRP +
+   4 push]）搬到 tg1 首条 TCT 之前，BD 槽 0-3 → 8-11（重写活描述符是
+   FLM 从不做的危险动作，P16 律）。通道消费序 [X, A1, window, A2] 保持
+   ——只有 window 的源数据是陈旧的（tg1 drain 未落地）。
+2. **.hs2（+ 输出侧）**：tg2 的 S2MM 排水机器（slot 4/5 的 BLKWR+DDRP+
+   MASKWR+push）也搬前，槽 4/5 → 12/13。C fifo 满死锁假说的直接检验：
+   排水提前后 A2 流应该不再被 tg1 尾部卡住。S2MM 队列序 [tg1 bd4 →
+   tg2 bd12] 与元素生产序（fifo 序传递保证 C1 先于 C2）一致，语义安全。
+3. **.hs3（− tg1 TCT）**：从 .hs2 里删掉 tg1 的 8 条 TCT，只剩 tg2 的
+   8 条收尾——检验「TCT 串行 retire」是不是残余固定成本。
+
+**结果（全部留痕）**：
+
+| 变体 | A:wait µs/token（3 轮） | B:wait | 判定 |
+|---|---|---|---|
+| orig | 14,738/15,598/14,878（及二轮 14,726/14,657/14,856） | ~10,850-10,940 | 基线 |
+| .hs 输入 hoist | 14,916/14,821/14,353 | ~10,576-10,924 | **NULL** |
+| .hs2 全 hoist | 14,404/14,670/14,646 | ~10,602-10,817 | **NULL**（≈1-2%，噪声边缘） |
+| .hs3 −TCT | 第 2 个 exec 起 `Timer expired` 挂死 | — | **不可行** |
+
+手术生效性证据（不是没打上）：.hs/.hs2 的 lm rel_rms 从 0.0223 稳定
+劣化到 0.045-0.073（陈旧 window 真被提前读了，值有界、argmax 仍对、
+无挂死无槽碰撞）。hs3 挂死复现 P19b「无 sync 组的槽重用」警告：TCT
+不只是排序，它承担通道/BD 状态的 retire，下一个 exec 的槽重写依赖它。
+
+**三个否定结果的合成推理**：
+
+1. 输入侧 enqueue-ahead 无效 + 输出侧 enqueue-ahead 无效 + window DDR
+   往返被证明跳过（.hs2 里 window 读的是陈旧数据）仍无提速 ⇒ 组固定
+   成本**不在 ctrl 指令的发行时序里**——ctrl DPU 把什么都提前发也没用。
+2. 排除清单（累计）：BD 形状/尺寸（P27-3b）、计算暴露（P27-3b probe）、
+   输入发行时序、排水发行时序、window DDR 往返、通道数（P12）、
+   fifo 元素粒度（plain 同粒度跑 55.1）。剩下唯一与「组」绑定的东西：
+   **shim/fw 对每个 task group 的状态机开销本身**（drain token 集合 +
+   npu.sync 组末屏障的完成路径）。
+3. 定量闭合（本窗口数据）：pair A 460µs = 流 310 + 2×75；pair B 346 =
+   流 193 + 2×76。quad（5 组）同模型 5×114 + 流（P19b 实测 1066 拼合）。
+   **每 token 129 组 × ~75µs ≈ 9.7ms 就是与 FLM 的全部设备侧差距。**
+4. FLM 对照：他们 309 TCT/层 exec 却只有 ~30µs/层固定成本 ⇒ TCT 本身
+   可以很便宜；贵的是我们的「组」粒度——每组的 8 条 npu.sync + drain
+   token 集 + X/window 小元素 + 2D C tap 组合。FLM 的层是**一个 exec、
+   一个连续 BD 重填循环**，TCT 串在流内当数据依赖用，不是组末屏障。
+
+**教科书结论**：XDNA2 上 ctrl-code 的调度成本原子是 **task group**
+（fill 集 + drain token 集 + 组末 npu.sync 屏障），不是指令、不是 BD、
+不是 TCT 条数。ctrl 级重排（无论多激进）无法合并组；组只能靠**设计时
+不产生跨组数据依赖**来减少——依赖必须走内核内 L1/.bss 交接，而不是
+C→DDR→window 往返。
+
+**生产路线（P28 = layer-v2，数学已闭合）**：
+
+- 1 组/层：流 503µs（27.2MB@55.1）+ 75 + exec ~30 ≈ **608µs/层** vs 现
+  810µs（460+350）→ 设备 28.3 → ~22ms；加 host 重叠（submit-ahead）与
+  attention 遮盖 → 21.5ms 附近 = FLM 追平点。
+- pair-v2（1 组/pair，仅去组）只省 ~44µs/pair ≈ 2.8ms → 27.3ms，不够；
+  **必须整层 1 组**。
+- 内核改造点（全部有 P19b 机器）：compute 尾声把 partials stash 进
+  .bss（不再靠 drain→DDR→window 往返）；residual 走 host 稳定 BO 的
+  小元素（X BO 同路，独立于任何 drain）；swiglu 口味（K=4/K=5）改读
+  .bss stash；window fill 全部消失 ⇒ 层内全部 fill 都是静态的 → 单组
+  [X, res, w, 权重块…] + 一条 drain 链（bd4→nextbd→…）+ 一组 8 条 TCT。
+- 风险：单组内双 drain push 的 token 记账未证（hs3 教训：sync 语义脆，
+  用 nextbd 链 + 单 token 集兜底）；L1 预算（stash +4KB/核 vs 63.3KB
+  现状，可行）。
+
+**留痕**：.hs/.hs2/.hs3 生成与校验逻辑全在 tools/hoist_probe.py（提交
+在本仓库）；A/B 日志 /tmp/p274/{o,h,g,s,t}*.log（会话后归档）；夹具
+已复原（md5 与原版一致）。
