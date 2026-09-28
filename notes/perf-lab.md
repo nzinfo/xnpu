@@ -1528,3 +1528,95 @@ packed1 头部连续区 `[X0..X7 | blocks0..blocks7]`，tg1 每列改两次 fill
    syscall 都不是成本。**
 8. 落地：`sync_to_device`（env XNPU_IOCTL_SYNC=1 可切回 ioctl 做 A/B），
    默认 CLFLUSHOPT；FromDevice ioctl 保留（固件 fence 必需，见 4）。
+
+## P22（2026-09-28③，FastFlowLM 开源边界 + RE 侦察）
+
+问题：与 FLM 差距的结构性原因在哪？其推理部分是否完全闭源、能否反汇编？
+
+1. **仓库已 clone**：`~/qwen/refs/FastFlowLM`（MIT runtime license，
+   AMD 2026）。开源部分 = 运行时/编排（flm Rust 97MB not stripped 含
+   debug_info）、AutoModel wrapper、tokenizer/sampler、**模块接口头**
+   （causal_lm.hpp / gemm.hpp / mha 接口）、**npu_cmd_*.hpp 指令编码
+   DSL**（issue_token/maskwrite/write_dma/preemption/wait——就是我们
+   P20b 逆向的 ctrl-code wire format 的源码级呈现）、每模型独立
+   test harness（src/test/hunyuan_npu/test.cpp，danmaku 语料逐 turn
+   prefill/decode 分相计时，profiler 分 SLOT）。
+2. **闭源边界 = per-model engine .so**（create_new_model.md 自述
+   "comes from the kernel/IRON project"，PIMPL）。但 **not stripped**：
+   libhunyuan_npu.so 93 个 T 符号（hunyuan_npu::Impl::_build_slot /
+   get_logits / load_weights…）；**libmha.so 19 个 T 符号直接泄露架构**：
+   `MHA::Impl::_gen_mha_seq_{d64_q4, d128_q2/q3/q4, d256_q2/q4,
+   d128_q4_1cu}` —— attention = **host 侧按 (head_dim, 量化格式) 生成
+   ctrl-code 指令序列（npu_sequence）**，由 xclbin 里的 AIE graph 执行。
+   与我们的 runtime_sequence 同构，但他们是运行时按形状现生成的。
+3. **xclbin 两个图**：Hy-MT2-1.8B-NPU2/{layer.xclbin 364KB,
+   fused_prefill.xclbin 244KB}，sections 含 AIE_PARTITION（=PDI）。
+   PDI/ctrl-code 解析能力我们已有（P20b），xclbinutil 可提取。
+4. **架构结论（差距的结构性解释）**：FLM forward(ids)→logits 一次调用，
+   每层 0 次 host 插手——MHA/swiglu/rms 全部在 layer.xclbin 单图内，
+   指令序列预生成；我们 fused 口径每层 host 插手 2 次（attention 全套
+   + pair 间 swiglu/量化），quad 口径 1 次（attention）。
+5. **RE 阶梯（便宜→贵）**：① xdump2 LD_PRELOAD（已有）trace flm
+   hy-mt2 → 每 token EXEC_CMD 数/BO 大小/sync 模式；② nm 符号 +
+   开源头文件 anchor（本次已完成首遍）；③ xclbinutil 提 PDI →
+   我们自己的 IRON 工具看图结构；④ objdump/Ghidra 只在①-③留问号时
+   （engine .so 的 T 函数多为序列生成器，语义接近配置数据；算法本体
+   在 xclbin 的 AIE 核里）。MIT license 对研究/互操作无碍。
+
+## P23（2026-09-28④，FLM 全量 ioctl trace + ctrl-code 完整解码）
+
+工具：`tools/xdump2`（本日纳入版本管理）+ `tools/ctrl_decode.py`。
+原料：`flm run hy-mt2:1.8b` 一句话（12 token 出）的完整 trace（374 exec）
+与 40 个 sub dump（132 个 ctrl blob）。过程三步：trace 划相 → ctrl BO 定位
+（两次失败假设，见下）→ 指令 walk 校准（IRON 产物双向验证）。
+
+1. **提交解剖（decode 相，hwctx=1）**：每 token = 2 条 ERT_CMD_CHAIN
+   （opcode 19）+ 1 条单 op20：
+   - chain A：ccount=24 = 1×1024B ctrl（token embedding/输入分发）+ 23×51532B 层 ctrl
+   - chain B：ccount=9 = 9×51532B 层 ctrl → 合计 **32 层 ×51532B**
+   - 单条 ac=4 的 op20 = lm_head（唯一直接过 arg 的 op）
+   - 即 33 op/token，对上 P5 XRT 层 33 run/token；token 节拍 ~20.7ms
+     （exec t= 戳：137387→158078→178921µs…）＝48 tok/s
+2. **prefill 相（hwctx=2，fused_prefill.xclbin）**：256 条单 op20 =
+     32 层×8 op，无 chain。ctrl BO 尺寸按 op 波动（2400/7248/12176/20176B）。
+3. **全程 0 次 SYNC_BO**。一致性如何维持是开放问题（假设：engine .so
+   用户态 clflush；检验：objdump 扫 clflushopt/clflush/sfence）。
+4. **ctrl BO 内存机制（两次失败后定位）**：层 ctrl BO 是 type=3 DEV BO、
+   size=51532、**从 64MB DEV_HEAP carve**，map_off=-1 从不单独 mmap。
+   否定的两个假设：①CREATE_BO vaddr userptr（实测恒 0）②按 map_off
+   mmap（type=3 根本没有）。正解：host VA = heap_map_va + (ctrl_xdna −
+   heap_xdna)，xdump2 已实现 fallback。每 token BO 创建/释放风暴
+   ~1930 次 create_bo（hdl 211/213/214 每轮复用）。
+5. **ERT sub 包格式（4096B wrapper，type=4）**：[w0 hdr][w1=1]
+   [w2/w3 = ctrl BO 的 64 位 xdna 地址][w4/w5 = ctrl-code 字节数]
+   [w6=3][tensor VA 64bit 对…]。链上 sub 按 wrapper 内 handle 表逐个取。
+6. **指令格式定律（ctrl_decode.py 已双向校准）**：每条指令整数个 32bit
+   字，`op_size<<2` = **指令总字节数**，位置按 op 定：WRITE(0)=6w
+   尾字；BLOCKWRITE(1)/BLOCKSET(2) 在 w[3]，payload=(sz/4−4)w；
+   MASKWRITE(3)=7w 尾字；TCT(0x80)=4w w[1]；DDR_PATCH(0x81)=12w w[1]。
+   blob 头 [0x06040100, 264, 指令数, 总字节]——w2=指令数、w3=总字节
+   两处都对上了（IRON 480/17488，FLM 1566/51532）。
+   **shim BD 空间**：BLOCKWRITE 到 (addr&0xFFFFF)∈[0x1D000,0x1D200)，
+   bd_id=((a&0xFFFFF)−0x1D000)>>5，**BD 步长 0x20B=8 字 payload 恰好**。
+   **队列推**：WRITE 到 reg∈[0x1D200,0x1D400)，MM2S=+0x10，
+   value=bd_id|rep<<16|token<<31；MASKWRITE 同区间=issue token。
+   校准链：IRON `w4gemvuq….bin`（480 指令 walk 到 0x4450 全对齐，
+   语义与其 npu_insts.mlir 一致）→ FLM 开源 npu_cmd_*.hpp 的 to_npu
+   编码器逐字段对拍。
+7. **IRON quad 对照（同一 decoder）**：我们 1 个 GEMM op = 480 指令/
+   17.5KB/48 TCT/4 列；BD 形态 4 列×{bd0 4640B, bd1 74240B}×8 轮
+   DDR patch arg0/arg4。**FLM 一整层** = 1566 指令/51.5KB/309 TCT/
+   7 列（c5 空置）：**我们单个 GEMM 的 ctrl 成本 ≈ FLM 整层的 1/3**。
+8. **FLM 层编排**：316 BD fill + 316 DDR patch + 316 队列推 + 309
+   issue-token + 309 TCT 等待；列分工：
+   - c0/c1/c6/c7（算力列）：各 68×18432B + 8×55296B 流入（MM2S）
+   - c3/c4：仅 2×128B + 2×2048B（KV 头路由级小传输）
+   - c2（分发列）：1024B 嵌入 + 2048B + 192B mask，唯一的 S2MM 群
+   - DDR patch：arg1×304（主权重流，列内步长 0x12000=73728B）+
+     arg0/2/3/4 零星
+   - 每次传输配一个 TCT 等待——**无 host 介入的串行化全靠 ctrl 流
+     内的 TCT 链**，这是 0 host 插手的实现机制
+9. **教科书对比要点**：同 token 粒度下 FLM 提交 1 ioctl（链 33 blob）
+   vs 我们 fused 63 exec；其代价是每层 51.5KB×32=1.65MB ctrl-code
+   复用（BO 每轮重建）与 309×32≈9.9k 条 TCT 的流内等待。ctrl-code
+   密度（指令/有效计算）是我们的差距方向，也是融合深度的度量。
