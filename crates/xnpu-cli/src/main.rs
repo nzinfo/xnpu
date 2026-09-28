@@ -192,17 +192,25 @@ fn main() -> ExitCode {
             // "hy" selects the hy-mt2 arch profile (M5c), "cpu" keeps the
             // Rust scalar attention (A/B path; default is NPU attention),
             // "fused" runs the M9/P18 fused rms-pair chain (hy only: pair
-            // geometry needs qkv_m == 3072).
+            // geometry needs qkv_m == 3072), "quad" the P19 whole-layer
+            // chain (one exec per layer, device swiglu; hy only).
             let is_hy = args.iter().any(|s| matches!(s.as_str(), "hy" | "hy-mt2"));
             let arch: &DecArch = if is_hy { &DEC_HY } else { &DEC_MINICPM };
             let fused = args.iter().any(|s| s.as_str() == "fused");
-            if fused && !is_hy {
-                eprintln!("fused rms-pairs need the hy arch (qkv_m 3072)");
+            let quad = args.iter().any(|s| s.as_str() == "quad");
+            if (fused || quad) && !is_hy {
+                eprintln!("fused/quad chains need the hy arch (qkv_m 3072)");
+                return ExitCode::FAILURE;
+            }
+            if fused && quad {
+                eprintln!("fused and quad are exclusive chain modes");
                 return ExitCode::FAILURE;
             }
             let pos_args: Vec<&String> = args[1..]
                 .iter()
-                .filter(|s| !matches!(s.as_str(), "cpu" | "hy" | "hy-mt2" | "fused"))
+                .filter(|s| {
+                    !matches!(s.as_str(), "cpu" | "hy" | "hy-mt2" | "fused" | "quad")
+                })
                 .collect();
             let decdir = pos_args
                 .first()
@@ -217,7 +225,7 @@ fn main() -> ExitCode {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(5);
             let npu_attn = !args.iter().any(|s| s.as_str() == "cpu");
-            cmd_run_decode(arch, &decdir, &w4dir, iters, npu_attn, fused)
+            cmd_run_decode(arch, &decdir, &w4dir, iters, npu_attn, fused, quad)
         }
         Some("run-lmhead") => {
             // M8/P8: hy lm_head on NPU — isolated probe (correctness + perf).
@@ -264,7 +272,7 @@ fn main() -> ExitCode {
         }
         _ => {
             eprintln!(
-                "usage: xnpu-cli <info | ctx-probe [max] [cols] | run-add [prj-dir] [bf16|i8] | run-gemm [prj-dir] [M K N] [bf16|i8] | run-multi [add-prj] [gemm-prj] [M K N] | run-pipe [prj-dir] [M K N] [iters] | run-chain [add-prj] [gemm-prj] [M K N] [reps] | run-q8 [gemm-prj] [rescale-prj] [M K N tile_m] [reps] | run-w4gemv [prj-dir] [M K] [group] [tsi] [iters] | run-w4layer [w4-dir] [layers] [iters] | run-w4ulayer [w4u-dir] [layers] [iters] | run-decode [dec-dir] [w4u-dir] [iters] [hy] [cpu] | run-lmhead [iters] | perf-calibrate [hy] [iters]>"
+                "usage: xnpu-cli <info | ctx-probe [max] [cols] | run-add [prj-dir] [bf16|i8] | run-gemm [prj-dir] [M K N] [bf16|i8] | run-multi [add-prj] [gemm-prj] [M K N] | run-pipe [prj-dir] [M K N] [iters] | run-chain [add-prj] [gemm-prj] [M K N] [reps] | run-q8 [gemm-prj] [rescale-prj] [M K N tile_m] [reps] | run-w4gemv [prj-dir] [M K] [group] [tsi] [iters] | run-w4layer [w4-dir] [layers] [iters] | run-w4ulayer [w4u-dir] [layers] [iters] | run-decode [dec-dir] [w4u-dir] [iters] [hy] [cpu] [fused|quad] | run-lmhead [iters] | perf-calibrate [hy] [iters]>"
             );
             ExitCode::FAILURE
         }
@@ -3003,6 +3011,54 @@ fn w4uf_build_c_init(c_rows: usize, blocks1: usize) -> Vec<u8> {
     out
 }
 
+/// P19 quad C geometry (IRON design_quad.py): 40704 bf16 rows — win1
+/// [o sections (8x288) | residual1 @2304 | hdr @9276], gate cols 0..3
+/// @9280, padA @15552, up cols 4..7 @18560, padB @24832, win2 (down
+/// sections + residual2 rows, dead) @27840, qkv sections @37120 (3
+/// dummy 16-row groups ahead of the data).
+const W4Q_C_ROWS: usize = 40704;
+const W4Q_WIN2_OFF: usize = 27840; // down sections: 8 x 800 rows, 2 dummy groups
+                                   // (37116 is only the win2 K=2 header words)
+const W4Q_SEC_DN: usize = 800;
+const W4Q_QKV_OFF: usize = 37120;
+const W4Q_SEC_Q: usize = 448;
+const W4Q_RES1_ROW: usize = 2304;
+
+/// P19 quad packed1: per column [X element | that column's 16 o blocks]
+/// (op_quad.py build_packed1). The X head is zeroed here — the exec
+/// rewrites it (same quantized activation in all 8 columns) before each
+/// submit; one whole-BO clflush covers all 8 copies.
+fn w4q_build_packed1(blocks: &[u8], blocks1: usize) -> Vec<u8> {
+    assert_eq!(blocks.len(), 8 * blocks1 * W4U_ELEM);
+    let per_col = (1 + blocks1) * W4U_ELEM;
+    let mut out = vec![0u8; 8 * per_col];
+    for col in 0..8 {
+        let base = col * per_col;
+        let src = col * blocks1 * W4U_ELEM;
+        out[base + W4U_ELEM..base + per_col]
+            .copy_from_slice(&blocks[src..src + blocks1 * W4U_ELEM]);
+    }
+    out
+}
+
+/// P19 quad C pre-run seed: zeros plus the four windows' header words
+/// (op_quad.py build_c_init minus the residual, which is re-seeded per
+/// exec by gemv_quad). residual2 rows stay ZERO — the device computes
+/// h2' = x + o_out itself (stage1r overwrites stage1b's dead copy).
+fn w4q_build_c_init() -> Vec<u8> {
+    fn hdr(out: &mut [u8], row: usize, k: u32, blocks1: u32) {
+        let h = row * 2;
+        out[h..h + 4].copy_from_slice(&k.to_le_bytes());
+        out[h + 4..h + 8].copy_from_slice(&blocks1.to_le_bytes());
+    }
+    let mut out = vec![0u8; W4Q_C_ROWS * 2];
+    hdr(&mut out, 9276, 1, 16); // win1 (o sections + residual1)
+    hdr(&mut out, 18556, 4, 0); // padA: K=4 gate window
+    hdr(&mut out, 27836, 5, 0); // padB: K=5 up window
+    hdr(&mut out, 37116, 2, 48); // win2 (down sections)
+    out
+}
+
 /// M3b: the same 42-layer projection chain on the UNIVERSAL w4gemvu kernel.
 /// All four shapes share one PDI (the kernel reads K from the block tail at
 /// runtime), so the whole chain runs on ONE CU and differs only in ctrl
@@ -4596,6 +4652,7 @@ fn cmd_run_decode(
     iters: usize,
     npu_attn_req: bool,
     fused: bool,
+    quad: bool,
 ) -> ExitCode {
     let build = "/home/nzinfo/qwen/xnpu/build";
     let layers = arch.layers;
@@ -4603,7 +4660,13 @@ fn cmd_run_decode(
     let npu_attn = npu_attn_req;
     println!(
         "decode chain: {name} {layers} layers, w4gemvu projections on CU0{} + {} attention{}, {iters} iters",
-        if fused { " + fused rms-pairs on CU1" } else { "" },
+        if fused {
+            " + fused rms-pairs on CU1"
+        } else if quad {
+            " + quad whole-layer execs on CU1"
+        } else {
+            ""
+        },
         if npu_attn { "flowkv NPU" } else { "Rust scalar" },
         if npu_attn { "" } else { " (cpu mode)" },
         name = arch.name,
@@ -4633,8 +4696,9 @@ fn cmd_run_decode(
     // o(K1=2048) -> ln2_n -> gateup(M2=12288), pair B = down(K1=6144)
     // -> ln1_{n+1} -> qkv(M2=3072). Own CU slot; the ctrl code takes
     // FOUR tensor BOs (rt.sequence order A1, A2, X, C) — chain_op
-    // already appends any number of tensor VAs.
-    let fused_fx: Option<Vec<(Vec<u8>, Vec<u8>, u32)>> = if fused {
+    // already appends any number of tensor VAs. Quad mode loads ONLY
+    // pair A (the last layer's tail: no qkv(L) exists for a quad).
+    let fused_fx: Option<Vec<(Vec<u8>, Vec<u8>, u32)>> = if fused || quad {
         let stems = [
             "w4gemvuf_2048x2048_12288x2048", // pair A
             "w4gemvuf_2048x6144_3072x2048",  // pair B
@@ -4693,26 +4757,66 @@ fn cmd_run_decode(
             return ExitCode::FAILURE;
         }
     };
+    // P19 quad fixture (IRON w4gemvuq_*): the fixed hy layer
+    // o -> rms1 -> gateup -> swiglu -> down -> rms2 -> qkv' in ONE exec.
+    let quad_fx: Option<(Vec<u8>, Vec<u8>, u32)> = if quad {
+        match load_fixture(&format!(
+            "{build}/w4gemvuq_2048x2048_12288_2048x6144_3072.mlir.prj"
+        )) {
+            Some(f) => Some(f),
+            None => {
+                eprintln!("load quad fixture failed (run test_quad first)");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
+
     // Both PDIs take cu_func 0 — the CU slot is the index in this list and
     // is selected per op via set_cu (the run-multi pattern; func != 0 makes
     // the fw look up a DPU function the PDI doesn't have and the op never
-    // runs). Fused mode inserts the w4gemvuf PDI at slot 1, pushing flowkv
-    // to slot 2 (fk_cu).
-    let fk_cu: u32 = if fused { 2 } else { 1 };
-    let cus: Vec<(&[u8], u8)> = if npu_attn {
-        if let Some(ffx) = &fused_fx {
-            vec![
-                (fixtures[0].0.as_slice(), 0),
-                (ffx[0].0.as_slice(), 0),
-                (fk_fixture.0.as_slice(), 0),
-            ]
-        } else {
-            vec![(fixtures[0].0.as_slice(), 0), (fk_fixture.0.as_slice(), 0)]
-        }
-    } else if let Some(ffx) = &fused_fx {
-        vec![(fixtures[0].0.as_slice(), 0), (ffx[0].0.as_slice(), 0)]
+    // runs). Fused inserts the w4gemvuf PDI at slot 1 (flowkv -> 2); quad
+    // inserts w4gemvuq at 1 AND the pair-A PDI at 2 (flowkv -> 3).
+    let quad_cu: u32 = 1;
+    let pa_cu: u32 = if quad { 2 } else { 1 };
+    let fk_cu: u32 = if quad {
+        3
+    } else if fused {
+        2
     } else {
-        vec![(fixtures[0].0.as_slice(), 0)]
+        1
+    };
+    let cus: Vec<(&[u8], u8)> = match (&quad_fx, &fused_fx) {
+        (Some(qf), Some(ffx)) => {
+            let mut v = vec![
+                (fixtures[0].0.as_slice(), 0),
+                (qf.0.as_slice(), 0),
+                (ffx[0].0.as_slice(), 0),
+            ];
+            if npu_attn {
+                v.push((fk_fixture.0.as_slice(), 0));
+            }
+            v
+        }
+        (None, Some(ffx)) => {
+            if npu_attn {
+                vec![
+                    (fixtures[0].0.as_slice(), 0),
+                    (ffx[0].0.as_slice(), 0),
+                    (fk_fixture.0.as_slice(), 0),
+                ]
+            } else {
+                vec![(fixtures[0].0.as_slice(), 0), (ffx[0].0.as_slice(), 0)]
+            }
+        }
+        _ => {
+            if npu_attn {
+                vec![(fixtures[0].0.as_slice(), 0), (fk_fixture.0.as_slice(), 0)]
+            } else {
+                vec![(fixtures[0].0.as_slice(), 0)]
+            }
+        }
     };
     if let Err(e) = ctx.configure_cus(&cus) {
         eprintln!("configure_cus: {e}");
@@ -4985,9 +5089,12 @@ fn cmd_run_decode(
         m2: [usize; 2],
         c_rows1: [usize; 2],
         section2: [usize; 2],
+        /// P19 quad mode: exactly ONE pair was built — A of the LAST
+        /// layer (index 0 in ops/handles, live_fused [p1, p2, c]).
+        a_only_last: bool,
     }
     let mut live_fused: Vec<(BufferObject, Mapping)> = Vec::new();
-    let mut fst: Option<FusedState> = if fused {
+    let mut fst: Option<FusedState> = if fused || quad {
         let (qa, qb) = (
             fused_fx.as_ref().unwrap()[0].1.as_slice(),
             fused_fx.as_ref().unwrap()[1].1.as_slice(),
@@ -5034,11 +5141,14 @@ fn cmd_run_decode(
                 &dev,
                 &format!("fused{}L{n:02}", if pi == 0 { "A" } else { "B" }),
                 instr,
-                1,
+                pa_cu,
                 &[p1_va, p2_va, x_va, c_va],
             ) {
                 Some(op) => {
-                    let ci = n * 6 + 2 + pi * 3;
+                    // mk_pair pushed exactly [p1, p2, c] above, so the C BO
+                    // sits at len() - 1 — robust in quad mode's A-only
+                    // layout too (was n * 6 + 2 + pi * 3).
+                    let ci = live_fused.len() - 1;
                     handles.push(vec![
                         op.ctrl_bo.handle(),
                         live_fused[ci - 2].0.handle(),
@@ -5057,6 +5167,12 @@ fn cmd_run_decode(
             Some(d)
         };
         for n in 0..layers {
+            // Quad mode needs exactly ONE pair: A(L-1) closes the last
+            // layer's tail (there is no qkv(L) for a quad to produce —
+            // pair A + plain down + host swiglu finish the token).
+            if quad && n + 1 != layers {
+                continue;
+            }
             // pair A: packed1 = o blocks; packed2 = [w elem | gateup blocks],
             // rms weight = ln2_n.
             let p1a = match rd_w(format!("layer{n:02}_{}.bin", shapes[1].name)) {
@@ -5083,7 +5199,7 @@ fn cmd_run_decode(
                 eprintln!("fused pair A layer{n} setup failed");
                 return ExitCode::FAILURE;
             }
-            if n + 1 < layers {
+            if n + 1 < layers && !quad {
                 // pair B: packed1 = down blocks; packed2 = [w elem | NEXT
                 // layer's qkv blocks], rms weight = ln1_{n+1}.
                 let p1b = match rd_w(format!("layer{n:02}_{}.bin", shapes[3].name)) {
@@ -5112,11 +5228,18 @@ fn cmd_run_decode(
                 }
             }
         }
-        println!(
-            "fused rms-pairs: {} pair A (o->ln2->gateup) + {} pair B (down->ln1'->qkv') execs/token on CU1",
-            layers,
-            layers - 1
-        );
+        if quad {
+            println!(
+                "fused rms-pairs: 1 pair A (o->ln2->gateup) at L{} on CU{pa_cu} — the quad execs cover every other layer",
+                layers - 1
+            );
+        } else {
+            println!(
+                "fused rms-pairs: {} pair A (o->ln2->gateup) + {} pair B (down->ln1'->qkv') execs/token on CU1",
+                layers,
+                layers - 1
+            );
+        }
         Some(FusedState {
             ops,
             handles,
@@ -5124,7 +5247,128 @@ fn cmd_run_decode(
             m2: [mg, mq],
             c_rows1,
             section2,
+            a_only_last: quad,
         })
+    } else {
+        None
+    };
+
+    // P19 quad state (hy only): layers-1 execs, quad(n) = o(n) -> rms1
+    // (ln2_n) -> gateup -> DEVICE swiglu -> down -> rms2 (ln1_{n+1}) ->
+    // qkv(n+1) in ONE NPU exec (design_quad.py). live_quad layout: base
+    // 5n = [p1, p2, p3, p4, c]; handles [ctrl, p1, p2, p3, p4, c]
+    // (rt.sequence order A1..A4, C — the X element rides each column's
+    // packed1 head, the 5-BO ctrl-kernel cap). packed1/packed3 are the
+    // plain v5 streams (X head zero here, rewritten per exec); packed2/
+    // packed4 interleave the two K=3 rms-weight elements (same builder
+    // as the fused pairs). C carries setup-once window headers; the
+    // host seeds residual1 per exec and reads back ONLY the o sections
+    // (x' = x + o via the same add_bf16 as the split path — the
+    // residual stream stays bit-exact) and the qkv sections.
+    struct QuadState {
+        ops: Vec<ChainOp>,
+        handles: Vec<Vec<u32>>,
+    }
+    let mut live_quad: Vec<(BufferObject, Mapping)> = Vec::new();
+    let mut qst: Option<QuadState> = if quad {
+        let qinstr = quad_fx.as_ref().unwrap().1.as_slice();
+        // hy shape contract (quad geometry is compiled into the ctrl code):
+        // o 2048x2048, gateup 12288x2048, down 2048x6144, qkv 3072x2048.
+        let (mq, mo, mg, md, kd) =
+            (shapes[0].m, shapes[1].m, shapes[2].m, shapes[3].m, shapes[3].k);
+        assert!(mq == 3072 && mo == 2048 && mg == 12288 && md == 2048 && kd == 6144);
+        let blocks1 = w4u_blocks(2048, 2048); // 16 (o)
+        let blocks2 = w4u_blocks(mg, 2048); // 96 (gateup)
+        let blocks3 = w4u_blocks(md, kd); // 48 (down)
+        let blocks4 = w4u_blocks(mq, 2048); // 24 (qkv)
+        let mut ops = Vec::with_capacity(layers - 1);
+        let mut handles = Vec::with_capacity(layers - 1);
+        let rd_w = |stem: String| -> Option<Vec<u8>> {
+            let d = std::fs::read(format!("{w4dir}/{stem}")).ok()?;
+            Some(d)
+        };
+        for n in 0..layers - 1 {
+            let o = match rd_w(format!("layer{n:02}_{}.bin", shapes[1].name)) {
+                Some(d) if d.len() == 8 * blocks1 * W4U_ELEM => d,
+                _ => {
+                    eprintln!("quad: layer{n:02}_o absent/stale");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let g = match rd_w(format!("layer{n:02}_{}.bin", shapes[2].name)) {
+                Some(d) if d.len() == 8 * blocks2 * W4U_ELEM => d,
+                _ => {
+                    eprintln!("quad: layer{n:02}_gateup absent/stale");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let dn = match rd_w(format!("layer{n:02}_{}.bin", shapes[3].name)) {
+                Some(d) if d.len() == 8 * blocks3 * W4U_ELEM => d,
+                _ => {
+                    eprintln!("quad: layer{n:02}_down absent/stale");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let q = match rd_w(format!("layer{:02}_{}.bin", n + 1, shapes[0].name)) {
+                Some(d) if d.len() == 8 * blocks4 * W4U_ELEM => d,
+                _ => {
+                    eprintln!("quad: layer{:02}_qkv absent/stale", n + 1);
+                    return ExitCode::FAILURE;
+                }
+            };
+            // rms1 weight = ln2_n; rms2 weight = ln1_{n+1} (the glue that
+            // feeds the NEXT layer's qkv — same pairing as fused pair B).
+            let p1 = w4q_build_packed1(&o, blocks1);
+            let p2 =
+                w4uf_build_packed2(&g, &norms[(2 * n + 1) * 2048..][..2048], blocks1, blocks2);
+            let p4 = w4uf_build_packed2(
+                &q,
+                &norms[(2 * (n + 1)) * 2048..][..2048],
+                blocks3,
+                blocks4,
+            );
+            let cdata = w4q_build_c_init();
+            let (mut vas, mut hds) = (Vec::new(), Vec::new());
+            let mut ok = true;
+            for (tag, data) in [("p1", p1), ("p2", p2), ("p3", dn), ("p4", p4)] {
+                match chain_tensor(&dev, &mut live_quad, &format!("qL{n:02}.{tag}"), &data) {
+                    Some(va) => vas.push(va),
+                    None => ok = false,
+                }
+            }
+            if ok {
+                match chain_tensor(&dev, &mut live_quad, &format!("qL{n:02}.c"), &cdata) {
+                    Some(va) => vas.push(va),
+                    None => ok = false,
+                }
+            }
+            if !ok {
+                eprintln!("quad layer{n} BO setup failed");
+                return ExitCode::FAILURE;
+            }
+            hds.extend(
+                live_quad[n * 5..n * 5 + 5]
+                    .iter()
+                    .map(|(bo, _)| bo.handle()),
+            );
+            match chain_op(&dev, &format!("quadL{n:02}"), qinstr, quad_cu, &vas) {
+                Some(op) => {
+                    let mut h = vec![op.ctrl_bo.handle()];
+                    h.extend(hds);
+                    handles.push(h);
+                    ops.push(op);
+                }
+                None => {
+                    eprintln!("quad op layer{n} setup failed");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        println!(
+            "quad whole-layer: {} execs/token on CU{quad_cu} (o->rms->gateup->swiglu->down->rms->qkv'), swiglu on device",
+            layers - 1
+        );
+        Some(QuadState { ops, handles })
     } else {
         None
     };
@@ -5355,6 +5599,22 @@ fn cmd_run_decode(
         m
     })
     .collect();
+    // P19: the quad whole-layer meta (CU1; replaces pair A + host swiglu
+    // + pair B for one layer). bytes_stream = the real weight stream:
+    // 8 columns x ([X | 16 o] + [w | 96 gateup] + 48 down + [w | 24 qkv]).
+    let meta_quad: OpMeta = {
+        let mut m = OpMeta::new(
+            "quad_layer",
+            "w4gemvu",
+            1,
+            (8 * W4U_ELEM + 4096) as u64, // 8 X element heads + residual1 seed
+            (W4Q_C_ROWS * 2) as u64,
+            (2 * (2048 * 2048 + 12288 * 2048 + 2048 * 6144 + 3072 * 2048)) as u64,
+        )
+        .with_tier(tier::SLOT_STREAM);
+        m.bytes_stream = Some((8 * (17 + 97 + 48 + 25) * W4U_ELEM) as u64);
+        m
+    };
     let mut rec = Recorder::new();
     let mut rec_seq = 0u64;
 
@@ -5436,9 +5696,29 @@ fn cmd_run_decode(
                          rec: &mut Recorder,
                          rec_seq: &mut u64|
      -> bool {
-        let (k1, m2, c_rows1, section2) = {
+        let (k1, m2, c_rows1, section2, oi, ci) = {
             let fs = fst.as_ref().unwrap();
-            (fs.k1[pi], fs.m2[pi], fs.c_rows1[pi], fs.section2[pi])
+            if fs.a_only_last {
+                // quad mode: exactly one pair was built (A of the last
+                // layer) — it IS ops[0] / live_fused[0..3].
+                (
+                    fs.k1[pi],
+                    fs.m2[pi],
+                    fs.c_rows1[pi],
+                    fs.section2[pi],
+                    0,
+                    2,
+                )
+            } else {
+                (
+                    fs.k1[pi],
+                    fs.m2[pi],
+                    fs.c_rows1[pi],
+                    fs.section2[pi],
+                    n * 2 + pi,
+                    n * 6 + 2 + pi * 3,
+                )
+            }
         };
         let vi = if k1 == 6144 { 1 } else { 0 };
         {
@@ -5451,7 +5731,6 @@ fn cmd_run_decode(
             }
         }
         {
-            let ci = n * 6 + 2 + pi * 3;
             let (bo, map) = &mut live_fused[ci];
             let bytes = map.as_mut_slice();
             let r0 = c_rows1 * 2;
@@ -5463,7 +5742,6 @@ fn cmd_run_decode(
                 return false;
             }
         }
-        let oi = n * 2 + pi;
         let ts = std::time::Instant::now();
         let fs = fst.as_mut().unwrap();
         let op = &mut fs.ops[oi];
@@ -5482,7 +5760,6 @@ fn cmd_run_decode(
             rec.solo(&metas_fused[pi], it, ts, *rec_seq);
             *rec_seq += 1;
         }
-        let ci = n * 6 + 2 + pi * 3;
         let (c_bo, c_map) = &live_fused[ci];
         let _ = c_bo.sync(SyncDirection::FromDevice, 0, c_bo.size() as u64);
         let cs = c_map.as_slice();
@@ -5498,6 +5775,151 @@ fn cmd_run_decode(
             for r in 0..rpc2 {
                 let off = base + r * 2;
                 out2[col * rpc2 + r] = u16::from_le_bytes([cs[off], cs[off + 1]]);
+            }
+        }
+        true
+    };
+
+    // P19: one QUAD whole-layer exec — tg1 o gemv -> tg2 rms1 + gateup
+    // -> tg3 DEVICE swiglu + down -> tg4 rms2 + qkv(n+1), all inside ONE
+    // NPU exec. Host work per call: quantize the attention output into
+    // packed1's EIGHT column-head X elements (the 5-BO ctrl-kernel cap
+    // pushed X into the weight stream — one whole-BO clflush covers all
+    // 8 copies), seed residual1 in C, submit [ctrl, p1..p4, c], then
+    // read the o sections (x' = x + o via the same add_bf16 on the same
+    // section bits as the split path — the residual stream stays
+    // bit-exact) and the qkv sections (3 dummy 16-row groups ahead).
+    // The swiglu numerics live on the AIE2P hw exp2 — the E2E gates
+    // arbitrate that (notes/perf-lab.md P19).
+    let mut gemv_quad = |n: usize, // layer index (op = quad(n), n < L-1)
+                         act: &[u16], // attention output (o's activation)
+                         res: &[u16], // residual x_n (seeded as residual1)
+                         out1: &mut [u16], // x_{n+1} = x_n + o_out + down_out
+                         qkv_out: &mut [u16], // qkv(n+1) (3072,)
+                         ops: &mut [ChainOp], // plain ops (QUAD_DEBUG compare)
+                         op_h: &[Vec<u32>],
+                         live: &mut Vec<(BufferObject, Mapping)>,
+                         it: u32,
+                         rec: &mut Recorder,
+                         rec_seq: &mut u64|
+     -> bool {
+        {
+            let (q, d) = w4u_quantize_x(act, 2048);
+            let xe = w4u_build_x_elem(&q, &d, 2048);
+            let (bo, map) = &mut live_quad[n * 5];
+            let bytes = map.as_mut_slice();
+            for col in 0..8 {
+                let off = col * 17 * W4U_ELEM; // (1 + 16 blocks) per column
+                bytes[off..off + W4U_ELEM].copy_from_slice(&xe);
+            }
+            if let Err(e) = bo.sync(SyncDirection::ToDevice, 0, bo.size() as u64) {
+                eprintln!("quad x sync (L{n}): {e}");
+                return false;
+            }
+        }
+        {
+            let (bo, map) = &mut live_quad[n * 5 + 4];
+            let bytes = map.as_mut_slice();
+            let r0 = W4Q_RES1_ROW * 2;
+            for j in 0..2048 {
+                bytes[r0 + j * 2..r0 + j * 2 + 2].copy_from_slice(&res[j].to_le_bytes());
+            }
+            if let Err(e) = bo.sync(SyncDirection::ToDevice, r0 as u64, 4096) {
+                eprintln!("quad res sync (L{n}): {e}");
+                return false;
+            }
+        }
+        let ts = std::time::Instant::now();
+        let qs = qst.as_mut().unwrap();
+        let op = &mut qs.ops[n];
+        let seq = match op.pkt.submit(&dev, &ctx, &qs.handles[n]) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("quad submit (L{n}): {e}");
+                return false;
+            }
+        };
+        if let Err(e) = syncobj_timeline_wait(&dev, ctx.syncobj_handle, seq, 10_000_000_000) {
+            eprintln!("quad wait (L{n}, seq {seq}): {e}");
+            return false;
+        }
+        if it > 0 {
+            rec.solo(&meta_quad, it, ts, *rec_seq);
+            *rec_seq += 1;
+        }
+        let (c_bo, c_map) = &live_quad[n * 5 + 4];
+        let _ = c_bo.sync(SyncDirection::FromDevice, 0, c_bo.size() as u64);
+        let cs = c_map.as_slice();
+        // QUAD_DEBUG: bit-compare this exec's o sections against the PLAIN
+        // o op on the same activation (the o path must be bit-exact — any
+        // diff names the quad bring-up, not numerics).
+        if std::env::var("QUAD_DEBUG").is_ok() && n == 0 && it == 0 {
+            let (xbo, xmap) = &mut live[0];
+            let (q, d) = w4u_quantize_x(act, 2048);
+            xmap.as_mut_slice()[..W4U_ELEM]
+                .copy_from_slice(&w4u_build_x_elem(&q, &d, 2048));
+            let _ = xbo.sync(SyncDirection::ToDevice, 0, W4U_ELEM as u64);
+            let seq = match ops[1].pkt.submit(&dev, &ctx, &op_h[1]) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("debug o submit: {e}");
+                    return false;
+                }
+            };
+            if let Err(e) = syncobj_timeline_wait(&dev, ctx.syncobj_handle, seq, 10_000_000_000) {
+                eprintln!("debug o wait: {e}");
+                return false;
+            }
+            let (oc_bo, oc_map) = &live[3];
+            let _ = oc_bo.sync(SyncDirection::FromDevice, 0, oc_bo.size() as u64);
+            let ocs = oc_map.as_slice();
+            let mut diffs = 0usize;
+            let mut first = Vec::new();
+            for r in 0..2304 * 2 {
+                if cs[r] != ocs[r] {
+                    diffs += 1;
+                    if first.len() < 12 {
+                        first.push(r / 2);
+                    }
+                }
+            }
+            println!(
+                "[quad-debug] L0 o sections vs plain op: {diffs}/4608 bytes differ, first rows {first:?}"
+            );
+        }
+        // o sections: the PLAIN v5 C layout in rows [0..2304) — same read
+        // as the split path (K=2048, single chunk).
+        let o = w4u_read_c(cs, 2048, 2048);
+        add_bf16(res, &o, out1);
+        // down partials from the win2 sections (8 x 800 rows): TWO dummy
+        // groups (the K=4/K=5 glue zero-Cs) ahead of the 3 chunk-major
+        // chunks — w4u_read_c's own walk assumes a 0 base and 1 dummy, so
+        // this is spelled out. x_{n+1} = bf16(f32(bf16(x+o)) + sum_c
+        // f32(p_c)) — the golden's exact rounding order (and the device's
+        // own h2''), NOT the missing-down x+o the first bring-up ran
+        // (E2E snowballed: each layer's down dropped from the residual
+        // stream, ~0.03/layer at L0 growing with depth, decorrelating
+        // attention by L11 — qkv itself matched fused to 2e-4 the whole
+        // time, which is what named the host bug).
+        for col in 0..8 {
+            let sec = (W4Q_WIN2_OFF + col * W4Q_SEC_DN) * 2;
+            for w in 0..256usize {
+                let oi = col * 256 + w;
+                let mut acc = bf16_to_f32(out1[oi]);
+                for c in 0..3usize {
+                    let off = sec + (2 * W4U_TILE_ROWS + c * 256 + w) * 2;
+                    acc += bf16_to_f32(u16::from_le_bytes([cs[off], cs[off + 1]]));
+                }
+                out1[oi] = f32_to_bf16(acc);
+            }
+        }
+        // qkv sections: 3 dummy 16-row groups ahead of 384 data rows/col.
+        let rpcq = 3072 / 8;
+        for col in 0..8 {
+            let base = (W4Q_QKV_OFF + col * W4Q_SEC_Q + 3 * W4U_TILE_ROWS) * 2;
+            for r in 0..rpcq {
+                let off = base + r * 2;
+                qkv_out[col * rpcq + r] = u16::from_le_bytes([cs[off], cs[off + 1]]);
             }
         }
         true
@@ -5539,10 +5961,11 @@ fn cmd_run_decode(
      -> bool {
         for n in 0..layers {
             let Scratch { xn, qr, kr, attn, gu, sw, qkv: scq } = sc;
-            // P18 fused: layer n>0's qkv came from pair B(n-1) — its ln1_n
-            // rms ran in the NPU glue, the result rides Scratch.qkv.
+            // P18 fused / P19 quad: layer n>0's qkv came from the previous
+            // layer's fused tail (pair B / the quad exec) — its ln1_n rms
+            // ran in the NPU glue, the result rides Scratch.qkv.
             let qkv_owned;
-            let qkv: &[u16] = if n == 0 || !fused {
+            let qkv: &[u16] = if n == 0 || !fused && !quad {
                 rms_norm_bf16(x, &norms[n * 2 * 2048..][..2048], xn);
                 qkv_owned = match gemv(ops, n * 4, 0, xn, live, it, rec, rec_seq) {
                     Some(v) => v,
@@ -5659,7 +6082,46 @@ fn cmd_run_decode(
                     );
                 }
             }
-            if fused {
+            if quad {
+                if n + 1 < layers {
+                    // P19 quad: o(n) -> rms1 -> gateup -> DEVICE swiglu ->
+                    // down -> rms2 -> qkv(n+1) in ONE exec; qkv rides
+                    // Scratch.qkv for the next layer iteration.
+                    if !gemv_quad(
+                        n, attn, x, xn, scq, ops, &op_handles, live, it, rec, rec_seq,
+                    ) {
+                        return false;
+                    }
+                    std::mem::swap(x, xn); // x = x + o + down (gu/sw device-side)
+                    if check && std::env::var("QUAD_DUMP").is_ok() {
+                        // P19 debug: raw qkv(n+1) readback trajectory, to diff
+                        // against the fused path's (gate-passing) qkv at the
+                        // same layer — isolates the quad qkv path from
+                        // rope/attention amplification.
+                        let _ = std::fs::create_dir_all("/tmp/qkvdump");
+                        let _ = std::fs::write(
+                            format!("/tmp/qkvdump/quad_L{:02}.bin", n + 1),
+                            (0..arch.qkv_m)
+                                .flat_map(|i| scq[i].to_le_bytes())
+                                .collect::<Vec<u8>>(),
+                        );
+                    }
+                } else {
+                    // last layer: no qkv(L) exists for a quad to produce —
+                    // close the tail with pair A + host swiglu + plain down.
+                    if !gemv_pair(0, n, attn, x, xn, gu, live, it, rec, rec_seq) {
+                        return false;
+                    }
+                    std::mem::swap(x, xn);
+                    swiglu_bf16(gu, sw);
+                    let d = match gemv(ops, n * 4 + 3, 3, sw, live, it, rec, rec_seq) {
+                        Some(v) => v,
+                        None => return false,
+                    };
+                    add_bf16(x, &d, xn);
+                    std::mem::swap(x, xn);
+                }
+            } else if fused {
                 // P18 pair A: o(n) -> ln2_n rms -> gateup(n) in ONE exec.
                 // The host rebuilds the post-add hidden from op1's
                 // plain-layout C sections via the SAME add_bf16 the split
@@ -5676,6 +6138,18 @@ fn cmd_run_decode(
                         return false;
                     }
                     std::mem::swap(x, xn);
+                    if check && std::env::var("QUAD_DUMP").is_ok() {
+                        // P19 debug: reference qkv(n+1) for the quad diff (the
+                        // fused chain passes the E2E gates, so its readback is
+                        // the working baseline).
+                        let _ = std::fs::create_dir_all("/tmp/qkvdump");
+                        let _ = std::fs::write(
+                            format!("/tmp/qkvdump/fused_L{:02}.bin", n + 1),
+                            (0..arch.qkv_m)
+                                .flat_map(|i| scq[i].to_le_bytes())
+                                .collect::<Vec<u8>>(),
+                        );
+                    }
                 } else {
                     let d = match gemv(ops, n * 4 + 3, 3, sw, live, it, rec, rec_seq) {
                         Some(v) => v,
@@ -5721,8 +6195,37 @@ fn cmd_run_decode(
                     }
                     worst_rel = worst_rel.max(e / (gv.abs() + 1e-6));
                 }
+                if bad > 16 && std::env::var("QUAD_DEBUG").is_ok() {
+                    println!(
+                        "  [quad-debug] layer {n}: {bad}/2048 outside tolerance (worst rel {worst_rel:.3})"
+                    );
+                }
                 if bad > 16 && first_bad.is_none() {
                     first_bad = Some(n);
+                    if std::env::var("QUAD_DEBUG").is_ok() {
+                        let _ = std::fs::write(
+                            "/tmp/quad_x.bin",
+                            (0..2048).flat_map(|i| x[i].to_le_bytes()).collect::<Vec<u8>>(),
+                        );
+                    }
+                    // P19 debug: dump the failing rows (index, ours, golden)
+                    // — the o path should be bit-exact, so the pattern
+                    // (columns/groups) names the culprit region directly.
+                    let rows: Vec<usize> = (0..2048)
+                        .filter(|&i| {
+                            let e =
+                                (bf16_to_f32(x[i]) - bf16_to_f32(g[i])).abs();
+                            e > 0.01 + 0.02 * bf16_to_f32(x[i]).abs()
+                        })
+                        .take(12)
+                        .collect();
+                    for i in rows {
+                        println!(
+                            "    row {i}: x={:.5} golden={:.5}",
+                            bf16_to_f32(x[i]),
+                            bf16_to_f32(g[i])
+                        );
+                    }
                     println!(
                         "  first divergence at layer {n}: {bad}/2048 outside tolerance (worst rel {worst_rel:.3})"
                     );
@@ -5872,8 +6375,14 @@ fn cmd_run_decode(
             Mode::Solo,
             it,
             tb,
-            (layers * 4 - if fused { 2 * layers - 1 } else { 0 }
-                + if npu_attn { layers } else { 0 }
+            (if quad {
+                // 1 plain qkv (L0) + (L-1) quads + 1 pair A + 1 plain down
+                layers + 2
+            } else if fused {
+                layers * 4 - (2 * layers - 1)
+            } else {
+                layers * 4
+            } + if npu_attn { layers } else { 0 }
                 + if lm.is_some() { 1 } else { 0 }) as u32,
             1,
         );
@@ -5886,15 +6395,33 @@ fn cmd_run_decode(
         1e3 / per.as_secs_f64() / 1e3
     );
     println!(
-        "  (CPU: rope+{}+norms+swiglu{}; NPU: {} w4gemvu{})",
+        "  (CPU: rope+{}+norms+swiglu{}{}; NPU: {} w4gemvu{})",
         if npu_attn {
             "kv-row-append"
         } else {
             "GQA-attention"
         },
+        if quad { "(last layer only)" } else { "" },
         if arch.qk_norm { "+qk-norm" } else { "" },
-        layers * 4 - if fused { 2 * layers - 1 } else { 0 },
-        if fused && npu_attn {
+        if quad {
+            layers + 2
+        } else if fused {
+            layers * 4 - (2 * layers - 1)
+        } else {
+            layers * 4
+        },
+        if quad && npu_attn {
+            format!(
+                " on CU0 + {} quad whole-layer on CU1 + 1 pair A on CU2 + {} flowkv attention on CU{fk_cu}",
+                layers - 1,
+                layers
+            )
+        } else if quad {
+            format!(
+                " on CU0 + {} quad whole-layer on CU1 + 1 pair A on CU2",
+                layers - 1
+            )
+        } else if fused && npu_attn {
             format!(
                 " on CU0 + {} fused rms-pairs on CU1 + {} flowkv attention on CU{fk_cu}",
                 2 * layers - 1,
