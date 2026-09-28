@@ -1638,3 +1638,62 @@ packed1 头部连续区 `[X0..X7 | blocks0..blocks7]`，tg1 每列改两次 fill
     FAIL 则 0x0e 在 x86+此代互联上另有条件（IOMMU/非 snoop 路由）。
     注意 ctrl-code BO 本身的一致性另算（amdxdna exec 路径 kernel 侧
     对 cmd BO 有 dma map，P20b 的首 exec 竞态与之相符）。
+
+## P24（2026-09-28⑤）axcache 移植实验：单改 AxCACHE 不充分，真变量是地址路径（host VA / SVM）
+
+P23-11 设计的三臂实验今天跑完，**结论是 FAIL 方向但价值更高**：排除了
+axcache 单因素，把 FLM 0-SYNC_BO 机制定位到 BD 的 64-bit 地址字段。
+
+1. **工具**：`tools/axcache_patch.py`（走 P23 校准的 per-op 尺寸规则，
+   对 shim BD 空间的 BLOCKWRITE 改 instr w9 = 0x02000000→0x0e000000，
+   留 `.ax02` 备份，`--restore` 复原）。四个 W4_SHAPES fixture 各
+   24/24 个 BD fill 全部命中并改写（8col 变体每 GEMV 24 个 BD）。
+2. **引擎闸门**：main.rs golden 循环两处 sync 加环境变量——
+   `XNPU_NO_IN_FLUSH`（跳过 submit 前输入 ToDevice clflush）、
+   `XNPU_NO_OUT_FLUSH`（跳过 exec 后输出 invalidate）。一次编译跑全部臂。
+3. **结果**（`run-w4layer build/w4 2 1`，golden 对拍 bf16 容差）：
+   - **A 基线**（patched + 双 flush）：4/4 PASS，worst rel err 0.00e0
+     ——0x0e 本身不破坏正确性（软件一致性下无害）
+   - **B1**（patched + 无输入 flush）：4/4 FAIL，rel err ~1.0
+     ——NPU 读到 DDR 旧数据，**MM2S 没有 snoop CPU 脏行**
+   - **B2**（patched + 无输出 invalidate）：qkv/o/down PASS、gateup
+     2 bad rows——"冷行侥幸"特征：CPU 从未缓存过的行从 DDR 读到新数据
+     恰好对，缓存过的行 stale。**S2MM 同样无硬件一致性**
+   - **B3**（双关）：4/4 FAIL（B1 ∪ B2 的并集症状）
+4. **BD 逐字 diff（关键发现）**：FLM 大流 BD vs 我们 patched qkv BD，
+   除 len/addr 外差两个字：
+   - FLM：`w5=0x15f80000, w6=0x0000789c` → 64-bit 值
+     **0x0000789c_15f80000 是 host 用户态 VA**（xdump trace 里
+     0x789b6c…… mmap 区间的邻居，512KB 对齐）
+   - 我们：`w5=w6=0`，地址由 DDR_PATCH 在 exec 时换成 firmware 从
+     arg handle 解析的 **device dma 地址**（0x4xxxxxx xdna 空间）
+   即 **FLM 把 mmap 的 SHMEM BO 的 host VA 直接烧进 BD**，DMA 地址
+   与 CPU 视角同地址。FLM ctrl blob 每 token 重建（create_bo 51532B/
+   轮）正是为了每轮把当前 VA 烧进去。
+5. **内核侧佐证**：amdxdna Kconfig `depends on AMD_IOMMU` +
+   `select HMM_MIRROR`；本机 7.0.0-31 amdxdna.ko（zstd 解包 strings）
+   含 `mmu_interval_notifier_insert_locked / mmu_interval_read_begin`
+   ——HMM interval notifier 机制在跑：驱动把 CPU 页表变更镜像给
+   NPU SMMU，device 可按 host VA 翻译并 snoop 一致访问。
+6. **机制修正（覆盖 P23-10 的单因素表述）**：0-SYNC_BO =
+   **host-VA 寻址（SMMU/HMM 路径，一致性由硬件保证）** ＋
+   AxCACHE=0x0e（AXI cacheable+allocate hint，可能仍必要但**不充分**）。
+   我们走 device dma 地址路径 → non-coherent → 必须 clflush。
+   公开文档状态：AMD 无公开 BD 手册；唯一公开出处是 FLM 头文件
+   cache_flag_t 枚举（其口径还是 "QoS fields ex. AxCache"，
+   write_dma.hpp:242）。AxCACHE 语义本身是 AXI 标准（0x02=Modifiable
+   不可缓存，0x0E=Modifiable+RA+WA）。
+7. **工程含义**：不是"手动控制 NPU cache"，而是**换地址路径**——数据面
+   BO 用 host VA 烧 BD（绕开/改写对应 DDR_PATCH），一致性交给硬件，
+   clflush/SYNC_BO 整体删除。这也是 FLM 每 token 重建 ctrl blob 的
+   原因（VA 会变）。
+8. **P25 候选（SVM 移植）**：patcher 变体——把输入/权重 BO 的 mmap
+   VA 写进 BD w5/w6，同时让对应 DDR_PATCH 失效（或改 argoff 指到
+   哑地址），跳输入 flush 跑 golden：
+   - PASS → SVM 路径对 exec 包里 arg 解析路径不敏感，机制全量落地，
+     SYNC_BO 消除可进 E2E（P21 测的 clflush 面成本直接归零）
+   - FAULT/stale → 需找到驱动的 SVM opt-in（interval notifier 注册
+     在哪个 ioctl/mmap 路径上），读 mainline amdxdna 源码确认
+9. **遗留核对**：ctrl-code BO 自身一致性另算（P20b 首 exec 竞态）；
+   B2 的 gateup 2-row stale 提示输出 BO 生命周期里确有 CPU 缓存
+   残留（上轮 golden 读过的行），与冷行理论自洽。
