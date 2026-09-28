@@ -1399,3 +1399,59 @@ MMIO preactions(可在 MTL 上写 C 编 ACT-SHAVE)。不开放别追:固件二�
    （gates pass 后 timed iters 也 hang），quad 专属（fused 全天稳定），命中层随机
    （L12/L15/L29，seq 13/100/191）。疑点：5 task-group 链 / win1 re-read /
    BD slot 交互。→ P20。
+
+## P20（2026-09-28，IRON design_quad.py 未提交 + probe）：parked-Cs 设计修复
+
+1. 设计缺陷（tg3/tg4 跨 task-group 停留零 C）：fill-only 组（K=4 gate 窗口、
+   K=5 up 窗口、K=2 win2、K=1' re-read）各自在 depth-2 C fifo 里留下零 C，
+   等下一组的 drain 当 section dummy 消费 —— 这个跨组交接在 ~1-3%/exec 上
+   竞态失败（P19 指纹：整列 down/qkv chunk 缺失，首缺行总是 section 首数据行）。
+2. 修复 = 回到 pair 已证形态：**每组自带 fills + 自己的 drain（2F+1D）**。
+   tg3 drain glue3→padA 死区（GLUE_C3_OFF=15600）、tg4 drain glue4→padB
+   （24880）；C3 只盖 48 down blocks（+2 dummy 行保持 c_init 零）；C4 重排为
+   [K=3 头零 C | 24 blocks] = 25 组 @+2 dummy（block 0 落 row 48）——A4 头元素
+   的组内消费定律（与 C2 同型）。逐列元素收支 192/192 平衡。
+3. 自坑两枚：C4 第一次写成 blocks_q+3 dummies → qkv 移位一组（ZZZZ X×23 Z
+   指纹）；pytest "Mismatch in output[17]" 的索引列表是 qkv 幅度不是 o 行
+   （debug_quad 证 o bit-identical，勿信错误列表索引当 C 行）。
+4. 验证：pytest 5/5；quad_probe2（pyxrt 500-iter loop）clean。
+5. **E2E 仍 ~1.7%/exec hang** → 引擎路径专属，设计修复没碰到 → P20b。
+
+## P20b（2026-09-28②，xnpu main.rs/ert.rs）：引擎路径 hang/corruption 三周目
+   ——真凶=夹具陈旧（P13 复犯），XRT 线格式全档补录
+
+1. `run-quadloop`（引擎侧 standalone：单 PDI cu0、同 BO 反复 submit+wait、
+   与 iter0 快照逐字节比对）：plain 模式 ~10%/iter **静默腐蚀** + 偶发 hang
+   （wait 超时、C 全零 = exec 从头卡死）——零 host 写、同包同址，纯提交机制
+   复现 P19 症状。
+2. 站不住的假设逐一排除（都有实验）：`sleep` 2ms（hang it62，更糟）、`syncs`
+   （pyxrt 式 6 个整 BO To_DEVICE 屏障，div it70 —— 腐蚀指纹与 plain 同型
+   不同位）、`fresh`（每 iter 重建 ctrl BO+ERT 包，div it37）→ **非 host 时序、
+   非 posted-write、非包头/ctrl 复用**。
+3. 重建 M1 ioctl 拦截器（/tmp/xdump2，Rust cdylib：拦 ioctl+mmap，
+   CREATE_BO→GET_BO_INFO→mmap 链解析 handle→VA，EXEC_CMD 逐字节 dump +
+   链式子命令展开）抓 pyxrt 真包，**XRT 线格式全档**（比 M1 多一层）：
+   - ioctl：ty=0、cmd_count=1、cmd_handles=**内联句柄值**指向 224B **chain BO**
+     （opcode 19 = ERT_CMD_CHAIN、command_count=1、data[0]=真包 BO 句柄）；
+   - 真包（4KB BO）：opcode 0 ERT_START_CU + type 3，cu_mask=1，regmap
+     [3][instr xdna 0x4070000][**ninstr=4132=16528/4 WORDS**][5 张量 user VA]；
+   - args=[ctrl BO 句柄 + 5 张量句柄]（内核只作 pin，fw 只见 regmap）。
+   - 内核源码核对：single vs chain 单命令路径语义等价（fill_one_slot_cf 同一
+     邮箱 op），chain 包装不需要抄。
+   - 发现并修正 engine 侧 ninstr 单位错误（M1 起就传 bytes=4×；A/B 实测两种
+     值都 clean，fw 容忍，但 words 是 XRT 约定，5 处全改 + ert.rs 注释立档）。
+4. **决定性一击**：拦截器 dump 引擎自己的 ctrl BO —— **13904B，不是 16528B**。
+   `/home/nzinfo/qwen/xnpu/build` 夹具是 09:47 拷的**修复前** ctrl（13904B），
+   IRON/build 最终版 10:46 才落盘（16528B，pytest 编译）。**P20b 全部 bisect
+   都在跑旧设计**；"设计修复对 E2E 无效"的结论是错的。
+5. 重拷夹具（bin md5 382406be82b2、pdi 696f2256bbdd，chown+md5 对验）后：
+   - quadloop：plain **500 clean**（1012-1033µs/exec）+ xwrite/syncs/sleep/
+     fresh/data 各 300 clean（data 模式基线修正为奇偶双基线——X 扰动周期 2）；
+   - E2E `run-decode hy cpu quad`：4 次 12-iter 全 clean，gates 全过
+     （hidden 1.7%、argmax 25868、top-8 8/8），**hang 绝迹**。
+6. 教训入档：**"同输入不同结果"先查树状态（P13 定律第二次咬人）**；诊断工具
+   （xdump2）值得保留 —— 单看"数字对不对"永远查不到"跑的是哪份代码"。
+7. P20+A/B 性能台面（12-iter，全 PASS 零 hang）：split 41.30 / **fused 37.59**
+   （26.6 tok/s）/ quad **45.05**（22.2 tok/s，34 exec/token）。quad 回归
+   +7.5ms vs fused（P19 口径 43.76 是旧夹具 5-iter 数字）；已知抓手不变：
+   X 重写 2.5MB 整 BO clflush → 8×148KB、K=5 glue、层间流水。
