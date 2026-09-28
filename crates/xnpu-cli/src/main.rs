@@ -2912,6 +2912,11 @@ fn w4u_c_rows(m: usize, k: usize) -> usize {
 /// quantize_vector bit-exactly (RNE bf16 + round_ties_even f32), the
 /// goldens are computed against this exact (q, d).
 fn w4u_quantize_x(x_bits: &[u16], k: usize) -> (Vec<i8>, Vec<u16>) {
+    // P27-2: the hostprof microscope put quantize at 18ns/elem scalar
+    // (B:quant alone was 3.6ms/token). Bit-identical AVX-512 path below.
+    if std::arch::is_x86_feature_detected!("avx512f") {
+        return unsafe { w4u_quantize_x_avx512(x_bits, k) };
+    }
     assert!(k % 32 == 0 && x_bits.len() >= k);
     let n_groups = k / 32;
     let mut q = vec![0i8; k];
@@ -2939,6 +2944,64 @@ fn w4u_quantize_x(x_bits: &[u16], k: usize) -> (Vec<i8>, Vec<u16>) {
     (q, d)
 }
 
+/// P27-2: AVX-512 w4u_quantize_x — BIT-IDENTICAL to the scalar body (the
+/// torch quantize_vector contract golden is built on): amax as integer
+/// max over |f32 bits| (nonneg IEEE bit order == value order), IEEE
+/// `_mm512_div_ps` for x/df, `roundscale(0x00)` == f32::round_ties_even,
+/// clamp-then-saturate matching `r.clamp(-127.0,127.0) as i8`. The
+/// amax==0 group keeps the torch.where guard (q=0, d=0).
+#[target_feature(enable = "avx512f")]
+unsafe fn w4u_quantize_x_avx512(x_bits: &[u16], k: usize) -> (Vec<i8>, Vec<u16>) {
+    use std::arch::x86_64::*;
+    unsafe {
+        assert!(k % 32 == 0 && x_bits.len() >= k);
+        let n_groups = k / 32;
+        let mut q = vec![0i8; k];
+        let mut d = vec![0u16; n_groups];
+        let absmask = _mm512_set1_epi32(0x7fff_ffff);
+        for g in 0..n_groups {
+            // 32 bf16 lanes in one 512b load; widen both 16-lane halves
+            // to f32 by the exact bit shift.
+            let raw = _mm512_loadu_si512(x_bits.as_ptr().add(g * 32) as *const __m512i);
+            let lo = _mm512_slli_epi32(
+                _mm512_cvtepu16_epi32(_mm512_castsi512_si256(raw)),
+                16,
+            );
+            let hi = _mm512_slli_epi32(
+                _mm512_cvtepu16_epi32(_mm512_extracti64x4_epi64(raw, 1)),
+                16,
+            );
+            let m = _mm512_max_epi32(
+                _mm512_and_si512(lo, absmask),
+                _mm512_and_si512(hi, absmask),
+            );
+            let amax_bits = _mm512_reduce_max_epi32(m) as u32;
+            if amax_bits == 0 {
+                continue; // q stays 0, d stays 0 (torch.where guard)
+            }
+            let amax = f32::from_bits(amax_bits);
+            let d_bits = f32_to_bf16(amax / 127.0);
+            d[g] = d_bits;
+            let df = _mm512_set1_ps(bf16_to_f32(d_bits));
+            for (half, v) in [(0usize, lo), (16usize, hi)] {
+                let t = _mm512_roundscale_ps(
+                    _mm512_div_ps(_mm512_castsi512_ps(v), df),
+                    0x00,
+                );
+                let t = _mm512_min_ps(
+                    _mm512_max_ps(t, _mm512_set1_ps(-127.0)),
+                    _mm512_set1_ps(127.0),
+                );
+                let bytes = _mm512_cvtsepi32_epi8(_mm512_cvtps_epi32(t));
+                _mm_storeu_si128(
+                    q.as_mut_ptr().add(g * 32 + half) as *mut __m128i,
+                    bytes,
+                );
+            }
+        }
+        (q, d)
+    }
+}
 /// Build the ONE ELEM-sized activation element an op's X fill ships
 /// (v5: rides the A fifo, K header 0): q (ALL chunks) at 0..K, d bf16 at
 /// K_MAX, K=0 word at ELEM-8. Every column's X tap reads the same bytes.
@@ -2964,20 +3027,22 @@ fn w4u_read_c(cs: &[u8], k: usize, m: usize) -> Vec<u16> {
     let chunks = w4u_chunks(k);
     let section = (w4u_blocks(m, k) + 2) * W4U_TILE_ROWS;
     let mut out = vec![0u16; m];
+    // P27-2: the byte-assembly loop was the read path's real cost — the
+    // BO mapping is u16-aligned (page base, even offsets), so reinterpret
+    // once and let chunks==1 collapse to per-column memcpys.
+    let cs16: &[u16] =
+        unsafe { std::slice::from_raw_parts(cs.as_ptr() as *const u16, cs.len() / 2) };
     for col in 0..8 {
-        let base = (col * section + W4U_TILE_ROWS) * 2;
-        for w in 0..rpc {
-            let o = col * rpc + w;
-            if chunks == 1 {
-                let off = base + w * 2;
-                out[o] = u16::from_le_bytes([cs[off], cs[off + 1]]);
-            } else {
-                let mut acc = 0f32;
-                for c in 0..chunks {
-                    let off = base + (c * rpc + w) * 2;
-                    acc += bf16_to_f32(u16::from_le_bytes([cs[off], cs[off + 1]]));
+        let base = col * section + W4U_TILE_ROWS;
+        if chunks == 1 {
+            out[col * rpc..][..rpc].copy_from_slice(&cs16[base..][..rpc]);
+        } else {
+            for w in 0..rpc {
+                let mut acc = bf16_to_f32(cs16[base + w]);
+                for c in 1..chunks {
+                    acc += bf16_to_f32(cs16[base + c * rpc + w]);
                 }
-                out[o] = f32_to_bf16(acc);
+                out[col * rpc + w] = f32_to_bf16(acc);
             }
         }
     }
@@ -4596,11 +4661,85 @@ fn add_bf16(a: &[u16], b: &[u16], out: &mut [u16]) {
 
 /// silu(gate)*up for a fused [gate | up] vector.
 fn swiglu_bf16(x: &[u16], out: &mut [u16]) {
+    if std::arch::is_x86_feature_detected!("avx512f") {
+        return unsafe { swiglu_bf16_avx512(x, out) };
+    }
     let half = x.len() / 2;
     for i in 0..half {
         let g = bf16_to_f32(x[i]);
         let u = bf16_to_f32(x[half + i]);
         out[i] = f32_to_bf16(g * (1.0 / (1.0 + (-g).exp())) * u);
+    }
+}
+
+/// AVX-512 flavor of swiglu (P27-2): sigmoid rides the same 6-term
+/// ln2-series poly as attention_avx512 (drift vs libc expf ~1e-7 relative,
+/// far below the bf16 grain); the IEEE division and the RNE bf16 store
+/// (bit-trick, same integer ops as the scalar f32_to_bf16) keep everything
+/// else bit-identical. Golden gates arbitrate the sigmoid drift.
+#[target_feature(enable = "avx512f")]
+unsafe fn swiglu_bf16_avx512(x: &[u16], out: &mut [u16]) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let half = x.len() / 2;
+        let log2e = 1.4426950408889634f32;
+        let c1 = 0.6931471805599453f32;
+        let c2 = 0.2402265069591007f32;
+        let c3 = 0.0555041086648216f32;
+        let c4 = 0.009618129107628477f32;
+        let c5 = 0.0013333558146428443f32;
+        let c6 = 0.0001540353039338167f32;
+        let one = _mm512_set1_ps(1f32);
+        let lo80 = _mm512_set1_ps(-80f32);
+        let hi80 = _mm512_set1_ps(80f32);
+        let bias = _mm512_set1_epi32(0x7fff);
+        let lsb = _mm512_set1_epi32(1);
+        let mut i = 0;
+        while i + 16 <= half {
+            let conv = |p: *const u16| -> __m512 {
+                _mm512_castsi512_ps(_mm512_slli_epi32(
+                    _mm512_cvtepu16_epi32(_mm256_loadu_si256(p as *const __m256i)),
+                    16,
+                ))
+            };
+            let g = conv(x.as_ptr().add(i));
+            let u = conv(x.as_ptr().add(half + i));
+            // sigmoid(g) = 1/(1+exp(-g)); exp poly on clamped z=-g.
+            let z = _mm512_min_ps(
+                _mm512_max_ps(_mm512_sub_ps(_mm512_setzero_ps(), g), lo80),
+                hi80,
+            );
+            let zn = _mm512_mul_ps(z, _mm512_set1_ps(log2e));
+            let n = _mm512_roundscale_ps(zn, 0x00); // RNE
+            let f = _mm512_sub_ps(zn, n);
+            let p = _mm512_fmadd_ps(_mm512_set1_ps(c6), f, _mm512_set1_ps(c5));
+            let p = _mm512_fmadd_ps(p, f, _mm512_set1_ps(c4));
+            let p = _mm512_fmadd_ps(p, f, _mm512_set1_ps(c3));
+            let p = _mm512_fmadd_ps(p, f, _mm512_set1_ps(c2));
+            let p = _mm512_fmadd_ps(p, f, _mm512_set1_ps(c1));
+            let p = _mm512_fmadd_ps(p, f, one);
+            let e = _mm512_castsi512_ps(_mm512_add_epi32(
+                _mm512_castps_si512(p),
+                _mm512_slli_epi32(_mm512_cvtps_epi32(n), 23),
+            ));
+            let sig = _mm512_div_ps(one, _mm512_add_ps(one, e));
+            let r = _mm512_mul_ps(_mm512_mul_ps(g, sig), u);
+            // f32->bf16 RNE: bias = 0x7fff + ((b>>16)&1); (b+bias)>>16.
+            let rb = _mm512_castps_si512(r);
+            let b = _mm512_add_epi32(
+                rb,
+                _mm512_add_epi32(bias, _mm512_and_si512(_mm512_srli_epi32(rb, 16), lsb)),
+            );
+            let h16 = _mm512_cvtepi32_epi16(_mm512_srli_epi32(b, 16));
+            _mm256_storeu_si256(out.as_mut_ptr().add(i) as *mut __m256i, h16);
+            i += 16;
+        }
+        while i < half {
+            let g = bf16_to_f32(x[i]);
+            let u = bf16_to_f32(x[half + i]);
+            out[i] = f32_to_bf16(g * (1.0 / (1.0 + (-g).exp())) * u);
+            i += 1;
+        }
     }
 }
 
@@ -6362,10 +6501,15 @@ fn cmd_run_decode(
             {
                 let (_, map) = &mut live_fused[ci];
                 let bytes = map.as_mut_slice();
-                for j in 0..2048 {
-                    bytes[r0 + j * 2..r0 + j * 2 + 2]
-                        .copy_from_slice(&res[j].to_le_bytes());
-                }
+                // P27-2: u16 reinterpret — the C BO is page-aligned and r0
+                // is even, so the residual staging is one slice copy.
+                let b16: &mut [u16] = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        bytes.as_mut_ptr() as *mut u16,
+                        bytes.len() / 2,
+                    )
+                };
+                b16[r0 / 2..][..2048].copy_from_slice(res);
             }
             let (bo, map) = &live_fused[ci];
             sync_to_device(bo, map, r0, 4096);
@@ -6399,14 +6543,15 @@ fn cmd_run_decode(
             let o1 = w4u_read_c(cs, k1, 2048);
             add_bf16(res, &o1, out1);
             // op2 sections: past the window, per column section2 rows, data
-            // after the 2 dummy 16-row glue elements.
+            // after the 2 dummy 16-row glue elements (P27-2: per-column
+            // slice copies on the u16 view — same layout, memcpy speed).
+            let cs16: &[u16] = unsafe {
+                std::slice::from_raw_parts(cs.as_ptr() as *const u16, cs.len() / 2)
+            };
             let rpc2 = m2 / 8;
             for col in 0..8 {
-                let base = (W4UF_WINDOW_ROWS + col * section2 + 2 * W4U_TILE_ROWS) * 2;
-                for r in 0..rpc2 {
-                    let off = base + r * 2;
-                    out2[col * rpc2 + r] = u16::from_le_bytes([cs[off], cs[off + 1]]);
-                }
+                let base = W4UF_WINDOW_ROWS + col * section2 + 2 * W4U_TILE_ROWS;
+                out2[col * rpc2..][..rpc2].copy_from_slice(&cs16[base..][..rpc2]);
             }
         });
         true
