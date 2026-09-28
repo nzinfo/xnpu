@@ -1945,3 +1945,37 @@ top-8 8/8。
 wait 比流地板多 ~8ms（exec 结构）+ lm_head 3.1 vs FLM 2.66 + attention
 1.6ms（上设备的前提是 quad-v2/编排）。P27-3（链化/更深融合）才是杠杆 3
 的本体。
+
+### P27-3a（2026-09-29④）单 CU 全 fused-PDI：翻转税消灭，−1.8ms
+
+**假设**：P18 补记的结构性翻转税（每 token 2×~500µs，fused 对 CU1 /
+plain 算子 CU0 两 PDI 异 CU）能否消除？关键观察：**plain 与 fused PDI
+编译自同一份 w4gemvu.cc**——fused 内核的 K 头 dispatcher 保留了 plain
+口味（K=0 X 元素 staging、K=2048 compute），plain ctrl bin 只是数据。
+两 PDI 的 partition JSON 结构相同（仅 uuid/文件名），BD 空间/fifo L1 地址
+一致（design_fused 的 tg1 本来就是 plain 组的形状）。
+
+**实验**：fused cpu 模式只配一个 CU（fused PDI），全部 66 exec 走 cu 0
+——cu_mask 永不翻转。**板上一次通过**：hidden rms 0.0447、lm rel_rms
+0.0223、argmax/top-8 与双 CU **逐位相同**。interleaved A/B（热板 3 轮）：
+two-CU 32.05/33.17/30.76 → one-CU **30.09/30.64/29.87**（−1.8ms 稳定；
+lm 段 3076→2690µs = 回到无税 solo）。默认开启，XNPU_TWOCU=1 复旧。
+
+**教科书点**：PDI 只是内核 ELF 载体，ctrl code 是数据；K 头自描述派发
+使一个 PDI 成为整个算子族的通用执行器。「CU 分工」是调度选择不是语义
+约束——翻转税来自 fw 对 cu_mask 变化的 PDI 重载，与算子归属无关。
+
+### P27-3 后的差距坐标（one-CU 热批 ~30.1ms vs FLM 21.44）
+
+| 项 | 我们 | 地板/FLM 坐标 |
+|---|---|---|
+| A:wait | 14.7ms（460µs/对，16.5MB → 35.9GB/s） | 338µs@48.9 |
+| B:wait | 10.9ms（350µs/对，10.7MB → 30.5GB/s） | 218µs@48.9 |
+| lm | 2.69ms | ~2.65（53GB/s，已在墙） |
+| host（attn+read+quant+swiglu） | ~2.9ms | FLM ~2.5（重叠） |
+
+设备 27.2MB/层在 810µs = **33.6GB/s 聚合**，而 FLM 层 exec ~480-585µs =
+47-56GB/s、P12 无 B 探针边际 55.6。**剩余差距的主形态不是 per-exec 固定
+成本（~30µs×2/层，FLM 同量级），是 pair exec 内部的流速率**（33.6 vs 47）。
+下一刀 = pair 填充率地板探针（v5s 技术：K 头打垃圾走零行路径，同 ctrl
+形状量纯 fill 地板），判 fill 机器（BD 尺寸/组边界）还是计算暴露。
