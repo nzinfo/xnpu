@@ -1875,3 +1875,73 @@ submit→syncobj-wait 为设备主导）：
 swiglu 763 + B:quant 3563 = **−4.3ms**；随后 A:quant/attn/read 的 SIMD 化
 再收 ~2ms；剩下的 ~8ms 设备固定成本要靠 P27-3 链化/更深融合。FLM 每层
 585µs vs 流地板 555µs（+30µs 固定）是我们 exec 结构差距的坐标。
+
+### P27-2 设计研究（2026-09-29②，先算账后动刀）
+
+读 design_fused.py / design_quad.py 全文，把「pair B' = swiglu 上设备」
+推到可实施级，然后**被自己的账否决**：
+
+1. **可行设计（cut the quad in half）**：pair A' = quad 的 tg1+tg2（C 扩成
+   padded gate/up 布局 [win1 9280 | gate 6272 | padA 3008 | up 6272 |
+   padB 3008] = 27840 行）；pair B' = tg3/tg3b/tg4/tg4b（rt.sequence
+   (A_down, A_qkv, C_B, C_A) 四张量 + ctrl = 5 BO 上限满足，X BO 消失，
+   宿主 residual2 写入不需要——stage1r 重读 cA 的 win1 导出 h2'=x+o）。
+   flag 生命周期 exec 内闭合（K=5 set → K=2 离开 → K=1 重读清零），零内核
+   改动，口味全在 P19b 机器里。
+2. **账（否决理由）**：quad 实测 1087µs/层 vs pair A+B 914µs = **+173µs/层
+   设备罚金**（≈+5.4ms/token），吃掉 −4.4ms 宿主节省的大半。swiglu 上设备
+   的正收益前提是 quad-v2 编排把整层压回 ~600µs——那是杠杆 3 的本体。
+3. **fill-hoisting 结构性不可能**：想把 op2 权重提前塞进 tg1 的 fifo——
+   fifo 顺序 = 消费顺序（K=1 窗口必须先于 K=3 元素，而 K=1 的源是 C 的
+   drain 输出）；单列 depth-2 fifo（2-fifo 被 L1 挡死：4×18560 > 64KB tile）
+   决定了 ~120µs/pair 的固定成本搬不走。
+
+**裁决：转 P27-2b（host SIMD 包）**——同一笔钱（−4.3ms 目标）零设备风险。
+
+### P27-2b（2026-09-29③）host SIMD 包：−2.5ms（interleaved A/B），量化位精确
+
+四刀（main.rs d9ea7d6）：
+
+1. **w4u_quantize_x_avx512**：按构造位精确——amax 用 |f32 bits| 的整数
+   max（非负 IEEE 位序=值序，P17-2 同款 trick）、amax==0 组守卫、
+   `f32_to_bf16(amax/127)` 留标量、`_mm512_div_ps` IEEE 精确除、
+   roundscale 0x00 = RNE、clamp 先于饱和 pack（与标量 round→clamp→cast
+   同序）。32 元素/组两拍 16-wide。
+2. **swiglu_bf16_avx512**：sigmoid 复用 attention_avx512 的 6 项 ln2 级数
+   poly（vs libc expf 漂移 ~1e-7 ≪ bf16 粒度）；除法与 RNE bf16 存储
+   （位 trick 向量化）逐位同标量。z∈[-80,80] clamp（sigmoid(±80) 已是
+   1/0 饱和区，poly 指数位加法在正常域）。
+3. **w4u_read_c**：chunks==1 改 u16 重解释 + 按列 copy_from_slice（C BO
+   页对齐、偏移偶——原逐字节拼装才是读路径真成本）；chunks==3 保持 f32
+   求和序（位不变）。
+4. **gemv_pair**：残差 staging 与 op2 section 循环同样改 u16 视图单次拷贝。
+
+**门**：hidden rms 0.0447（1.7%）与 lm rel_rms 0.0223 —— 与标量路径
+**完全相同**（bf16 舍入吸收了 sigmoid 的 1e-7 漂移）；argmax 25868 对、
+top-8 8/8。
+
+**A/B（P21-5 漂移定律下的严格口径）**：同一热板窗口内 old/new 交替
+（63bd542 worktree 重编译，绝对路径共享受夹具）：
+
+| | old | new |
+|---|---|---|
+| steady ms/token ×2 | 35.18 / 35.25 | 32.25 / 33.22 |
+| B:quant µs | 1417–1420 | 74–132 |
+| A:quant µs | 484–490 | 53–87 |
+| swiglu µs | 310–384 | 59–123 |
+| A:wait/B:wait | 16.0/11.7 ms | 16.0/11.3 ms（设备未动 ✓） |
+
+净 **−2.5ms**。P27-1 测的 B:quant 3563 是慢 CPU 批（18ns/elem），今天热
+批标量只要 1420（7ns/elem）——SIMD 化同时**消除了这些段对 CPU 频率的
+敏感**（冷批保护 ~4.3ms）。
+
+**板况新观察（P21-5 延伸）**：同日见 31→46ms 摆幅（同二进制）；间隔 20s
+的四连跑单调**变快**（37.6→34.7→32.4→32.0）——加热/唤醒方向，与 P7 记录
+的"跨批漂移"同源，根因仍未明。最优热批 30.98ms（32.3 tok/s）。
+
+**P27-2b 后的账（热批 ~32.3ms）**：A:wait 16.0 + B:wait 11.3 + lm 3.1
+（设备 30.4）+ attn 1.6 + reads 0.92 + quant 0.25 + swiglu 0.1 + 杂 0.3。
+宿主胶水只剩 ~3.3ms；**追平 FLM（21.44）的主战场完全在设备侧**——63 对
+wait 比流地板多 ~8ms（exec 结构）+ lm_head 3.1 vs FLM 2.66 + attention
+1.6ms（上设备的前提是 quad-v2/编排）。P27-3（链化/更深融合）才是杠杆 3
+的本体。
