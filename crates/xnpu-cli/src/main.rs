@@ -5537,7 +5537,21 @@ fn cmd_run_decode(
     // runs). Fused inserts the w4gemvuf PDI at slot 1 (flowkv -> 2); quad
     // inserts w4gemvuq at 1 AND the pair-A PDI at 2 (flowkv -> 3).
     let quad_cu: u32 = 1;
-    let pa_cu: u32 = if quad { 2 } else { 1 };
+    // P27-3a: ONE CU carrying the FUSED PDI for the whole token — the
+    // fused kernel is a superset (same w4gemvu.cc, K-header dispatch
+    // covers the plain K=0/K=2048 flavors; board-proven: gates
+    // bit-identical), so the plain ctrl bins (L0 qkv, tail down, lm)
+    // execute on it unchanged and the cu_mask NEVER flips — the
+    // ~2x500µs fw PDI-reload tax (P18 补记) is gone (interleaved A/B:
+    // -1.8ms/token). XNPU_TWOCU=1 restores the two-PDI wiring for A/B.
+    let onecu = std::env::var("XNPU_TWOCU").is_err() && fused && !quad && !npu_attn;
+    let pa_cu: u32 = if quad {
+        2
+    } else if onecu {
+        0
+    } else {
+        1
+    };
     let fk_cu: u32 = if quad {
         3
     } else if fused {
@@ -5564,6 +5578,8 @@ fn cmd_run_decode(
                     (ffx[0].0.as_slice(), 0),
                     (fk_fixture.0.as_slice(), 0),
                 ]
+            } else if onecu {
+                vec![(ffx[0].0.as_slice(), 0)]
             } else {
                 vec![(fixtures[0].0.as_slice(), 0), (ffx[0].0.as_slice(), 0)]
             }
