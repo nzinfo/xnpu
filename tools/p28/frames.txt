@@ -1,0 +1,90 @@
+00000000 <w4gemvu_layer_bf16>:
+00000000 <_ZL7lv_bodyPKhP8bfloat16>:
+00000070 <.LBB1_2>:
+00000080 <.LBB1_3>:
+000000c0 <.LBB1_6>:
+000000d0 <.LBB1_7>:
+000000e0 <.LBB1_8>:
+000000f0 <.LBB1_9>:
+00000110 <.LBB1_10>:
+00000120 <.LBB1_11>:
+00000140 <.LBB1_12>:
+00000000 <w4gemvu_layer_a>:
+00000000 <lv_fr1>:
+00000090 <.LBB3_1>:
+00000160 <.L_LEnd0>:
+00000000 <lv_fw1>:
+00000040 <.LBB4_1>:
+000000a0 <.L_LEnd1>:
+00000000 <lv_st1>:
+00000080 <.LBB5_1>:
+000000e0 <.L_LEnd2>:
+00000000 <lv_fr2>:
+00000070 <.LBB6_1>:
+000000d0 <.L_LEnd3>:
+00000000 <lv_fw2>:
+00000040 <.LBB7_1>:
+000000a0 <.L_LEnd4>:
+00000000 <lv_st2>:
+00000070 <.LBB8_1>:
+000000d0 <.L_LEnd5>:
+00000000 <lv_fr3>:
+00000090 <.LBB9_1>:
+000002a0 <.L_LEnd6>:
+00000000 <lv_st3>:
+00000080 <.LBB10_1>:
+000000e0 <.L_LEnd7>:
+00000000 <lv_cxn>:
+00000000 <_ZL8lv_k2048PKhP8bfloat16>:
+00000060 <.LBB12_2>:
+00000000 <_ZL8lv_xelemPKh>:
+       0: b6 70 00 00 00 02 00 20 00 f0 2c 00  	nopa	;		nopb	;		paddxm	 [sp], #0x40
+00000180 <.LBB13_1>:
+00000190 <.L_LEnd8>:
+     254: 3a 71 00 00 00 fe 3f 30 a2 00	st	 r8, [p0, #0];		paddxm	 [sp], #-0x40
+00000000 <_ZL9lv_xnelemPKh>:
+00000040 <.LBB14_1>:
+000000a0 <.L_LEnd9>:
+00000000 <_ZL11lv_rms_elemPKhj>:
+       c: c4 01 00 00 18 00    	paddxm	 [sp], #0xc0
+000000a0 <.LBB15_1>:
+00000150 <.L_LEnd10>:
+00000180 <.LBB15_3>:
+000003a0 <.LBB15_5>:
+00000600 <.LBB15_8>:
+00000630 <.LBB15_9>:
+     668: c4 01 00 00 e8 ff    	paddxm	 [sp], #-0xc0
+00000000 <_ZL11lv_gateelemPKh>:
+00000000 <_ZL9lv_upelemPKh>:
+       0: e1 00 00 70 00 00 00 02 00 5b 01 20 00 f0 2c 00      	nopa	;		nopb	;		nops	;		paddxm	 [sp], #0x40;		nopv	
+00000150 <.LBB17_2>:
+     188: c4 01 00 00 f8 ff    	paddxm	 [sp], #-0x40
+00000000 <_ZL11lv_downelemPKh>:
+      28: c4 01 00 00 08 00    	paddxm	 [sp], #0x40
+000000a0 <.LBB18_2>:
+00000110 <.LBB18_3>:
+     1a4: 3a 71 00 00 00 fe 3f 30 82 20	st	 r0, [p1, #0];		paddxm	 [sp], #-0x40
+00000000 <_ZL10lv_computePKhPKaPK8bfloat16PS3_>:
+      2e: ba 70 00 00 00 18 00 00 15 04	mova	r21, #0x20;		paddxm	 [sp], #0x300
+000000b0 <.LBB19_1>:
+00000360 <.L_LEnd11>:
+     444: 3a 71 00 00 00 e8 3f 50 82 40	vst.conv.bf16.fp32	 bmll0, [p2, #0x0];		paddxm	 [sp], #-0x300
+00000000 <_ZL14lv_build_arenaPKa>:
+00000090 <.LBB20_1>:
+000000f0 <.L_LEnd12>:
+00000000 <_ZL9lv_wgroupPK8bfloat16S1_fPf>:
+00000000 <_ZL14fused_sw_quantjPfPt>:
+      10: c4 01 00 00 50 00    	paddxm	 [sp], #0x280
+00000110 <.LBB22_2>:
+00000120 <.LBB22_3>:
+     2a4: 3a 71 00 00 00 ec 3f d0 84 e2	vst	 bmlh0, [p7, #0x40];		paddxm	 [sp], #-0x280
+00000000 <_ZL13fused_sw_amaxPKf>:
+00000060 <.LBB23_1>:
+000000b0 <.L_LEnd13>:
+00000000 <_ZL10fused_sw_xPKfPh>:
+00000060 <.LBB24_1>:
+00000130 <.L_LEnd14>:
+00000000 <_ZL12fused_sw_sigPK8bfloat16S1_Pf>:
+00000000 <_ZL9lv_sw_x32PKfPh>:
+00000050 <.LBB26_1>:
+000000a0 <.L_LEnd15>:

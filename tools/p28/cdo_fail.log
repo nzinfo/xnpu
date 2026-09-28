@@ -1,0 +1,65 @@
+============================= test session starts ==============================
+platform linux -- Python 3.14.4, pytest-9.1.1, pluggy-1.6.0
+rootdir: /home/nzinfo/qwen/xnpu/IRON
+configfile: pytest.ini
+plugins: typeguard-4.4.4
+collected 5 items
+
+iron/operators/w4gemvu/test_layerv2.py::test_layerv2[iter0] FAILED       [ 20%]
+
+=================================== FAILURES ===================================
+_____________________________ test_layerv2[iter0] ______________________________
+iron/operators/w4gemvu/test_layerv2.py:337: in test_layerv2
+    errors, latency_us, _ = run_test(
+iron/common/test_utils.py:89: in run_test
+    operator.context.compile_all()
+iron/common/aie_context.py:41: in compile_all
+    op.compile()
+iron/common/aie_base.py:167: in compile
+    comp.compile(compilation_rules, work_list)
+iron/common/compilation.py:631: in compile
+    success, artifacts = apply_rules(rules, remaining)
+                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+iron/common/compilation.py:618: in apply_rules
+    artifacts = rule.compile(artifacts)
+                ^^^^^^^^^^^^^^^^^^^^^^^
+iron/common/compilation.py:435: in compile
+    raise RuntimeError(
+E   RuntimeError: MLIR compilation for /home/nzinfo/qwen/xnpu/IRON/build/w4gemvu_layerv2_8.mlir failed: [AIE ERROR] _XAie_LoadProgMemSection():231: Overflow of program memory
+E   XAie_LoadElf failed with XAIE_INVALID_ELFTraceback (most recent call last):
+E     File "/home/nzinfo/.venvs/npu314/lib/python3.14/site-packages/mlir_aie/bin/aiecc.py", line 12, in <module>
+E       main()
+E       ~~~~^^
+E     File "/home/nzinfo/.venvs/npu314/lib/python3.14/site-packages/mlir_aie/python/aie/compiler/aiecc/main.py", line 2164, in main
+E       run(module_str)
+E       ~~~^^^^^^^^^^^^
+E     File "/home/nzinfo/.venvs/npu314/lib/python3.14/site-packages/mlir_aie/python/aie/compiler/aiecc/main.py", line 2132, in run
+E       asyncio.run(runner.run_flow())
+E       ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
+E     File "/usr/lib/python3.14/asyncio/runners.py", line 204, in run
+E       return runner.run(main)
+E              ~~~~~~~~~~^^^^^^
+E     File "/usr/lib/python3.14/asyncio/runners.py", line 127, in run
+E       return self._loop.run_until_complete(task)
+E              ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+E     File "/usr/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+E       return future.result()
+E              ~~~~~~~~~~~~~^^
+E     File "/home/nzinfo/.venvs/npu314/lib/python3.14/site-packages/mlir_aie/python/aie/compiler/aiecc/main.py", line 1937, in run_flow
+E       await self.run_flow_for_device(
+E       ...<8 lines>...
+E       )
+E     File "/home/nzinfo/.venvs/npu314/lib/python3.14/site-packages/mlir_aie/python/aie/compiler/aiecc/main.py", line 2017, in run_flow_for_device
+E       await self.process_cdo(input_physical_with_elfs_str, device_name)
+E     File "/home/nzinfo/.venvs/npu314/lib/python3.14/site-packages/mlir_aie/python/aie/compiler/aiecc/main.py", line 1094, in process_cdo
+E       aiedialect.generate_cdo(
+E       ~~~~~~~~~~~~~~~~~~~~~~~^
+E           input_physical.operation, self.tmpdirname, device_name
+E           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       )
+E       ^
+E   ValueError: Failed to generate cdo because:
+=========================== short test summary info ============================
+FAILED iron/operators/w4gemvu/test_layerv2.py::test_layerv2[iter0] - RuntimeE...
+!!!!!!!!!!!!!!!!!!!!!!!!!! stopping after 1 failures !!!!!!!!!!!!!!!!!!!!!!!!!!!
+============================== 1 failed in 1.70s ===============================

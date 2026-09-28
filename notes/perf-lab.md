@@ -2238,3 +2238,144 @@ C[w]=pred(w)+1 五连中 = 两件事同时被证明：(1) 蛇形环 8 边全部�
 环元素应取 per-worker chunk（2048/8=256 bf16=512B，depth-2，每 tile
 2 个环 fifo 仅 ~2KB L1），gather = 8 圈循环转发。L1 预算让给权重流
 （2×18560B）与胶水 staging。下一刀 = P28 本体（design_layerv2）。
+
+## P28-4（2026-09-29⑩）layer-v2 上板：PMEM 清剿 → 数值 3982 错 → 对齐律根因 → 5/5 PASS 全记录
+
+**终点先行**：`test_layerv2` **5/5 PASS**，warmed **777-836µs/exec
+（33.8 GB/s 有效权重流）**，`.text` 15616/16384B，最大 `paddxm` 帧
+0x300 ≤ 0x400。一次 exec = 完整一层（o→x'→rms2→gate/up→swiglu→sw
+gather→down→xn1 gather→rms1→qkv→xn1 drain），8 worker 各 186 元素
+A 流 + 40 元素 C 流，三次 all-gather 全走 core↔core ring，零 C→DDR
+往返。这一节把整个调试过程留痕——教科书素材密度最高的一节。
+
+### 4a. PMEM 溢出与软浮点清剿（上板第一墙）
+
+首编译直接 `Overflow of program memory`（cdo_fail.log 存档于
+tools/p28/）。16KB PMEM 里塞着：11 个内核口味 + aiecc wrapper 胶水
+（~3.05KB，P19b 定律）+ **编译器偷偷链接的软浮点库**。三条新定律：
+
+1. **peano 无标量 FPU**：标量 `float` 乘法 = `__mulsf3` 软调用。
+   fused_rsqrt 的 3 轮 Newton × 3 乘就够把整段拉爆。修法：Newton
+   迭代整体搬上向量单元（32 路 broadcast + `aie::mul/sub`，正确舍入
+   → 与 golden 的 np.float32 标量链 bit-identical）。**推论：AIE 上
+   标量浮点不是"慢"，是"不存在"——要浮点就上向量，哪怕只用 1 lane**。
+2. **LLVM  reciprocal-mul 陷阱**：`sumsq / 2048` 被合法改写成乘
+   2⁻¹¹ 精确倒数——但那 ONE 个软乘是最后一个 `__mulsf3` 调用点。
+   同样搬向量（对法向数精确，epsilon 加法吃掉 denormal 尾巴）。
+3. **aie::div 返回 accum**（它是 `mul(a, inv(b))`，mul 产出 accum）；
+   `store_v` 模板推导需要显式 `.to_vector<float>()`——赋值场景隐式
+   转换能编，store_v 场景不能。两个除法（amax/127、1/d）上向量
+   `aie::div` 后 `__divsf3 + __muldi3`（~1.2KB）整体退出链接。
+   代价 ~1-2ulp（db 本来就是 bf16 粒度，黄金带内不可见）。
+4. **unroll 定律**：aiecc 的 LLVM opt（-O2）**完全展开 ≤16 trip 的
+   scf.for，≥48 trip 保持 rolled**。22 个内核调用点 × 小循环展开
+   把 wrapper 单独推到 10896B。修法：全部循环改 48+ trip + `scf.if`
+   守卫选活迭代（rolled loop + branch，永不展开）；真元素 ≥48 的
+   段裸跑。浪费的守卫迭代是纯本地比较/分支，零 fifo 流量。
+
+尺寸考古（tools/p28/frames.txt + final.dis）：逐函数 .text 之和
+11984B + 胶水 ≈ 15.6KB，留 ~770B 余量。
+
+### 4b. 数值链 3982 错：假设树与逐层排除（echo 方法学）
+
+PMEM 修完后上板：latency 777-828µs 正常，**output 3982/5120 错**，
+全在 xn1 段（qkv 段严格带全过——这条线索后来成为破案支点）。
+板况漂移定律（P21-5）照旧：同 binary 同 warmed 窗口内错数
+3981-5120 波动，ulp 级非确定性存在。
+
+**echo 方法学（本节的核心工具）**：`lv_cxn` 的固定 16 元素 C drain
+（512B）被临时征用为探针窗口，改它 echo 内部任意 .bss 状态；dump
+的是最后一次迭代（5 次迭代覆盖写）。快照暂存必须尊重 liveness：
+arena2 在首个 down 重建时死；K=102 重建 arena；lv_shared 的 x' 在
+gate/up 窗口复用（overlay）时死；lv_o/lv_xn 活到 fr3；lv_dacc 在
+K=0 清零、down 逐块累加。**每次只换一个探针，其他分析块全部作废
+重跑**——旧分析块对新 dump 输出 nan/垃圾是常态。
+
+排除链（每步一个假设，编号留痕）：
+
+1. **ring 错位假设全灭**：sim.py 对 ring1/2/3 全部 ±1 shift 组合
+   打分，全部比零假设差 → 不是 gather 顺序错。
+2. **implied-dacc 逐 tile 匹配**：act_xn1 − x' 与 golden dacc 的
+   16 行 tile 位置对得上 → 数值在位损坏，不是搬运错位。
+3. **qkv 路径 bit-perfect**（决定性）：从 act_xn1 反推链重算 qkv，
+   与 act_qkv 差 0.1；与 golden 差同一量级 → **ring3 槽位、位置映射
+   p=(w<4)?w:11−w、K=102 rms、量化、4a 的全部软浮点修复代码——
+   数值全对**。bug 只能在 dacc（sw→down 段）。
+4. **fixture 输入 bit-perfect**：X（q1/d1）、xn、w2、w1、186 个
+   K-header × 2 worker 全部 0 mismatch → 不是 host 侧打包错。
+5. **x'/o/q2/q3 逐个 echo 排除**：x' echo vs **f32-dequant 模型**
+   0/256 bit-exact；q2 复制体 44/512 翻转 = 纯 golden 舍入漂移
+   （模型间翻转 44=44 吻合）；q3 84≈82 同理 → **输入 sw 全净**。
+6. **hw-sigmoid 排除**：numpy 仿真 hw exp2（LOG2E、bf16(exp2)、
+   f32 div）= golden 精确 0/512 差 → sigmoid 不是缺口。
+7. **只剩 d3 scales**：lv_sw[6144,6528) echo → **vs f32-model
+   40/192、vs golden 131/192 位错**——全链唯一没验证过的工件。
+
+### 4c. 对齐律：损坏指纹 → 反汇编 → 定律
+
+损坏指纹（g = 24p+k 全局组号，byte 偏移 48p+2k）：
+
+- 错位 g ∈ {16-23, 32-39, 80-87, 128-135, 176-183} = **slot0 的
+  k16-23（持有 k0-7 值的副本）+ 奇数 slot {1,3,5,7} 的 k8-15（全零，
+  从未被写）**。
+- 字节级：五个 16B 窗口**精确起始于 32B 边界**（rel 6144 偏移
+  32/64/160/256/352）。偶数 slot 的 k16-23 被写坏后又被同环内对齐
+  的后继 store 修复（环序 r=1..7 存 slot (p−r)&7，奇 slot 的截断
+  store 砸前一个偶 slot，紧随的偶 slot 对齐全量 store 又覆盖修复）；
+  唯 slot0 是最后一个（r=7 存 slot1）砸的，无人修复。
+- 奇 slot 的 k0-7 是**对的**——因为截断读的第二半恰好是自己的 k0-7。
+
+**反汇编实锤**（系统 objdump 报 "architecture UNKNOWN"、
+llvm-objdump-18/21 报 "can't find target"——正确工具 =
+`llvm-aie/bin/llvm-objdump`，mlir_aie/peano 工具链自带）：
+
+`lv_fr2` 尾部（`lv_st2` 同构）：`padda [p1], m0`（m0=p×48）后
+`vldb wh0, [p1, dj0]`（dj0=0x1800）——256-bit load 的
+`[指针, 流偏移]` 硬件形态，地址 = lv_sw+6144+48p。**奇 p 时
+≡16 (mod 32)——该形态在自然边界外无定义行为，硬件截断到 32B
+边界**：load 读到 [48p−16, 48p+16) 窗，store 写 [48s−16, 48s+16)
+窗 → 前一 slot 的 k16-23 被砸、本 slot k8-15 永不写。代码里唯一
+的 16B 形态（`load_v<8>(sc+16)` → `vldb.128` @ +32）恰好是唯一
+干净的部分——16B op 在 16B 对齐地址直接证明可用。
+
+> **AIE 向量对齐律（新增，入 ledger）**：`aie::load_v<N>/store_v<N>`
+> 要求自然对齐（32B 向量→32B，16B→16B），`[ptr, stream-off]` 硬件
+> 形态对齐外地址**截断到自然边界而非报错**。**紧凑子区域的
+> per-position 步长（48B）会静默违反它**——q 区安全纯属
+> 768≡0 (mod 32) 的巧合。修复 = 三段 16B op（48p ≡ 0 mod 16 恒成立）；
+> 反汇编验证 peano **不会**把相邻 16B op 重合并回 32B（三个
+> `vldb.128/vst.128` 原样落地）。每个函数 +16B，总 .text +32B。
+
+**修后**：scale echo vs f32-model **0/192**；qkv 段 0/384 × 8
+worker；总错数 3982 → **5**。
+
+### 4d. 残余 5 错 = golden 模型缺口，非硬件错
+
+5 个幸存错全部 xn1 行、全部 ⊂ f32-模型预测的 12 个幸存者。根因：
+reference.py 的 `W_dequant = (q*scale).to(torch.bfloat16)` ——
+golden 把反量化权重多舍入了一次 bf16，而设备做的是精确 int32 点积
+× f32 scale（4a/4b 已证设备与 f32-dequant 链 bit-exact）。四级量化
+链上这个 2⁻⁹/项 的差异复利：x' 1-ulp → q2 ±1（9%）→ q3 ±1（16%）
+→ xn1 ~216-272 绝对漂移，超过 loose 带 max(0.08|exp|, 200)。
+
+处理 = test_fused 先例：**golden 设备忠实化**（`_deq_f32`：packer
+的组数学原样、去掉最后那次 bf16 舍入；fixture 字节仍走 packer）。
+修后 **5/5 PASS**。loose 带 200 保留给真正的 hw-sigmoid 偏差
+（P19b 测过 rms 归一后 ≤0.75 绝对——正是该带的设计对象）。
+
+### 4e. 账本与下一刀
+
+- 一次 exec = 8 worker × 186 元素 × 18560B ≈ 27.6MB 权重流，
+  826µs ≈ **33.8 GB/s 有效带宽**（shim DMA 实测历史 10-25，此为
+  8 路并发的新高）。FLM 21.44ms/token ÷ 32 层 ≈ 670µs/层全含
+  （注意力+host）→ **每层带宽已近持平，差距在层外**：exec 边界
+  ×32、flowkv 注意力、lm_head、host 串行。
+- `.text` 15616/16384B（余 768B），max frame 0x300/0x400，
+  .bss 21184B/tile（设计值），worst tile L1 64768/65536。
+- **P28-5 = host E2E 集成**（run-decode：~33 exec/token + lm_head，
+  res fill 源 = 上一 exec 的 xn1 drain BO；exec 边界 ~30µs × 33
+  ≈ 1ms 可先吃掉，之后是层间流水/多层一组）。
+- 板况：5 迭代 warmed 窗口内 latency 777-836µs 波动；错数 ulp 级
+  波动同理（P21-5 漂移定律不变）。
+- 存档：tools/p28/（sim.py 假设机、dumps、修后 .o、PMEM 考古、
+  cdo_fail.log、README 含工具坑）。
