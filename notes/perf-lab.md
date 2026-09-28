@@ -2122,3 +2122,82 @@ C→DDR→window 往返。
 **留痕**：.hs/.hs2/.hs3 生成与校验逻辑全在 tools/hoist_probe.py（提交
 在本仓库）；A/B 日志 /tmp/p274/{o,h,g,s,t}*.log（会话后归档）；夹具
 已复原（md5 与原版一致）。
+
+## P28-1（2026-09-29⑧）persistent-worker 执行模型：IRON 原生就有 FLM 的机制
+
+P27-4 定论「组只能靠设计时不产生跨组数据依赖来减少」之后的第一个问题：
+层内全静态 fill 的执行模型长什么样？答案不需要发明——**IRON 自己的
+`iron/operators/swiglu_fused_decode` 就是 FLM 模型的原生实现**（README:
+"1.3x faster decode"，Llama 配置里的 dual-GEMV SiLU-mul 融合算子；中间
+向量经 inter-tile ObjectFifo 留在片上，消灭 DDR 往返）。本条把它的
+设计、npu_insts 证据、板上表现全量解剖。
+
+### 三大机制（npu_insts.mlir 实证，build/…4col.mlir.prj）
+
+1. **one-shot 巨型 BD**：每 exec 每 fifo 只有一个 blockwrite+address_patch+
+   push 三元组。整个 exec = 12 fill 三元组 + 4 drain 四元组（多一条
+   maskwrite + token push）+ **4 条 npu.sync** ≈ 52 条 ctrl 指令。单条
+   BD 的 repeat/stride 字段覆盖整列权重流（例
+   `dense<[1048576, 8388608, 0, 0, 0xC0000000, 33554432, 0, 33554432]>`
+   = len 0x100000 词、axcache 0xC0000000 aggressive、stride/repeat
+   0x2000000）。queue 从不排空 → 无重启成本。对照：我们 quad 480 指令/
+   48 TCT；FLM 一整层 1566 指令/309 TCT。
+2. **mid-flow 依赖全是核侧锁**：`aie.mem` 区域里 dma_bd 自环（bd_id
+   0↔1 = depth-2 L1 buffer）+ `aie.use_lock(AcquireGreaterEqual/Release)`。
+   shim→核 = shim 的 MM2S 流进消费核自己的 mem-DMA S2MM（锁流控）；
+   核↔核 ObjectFifo（inter_i）= 生产核 MM2S / 消费核 S2MM 同款机器。
+   整个 exec 只有末尾 4 条 npu.sync（最终 C drain 的 wait=True）。
+3. **persistent worker**：`for _ in range_(0xFFFFFFFF)`。核配置一次
+   （PDI），每 exec 只重跑 ~52 条 ctrl；worker 在 fifo acquire 上无限
+   阻塞，等下一个 exec 的新 BD 送元素进来。
+
+### 对 75µs/组 成本理论的修正（覆盖 P27-4 的表述）
+
+我们的组末 8 条 npu.sync 是**对真实 drain 完成的长等待**，每条付出
+poll 量子开销（~5-10µs × 8 ≈ 75µs/组）；FLM 的 309 TCT **立即 retire**
+（issue+wait 一个已完成的 token ≈ 免费）。消灭 DDR 往返 → 消灭长 TCT。
+与 P27-4 .hs2 异常自洽：一切提前 enqueue 仍 460µs——TCT 等待本身还在
+DPU 指令路径里，发行时序不是变量。
+
+### 板上验证（test_swiglu_fused_decode，sudo+prlimit 配方）
+
+- **机制跑通不挂死**：latency **1230.3µs**（2048×2048，25.2MB bf16
+  权重流 = **20.4GB/s 聚合**；4 列 × ~5GB/s/通道——他们只用 4/8 通道、
+  8KB L1 buffer）。
+- **3/2048 行 FAIL**：output[858] expected -160768 got **-32768**；
+  output[1384] expected 15040 got **32768**；output[1738] expected
+  109056 got 0.0。值钉在 ±32768（int16 饱和签名）→ 疑似他们内核的
+  stale-fifo/竞态或 nightly llvm-aie 回归。内核读码排除 accumulate
+  dtype 一因（accfloat + aie::mac 全程）。**判定为非机制问题，有意
+  搁置**：P28 写自己的内核（K-header 自描述口味已全在 P19b 机器里），
+  golden 门自控。backlog：查上游 IRON 修复。
+- 带宽判读：20.4 不是 persistent 模型的上限——4 列/8KB buffer 的选择；
+  我们 8 通道 + 18.5KB 元素在 55.1GB/s 器件墙上。persistent 不输带宽。
+
+### layer-v2 数据流设计（ring 拓扑，P28 本体的设计基线）
+
+- **跨列重分配不可避免**：rms 要全 2048 向量（M-split 每核 256）、
+  swiglu 要全 6144、rms1' 要 down 全输出。persistent 模型下没有
+  mid-flow TCT 可用 → 必须走核间流。FLM 侧证据：算力列零激活 BD。
+- **端口预算（决定拓扑）**：AIE2 每核 2 stream-in + 2 stream-out。
+  单核/列 RING（shim A in + shim C out + ring in + ring out）= 恰好
+  2+2 ✓。2 核/列（S1/S2 + inter fifo）超预算：S2 要 3 in（A2 + inter
+  + ring）✗。
+- **ring 自启动**：worker 循环序 [produce ring_out; then consume
+  ring_in]——prod acquire 只等空闲 buffer（depth-2 初始即可满足），
+  首轮无死锁。
+- 数据流：每 channel 静态 fill 全部 [X(attn_out), res(x_n), w2, o
+  blocks, w1, gateup blocks（gate/up 逐核交错 → swiglu 列内本地）,
+  down blocks, qkv blocks]；exec 末 drain qkv C + x_{n+1}；三次
+  all-gather 走 ring（o 输出、sw、down 输出）；gather 后每核冗余跑
+  glue（rms/量化）。**x_{n+1} 留设备**——下一 exec 的 res fill 源 =
+  上一 exec drain 落地的 BO 区（exec 边界 ~30µs 便宜，host 提交序
+  保证顺序）。
+- fallback（若 ring 放置/路由失败）：(a) 列内 inter fifo + 每层一次
+  跨列 DDR 往返（2 组 TCT/exec，~−4ms）；(b) 单组 + mid-group TCT
+  （~650-680µs/层 → ~24ms 设备，单独不够追平）。
+
+**P28-3 = ring 探针**（下一步）：8 worker 各 [shim A in, shim C out,
+ring in, ring out]，ring = ObjectFifo worker i → worker (i+1)%8，
+trivial parrot 内核，单组 fills + drain(wait=True)。放置成功 ≠ 路由
+成功——实际上板跑通才算数。
