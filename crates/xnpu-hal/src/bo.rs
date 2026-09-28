@@ -319,6 +319,104 @@ impl Mapping {
         // SAFETY: see as_slice.
         unsafe { slice::from_raw_parts_mut(self.ptr, self.len) }
     }
+
+    /// Write back and invalidate the cache lines covering
+    /// `[off, off+len)` — the user-space equivalent of
+    /// `BufferObject::sync` with `SyncDirection::ToDevice`, and (before
+    /// reading back device writes) of `FromDevice` too: CLFLUSH is
+    /// writeback+invalidate, so it both publishes host writes to DDR and
+    /// drops stale host lines so device-written DDR data is re-fetched.
+    ///
+    /// Why not the ioctl: P21-3 measured AMDXDNA_SYNC_BO at ~30us FLAT
+    /// regardless of range (4KB, 148KB and 2.5MB all ~30us) — the GEM
+    /// lookup + pin + page walk + unpin round trip dominates, the
+    /// drm_clflush itself is sub-3us even for the whole BO. A per-exec
+    /// sync budget is therefore an ioctl-COUNT budget, and this method
+    /// spends zero ioctls: the mmap'd VA hits the same physical lines
+    /// the kernel would flush (BO pages are locked — MAP_LOCKED here or
+    /// driver-pinned around submits — so no migration race). SFENCE
+    /// after the loop orders the writebacks before later stores/submits.
+    pub fn clflush_region(&self, off: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
+        debug_assert!(off.saturating_add(len) <= self.len);
+        // Round to containing lines: an unaligned head/tail just pulls
+        // neighboring lines into the flush, which is harmless.
+        let start = (self.ptr as usize + off) & !63;
+        let end = self.ptr as usize + off + len;
+        let f = clflush_picker();
+        // SAFETY: [start, end) lies within this mapping's live pages.
+        unsafe { f(start as *mut u8, end as *mut u8) }
+    }
+}
+
+/// CLFLUSHOPT line loop + SFENCE (the fast path when the CPU has it).
+/// Emitted via inline asm — the `_mm_clflushopt` intrinsic is still
+/// unstable (`simd_x86_clflushopt`), the instruction itself is
+/// Broadwell+/Zen1+.
+///
+/// # Safety
+/// `[start, end)` must lie within one live mapping, start <= end, both
+/// 64-byte aligned, and the CPU must have CLFLUSHOPT (see
+/// [`clflush_picker`]).
+unsafe fn clflushopt_range(start: *mut u8, end: *mut u8) {
+    let mut p = start;
+    while p < end {
+        // SAFETY: clflushopt takes a memory operand and only affects the
+        // containing line's cache state; `p` is a valid address within
+        // the mapping.
+        unsafe {
+            core::arch::asm!("clflushopt [{0}]", in(reg) p, options(readonly, nostack))
+        };
+        p = unsafe { p.add(64) };
+    }
+    // SAFETY: SFENCE orders the writebacks before later stores; no
+    // operands. Not `readonly` — it must not float past memory effects.
+    unsafe { core::arch::asm!("sfence") };
+}
+
+/// CLFLUSH fallback (self-serializing, so no fence needed). The
+/// `_mm_clflush` intrinsic IS stable.
+///
+/// # Safety
+/// Same contract as [`clflushopt_range`] minus the CPUID requirement.
+unsafe fn clflush_range(start: *mut u8, end: *mut u8) {
+    let mut p = start;
+    while p < end {
+        // SAFETY: see clflushopt_range.
+        unsafe { core::arch::x86_64::_mm_clflush(p as *const u8) };
+        p = unsafe { p.add(64) };
+    }
+}
+
+/// CPUID leaf 7 subleaf 0, EBX bit 23 = CLFLUSHOPT (manual detection —
+/// `is_x86_feature_detected!("clflushopt")` is also unstable).
+fn has_clflushopt() -> bool {
+    static HAS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *HAS.get_or_init(|| {
+        // SAFETY: CPUID has no preconditions on leaves 0/7.
+        unsafe {
+            let max = core::arch::x86_64::__cpuid(0).eax;
+            if max < 7 {
+                return false;
+            }
+            let r = core::arch::x86_64::__cpuid_count(7, 0);
+            (r.ebx >> 23) & 1 == 1
+        }
+    })
+}
+
+fn clflush_picker() -> unsafe fn(*mut u8, *mut u8) {
+    static PICK: std::sync::OnceLock<unsafe fn(*mut u8, *mut u8)> =
+        std::sync::OnceLock::new();
+    *PICK.get_or_init(|| {
+        if has_clflushopt() {
+            clflushopt_range
+        } else {
+            clflush_range
+        }
+    })
 }
 
 impl Drop for Mapping {

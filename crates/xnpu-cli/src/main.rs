@@ -1529,6 +1529,22 @@ fn cmd_run_pipe(gemm_prj: &str, m: usize, k: usize, n: usize, iters: usize) -> E
 
 /// Create one SHMEM tensor, fill it, sync it, park the (BO, mapping) pair in
 /// `live` so both outlive the experiment; returns its VA for the regmap.
+/// P21-3 ToDevice sync dispatch: user-space CLFLUSHOPT by default (the
+/// SYNC_BO ioctl measures ~30us FLAT regardless of range — a syscall
+/// round trip, not a flush), the ioctl when XNPU_IOCTL_SYNC=1 so both
+/// variants can be A/B'd from ONE binary back-to-back (the board's
+/// absolute exec time drifts across batches; only same-batch
+/// comparisons count — perf-lab P21-3).
+fn sync_to_device(bo: &BufferObject, map: &Mapping, off: usize, len: usize) {
+    use std::sync::OnceLock;
+    static IOCTL: OnceLock<bool> = OnceLock::new();
+    if *IOCTL.get_or_init(|| std::env::var("XNPU_IOCTL_SYNC").is_ok()) {
+        let _ = bo.sync(SyncDirection::ToDevice, off as u64, len as u64);
+    } else {
+        map.clflush_region(off, len);
+    }
+}
+
 fn chain_tensor(
     dev: &Device,
     live: &mut Vec<(BufferObject, Mapping)>,
@@ -3075,13 +3091,18 @@ fn c_bo_wait_dump(cm: &(BufferObject, Mapping), n: usize, it: u32) -> std::io::R
 /// rewrites it (same quantized activation in all 8 columns) before each
 /// submit; one whole-BO clflush covers all 8 copies.
 fn w4q_build_packed1(blocks: &[u8], blocks1: usize) -> Vec<u8> {
+    // P21-2 front-grouped: [X0..X7 | blocks_col0..col7]. The per-column
+    // fifo stream is still [X | 16 blocks] (two fills per column in the
+    // ctrl code), but the host's per-exec dirty set — the 8 X elements —
+    // is one contiguous 148KB run at the BO head, so seeding X costs one
+    // small region sync instead of flushing the 2.5MB weight BO.
     assert_eq!(blocks.len(), 8 * blocks1 * W4U_ELEM);
-    let per_col = (1 + blocks1) * W4U_ELEM;
-    let mut out = vec![0u8; 8 * per_col];
+    let x_region = 8 * W4U_ELEM;
+    let mut out = vec![0u8; x_region + 8 * blocks1 * W4U_ELEM];
     for col in 0..8 {
-        let base = col * per_col;
+        let dst = x_region + col * blocks1 * W4U_ELEM;
         let src = col * blocks1 * W4U_ELEM;
-        out[base + W4U_ELEM..base + per_col]
+        out[dst..dst + blocks1 * W4U_ELEM]
             .copy_from_slice(&blocks[src..src + blocks1 * W4U_ELEM]);
     }
     out
@@ -4787,16 +4808,52 @@ fn cmd_run_quadloop(iters: usize, mode: &str) -> ExitCode {
         Some(op) => op,
         None => return ExitCode::FAILURE,
     };
-    let seed_x = |live: &mut Vec<(BufferObject, Mapping)>, x: &[u16], it: usize| {
+    // P21-3 instrumentation: phase breakdown of the X seed (quantize+
+    // build vs memcpy vs SYNC_BO), averaged over the run. The sync size
+    // is steerable via mode suffix so the SAME loop measures 148KB vs
+    // whole-BO clflush cost directly (e.g. "xwrite" vs "xwrite-full").
+    let mut prof: [f64; 3] = [0.0; 3];
+    let mut prof_n: u32 = 0;
+    let sync_full = mode.ends_with("-full");
+    // "-noflush": user-space CLFLUSHOPT on the mapping instead of the
+    // SYNC_BO ioctl (P21-3: the ioctl is ~30us FLAT regardless of size —
+    // a syscall-count problem, not a byte problem).
+    let sync_noflush = mode.ends_with("-noflush");
+    let seed_x = |live: &mut Vec<(BufferObject, Mapping)>,
+                  x: &[u16],
+                  it: usize,
+                  prof: &mut [f64; 3]|
+     -> bool {
+        let ta = std::time::Instant::now();
         let (q, d) = w4u_quantize_x(x, 2048);
         let xe = w4u_build_x_elem(&q, &d, 2048);
+        let tb = std::time::Instant::now();
         let (bo, map) = &mut live[0];
         let bytes = map.as_mut_slice();
+        // P21-2: X elements front-grouped [X0..X7] — one contiguous
+        // 148KB dirty run, single region sync (was: whole-BO 2.5MB flush;
+        // 8 strided syncs measured slower — P21-1).
         for col in 0..8 {
-            let off = col * 17 * W4U_ELEM;
+            let off = col * W4U_ELEM;
             bytes[off..off + W4U_ELEM].copy_from_slice(&xe);
         }
-        if bo.sync(SyncDirection::ToDevice, 0, bo.size() as u64).is_err() {
+        let tc = std::time::Instant::now();
+        let sz = if sync_full {
+            bytes.len() as u64
+        } else {
+            (8 * W4U_ELEM) as u64
+        };
+        let r = if sync_noflush {
+            map.clflush_region(0, sz as usize);
+            Ok(())
+        } else {
+            bo.sync(SyncDirection::ToDevice, 0, sz)
+        };
+        let td = std::time::Instant::now();
+        prof[0] += (tb - ta).as_secs_f64() * 1e6;
+        prof[1] += (tc - tb).as_secs_f64() * 1e6;
+        prof[2] += (td - tc).as_secs_f64() * 1e6;
+        if r.is_err() {
             eprintln!("quadloop x sync failed (it {it})");
             return false;
         }
@@ -4809,7 +4866,9 @@ fn cmd_run_quadloop(iters: usize, mode: &str) -> ExitCode {
         for j in 0..2048 {
             bytes[r0 + j * 2..r0 + j * 2 + 2].copy_from_slice(&x[j].to_le_bytes());
         }
-        if bo.sync(SyncDirection::ToDevice, r0 as u64, 4096).is_err() {
+        if sync_noflush {
+            map.clflush_region(r0, 4096);
+        } else if bo.sync(SyncDirection::ToDevice, r0 as u64, 4096).is_err() {
             eprintln!("quadloop res sync failed");
             return false;
         }
@@ -4835,8 +4894,8 @@ fn cmd_run_quadloop(iters: usize, mode: &str) -> ExitCode {
                 let _ = bo.sync(SyncDirection::ToDevice, 0, bo.size() as u64);
             }
         }
-        if mode != "plain" && mode != "sleep" && mode != "syncs" && mode != "fresh" {
-            let x: Vec<u16> = if mode == "data" {
+        if !matches!(mode, "plain" | "sleep" | "syncs" | "fresh") {
+            let x: Vec<u16> = if mode.starts_with("data") {
                 x_bits
                     .iter()
                     .enumerate()
@@ -4845,9 +4904,10 @@ fn cmd_run_quadloop(iters: usize, mode: &str) -> ExitCode {
             } else {
                 x_bits.clone()
             };
-            if !seed_x(&mut live, &x, it) {
+            if !seed_x(&mut live, &x, it, &mut prof) {
                 return ExitCode::FAILURE;
             }
+            prof_n += 1;
             if !seed_res(&mut live, &x) {
                 return ExitCode::FAILURE;
             }
@@ -4881,10 +4941,20 @@ fn cmd_run_quadloop(iters: usize, mode: &str) -> ExitCode {
             let _ = c_bo_wait_dump(&live[4], 0, it as u32);
             return ExitCode::FAILURE;
         }
-        // FromDevice + divergence check vs iter 0 (silent-corruption catch).
+        // FromDevice + divergence check vs iter 0 (silent-corruption
+        // catch). In -noflush modes the readback flush is ALSO
+        // user-space — clflush writes back + invalidates, dropping stale
+        // host lines so the device-written DDR data is re-fetched. The
+        // ioctl additionally round-trips a MSG_OP_SYNC_BO to firmware;
+        // if that fence were required for readback correctness, this
+        // mode diverges (data mode compares against parity baselines).
         {
             let (bo, map) = &live[4];
-            let _ = bo.sync(SyncDirection::FromDevice, 0, bo.size() as u64);
+            if sync_noflush {
+                map.clflush_region(0, bo.size());
+            } else {
+                let _ = bo.sync(SyncDirection::FromDevice, 0, bo.size() as u64);
+            }
             let cs = map.as_slice().to_vec();
             let slot = &mut base[it % 2];
             match slot {
@@ -4914,6 +4984,16 @@ fn cmd_run_quadloop(iters: usize, mode: &str) -> ExitCode {
         "quadloop: {iters} iters clean (mode {mode}, {:.1} us/exec avg)",
         t0.elapsed().as_micros() as f64 / iters as f64
     );
+    if prof_n > 0 {
+        println!(
+            "xseed profile ({} seeds): quant+build {:.1}us, memcpy {:.1}us, sync({}) {:.1}us",
+            prof_n,
+            prof[0] / prof_n as f64,
+            prof[1] / prof_n as f64,
+            if sync_full { "whole-BO" } else { "148KB" },
+            prof[2] / prof_n as f64
+        );
+    }
     ExitCode::SUCCESS
 }
 
@@ -5270,14 +5350,14 @@ fn cmd_run_decode(
         const LM_M: usize = W4U_LM_M;
         let (op, handles, meta, _) = lm.as_mut()?;
         {
-            let (xbo, xmap) = &mut live_lm[1];
             let (q, d) = w4u_quantize_x(hidden, 2048);
-            let bytes = xmap.as_mut_slice();
-            bytes[..W4U_ELEM].copy_from_slice(&w4u_build_x_elem(&q, &d, 2048));
-            if let Err(e) = xbo.sync(SyncDirection::ToDevice, 0, xbo.size() as u64) {
-                eprintln!("lm x sync: {e}");
-                return None;
+            let xe = w4u_build_x_elem(&q, &d, 2048);
+            {
+                let (_, xmap) = &mut live_lm[1];
+                xmap.as_mut_slice()[..W4U_ELEM].copy_from_slice(&xe);
             }
+            let (bo, xmap) = &live_lm[1];
+            sync_to_device(bo, xmap, 0, W4U_ELEM);
         }
         let ts = std::time::Instant::now();
         let seq = match op.pkt.submit(&dev, &ctx, handles) {
@@ -5539,9 +5619,10 @@ fn cmd_run_decode(
     // (ln2_n) -> gateup -> DEVICE swiglu -> down -> rms2 (ln1_{n+1}) ->
     // qkv(n+1) in ONE NPU exec (design_quad.py). live_quad layout: base
     // 5n = [p1, p2, p3, p4, c]; handles [ctrl, p1, p2, p3, p4, c]
-    // (rt.sequence order A1..A4, C — the X element rides each column's
-    // packed1 head, the 5-BO ctrl-kernel cap). packed1/packed3 are the
-    // plain v5 streams (X head zero here, rewritten per exec); packed2/
+    // (rt.sequence order A1..A4, C — the X elements ride packed1
+    // FRONT-GROUPED at the BO head, P21-2, still the 5-BO ctrl-kernel
+    // cap). packed1's X region is rewritten per exec (one 148KB region
+    // sync); packed3 is the plain v5 stream; packed2/
     // packed4 interleave the two K=3 rms-weight elements (same builder
     // as the fused pairs). C carries setup-once window headers; the
     // host seeds residual1 per exec and reads back ONLY the o sections
@@ -6004,25 +6085,27 @@ fn cmd_run_decode(
         };
         let vi = if k1 == 6144 { 1 } else { 0 };
         {
-            let (bo, map) = &mut live[vi];
             let (q, d) = w4u_quantize_x(act, k1);
-            map.as_mut_slice()[..W4U_ELEM].copy_from_slice(&w4u_build_x_elem(&q, &d, k1));
-            if let Err(e) = bo.sync(SyncDirection::ToDevice, 0, W4U_ELEM as u64) {
-                eprintln!("fused x sync (L{n} p{pi}): {e}");
-                return false;
+            let xe = w4u_build_x_elem(&q, &d, k1);
+            {
+                let (_, map) = &mut live[vi];
+                map.as_mut_slice()[..W4U_ELEM].copy_from_slice(&xe);
             }
+            let (bo, map) = &live[vi];
+            sync_to_device(bo, map, 0, W4U_ELEM);
         }
         {
-            let (bo, map) = &mut live_fused[ci];
-            let bytes = map.as_mut_slice();
             let r0 = c_rows1 * 2;
-            for j in 0..2048 {
-                bytes[r0 + j * 2..r0 + j * 2 + 2].copy_from_slice(&res[j].to_le_bytes());
+            {
+                let (_, map) = &mut live_fused[ci];
+                let bytes = map.as_mut_slice();
+                for j in 0..2048 {
+                    bytes[r0 + j * 2..r0 + j * 2 + 2]
+                        .copy_from_slice(&res[j].to_le_bytes());
+                }
             }
-            if let Err(e) = bo.sync(SyncDirection::ToDevice, r0 as u64, 4096) {
-                eprintln!("fused res sync (L{n} p{pi}): {e}");
-                return false;
-            }
+            let (bo, map) = &live_fused[ci];
+            sync_to_device(bo, map, r0, 4096);
         }
         let ts = std::time::Instant::now();
         let fs = fst.as_mut().unwrap();
@@ -6088,28 +6171,31 @@ fn cmd_run_decode(
         {
             let (q, d) = w4u_quantize_x(act, 2048);
             let xe = w4u_build_x_elem(&q, &d, 2048);
-            let (bo, map) = &mut live_quad[n * 5];
-            let bytes = map.as_mut_slice();
-            for col in 0..8 {
-                let off = col * 17 * W4U_ELEM; // (1 + 16 blocks) per column
-                bytes[off..off + W4U_ELEM].copy_from_slice(&xe);
+            // P21-2: the 8 X elements are front-grouped [X0..X7] at the
+            // packed1 head — one contiguous 148KB dirty run (sync via
+            // sync_to_device: P21-3 CLFLUSHOPT vs ioctl A/B).
+            {
+                let (_, map) = &mut live_quad[n * 5];
+                let bytes = map.as_mut_slice();
+                for col in 0..8 {
+                    let off = col * W4U_ELEM;
+                    bytes[off..off + W4U_ELEM].copy_from_slice(&xe);
+                }
             }
-            if let Err(e) = bo.sync(SyncDirection::ToDevice, 0, bo.size() as u64) {
-                eprintln!("quad x sync (L{n}): {e}");
-                return false;
-            }
+            let (bo, map) = &live_quad[n * 5];
+            sync_to_device(bo, map, 0, 8 * W4U_ELEM);
         }
         {
-            let (bo, map) = &mut live_quad[n * 5 + 4];
-            let bytes = map.as_mut_slice();
             let r0 = W4Q_RES1_ROW * 2;
-            for j in 0..2048 {
-                bytes[r0 + j * 2..r0 + j * 2 + 2].copy_from_slice(&res[j].to_le_bytes());
+            {
+                let (_, map) = &mut live_quad[n * 5 + 4];
+                let bytes = map.as_mut_slice();
+                for j in 0..2048 {
+                    bytes[r0 + j * 2..r0 + j * 2 + 2].copy_from_slice(&res[j].to_le_bytes());
+                }
             }
-            if let Err(e) = bo.sync(SyncDirection::ToDevice, r0 as u64, 4096) {
-                eprintln!("quad res sync (L{n}): {e}");
-                return false;
-            }
+            let (bo, map) = &live_quad[n * 5 + 4];
+            sync_to_device(bo, map, r0, 4096);
         }
         let ts = std::time::Instant::now();
         let qs = qst.as_mut().unwrap();
@@ -6319,16 +6405,14 @@ fn cmd_run_decode(
                                     .copy_from_slice(&qr[g * gq + j].to_le_bytes());
                             }
                         }
-                        if let Err(e) = qbo.sync(SyncDirection::ToDevice, 0, qbo.size() as u64) {
-                            eprintln!("q sync (layer {n}): {e}");
-                            return false;
-                        }
+                        // P21-3 dispatch (CLFLUSHOPT vs ioctl A/B).
+                        sync_to_device(qbo, qmap, 0, qbo.size());
                     }
                     let op = &mut fk.ops[n];
                     // Same first-exec O-read-race guard as run-fkprobe: flush
                     // the o BO's cache lines before submit so the post-wait
-                    // read sees the DMA writes.
-                    let _ = fk.o.0.sync(SyncDirection::ToDevice, 0, fk.o.0.size() as u64);
+                    // read sees the DMA writes. (P21-3 dispatch.)
+                    sync_to_device(&fk.o.0, &fk.o.1, 0, fk.o.0.size());
                     let ts = std::time::Instant::now();
                     let seq = match op.pkt.submit(&dev, &ctx, &fk.handles[n]) {
                         Ok(s) => s,
