@@ -1455,3 +1455,76 @@ MMIO preactions(可在 MTL 上写 C 编 ACT-SHAVE)。不开放别追:固件二�
    （26.6 tok/s）/ quad **45.05**（22.2 tok/s，34 exec/token）。quad 回归
    +7.5ms vs fused（P19 口径 43.76 是旧夹具 5-iter 数字）；已知抓手不变：
    X 重写 2.5MB 整 BO clflush → 8×148KB、K=5 glue、层间流水。
+
+## P21（2026-09-28，quad X 重写 coherency 成本）：sync 粒度 vs 布局
+
+**P21-1 假设**：quad 每 exec 只脏 packed1 里 8 个列头 X 元素（8×18560B=148KB），
+却整 BO 2.5MB ToDevice clflush（~154µs/layer，quadloop xwrite 1166 vs plain
+1012 分解出来的量级）。把整 BO sync 改成 8 次 region sync 应该省 ~100µs/layer。
+
+**实测（negative）**：8 region syncs **更慢** —— xwrite 模式 300 iters
+**1292.0µs/exec**（vs 整 BO 1166.2）。分解：8 次 SYNC_BO ioctl 往返
+（~30µs/次 ≈ 240µs）> 1 次 ioctl + 2.5MB clflush（~129µs；clflushopt
+~22GB/s）。**教训：SYNC_BO 的成本模型是 per-ioctl 固定开销 + 字节数两项，
+region 化只在 region 数少、跳过字节多时赢；8 岛 × 315KB 步长两头都输。**
+两处（E2E gemv_quad + quadloop seed_x）已回退为整 BO sync。
+
+**P21-2 决定（改布局而非改 sync）**：对照 fused 路径 —— 它的 X 走独立共享
+ELEM BO（18.5KB sync），根本不脏权重 BO。quad 因 5 张量 regmap 上限只能
+把 X 塞进 packed1，但**没规定必须塞在每列流头部**：把 8 个 X 元素前聚到
+packed1 头部连续区 `[X0..X7 | blocks0..blocks7]`，tg1 每列改两次 fill
+（X tap + blocks tap，tg2 的 2-fill 形状已验证），kernel 侧零改动
+（元素尾部 header 自描述，fifo 流仍是 [X|16 blocks]）。此后每 exec 脏集
+= 连续 148KB → **1 ioctl + ~10µs**，期望 ~100µs/layer × 32 ≈ 3ms/token。
+通用律：**per-token 脏集必须连续 —— 布局为 coherency 服务，而不是 sync
+为布局买单。**
+
+**P21-3（同日续）：分解测量推翻成本模型 —— SYNC_BO 是 ~30µs 平价 syscall**
+
+1. **工具**：quadloop xwrite 内嵌三段计时（quantize+build / memcpy / sync），
+   且 sync 范围可用 mode 后缀切换（`xwrite`=148KB、`xwrite-full`=整 BO
+   2.5MB、`xwrite-noflush`=用户态 CLFLUSHOPT），同一循环直接量出 primitive。
+2. **实测（300 iters × 多批）**：quantize+build ~8-13µs、memcpy 148KB ~4µs、
+   **ioctl sync 148KB = 33.5µs ≈ ioctl sync 2.5MB = 30.5µs**。
+   **SYNC_BO 成本与字节数无关（17× 字节差价为零）**——clflush 本身 <3µs，
+   全部开销在 syscall 往返（GEM lookup + pin + page walk + unpin）。
+   内核源码核对（amdxdna_gem.c/amdxdna_drm_clflush）：范围确实只走
+   [start_page, end_page]，flush 不是成本，ioctl 才是。
+   **推论：per-exec sync 预算 = ioctl 次数预算，不是字节预算。**
+   P20b 把 xwrite-plain 差值 154µs 全部归因"2.5MB clflush"是错的。
+3. **用户态 CLFLUSHOPT 替代 ToDevice**：`Mapping::clflush_region`
+   （xnpu-hal/bo.rs）：CPUID leaf7 EBX bit23 手工探测（intrinsic 还在
+   unstable），inline asm `clflushopt [reg]`（Rust asm! 默认 Intel 语法，
+   AT&T 的 `(%reg)` 会报 invalid operand）+ SFENCE；mmap VA 打同一批
+   物理行（BO 页已 MAP_LOCKED，无迁移竞态）。148KB **4.6µs**（≈32GB/s），
+   300 iters clean。**ToDevice 方向 ioctl 本来就只做 clflush —— 替换是
+   严格等价**。
+4. **FromDevice 不能换（决定性反例）**：`data-noflush`（回读也用
+   clflush）it 5 DIVERGENCE，98 字节差异**全部落在 rows
+   [40576, 40687) = C BO 的最后 128 行**（qkv 尾段）——syncobj 信号时
+   S2MM 尾部写仍在 NoC 途中。内核 FromDevice 对 ctx-assigned BO 会
+   额外发 **MSG_OP_SYNC_BO 固件往返**（aie2_sync_bo，DEV_MEM→HOST_MEM
+   全 BO fence）并等它完成——**这个 fence 是正确性必需的**。结论：
+   **ToDevice → 用户态 CLFLUSHOPT；FromDevice → 保留 ioctl。**
+5. **板况漂移定律**：同日不同批次 plain 从 1009→1424µs、quantize
+   8→33µs（CPU 频率缩放）——**绝对值跨批不可比，A/B 必须同二进制同批
+   背靠背**（Engine 侧为此加了 XNPU_IOCTL_SYNC=1 环境开关，见下）。
+6. E2E 接线（fused pair X+res、quad X+res、lm_head X、flowkv q+o 共 7
+   处 ToDevice → clflush_region；FromDevice 全保留），quad 300 clean、
+   fused 12-iter gates 全过（1.3%、argmax 对、8/8）。
+7. **P21-3 自我修正（strace 决定性）**：上面"~30µs 平价"仍是错账。
+   strace -T 对拍（同二进制 6-iter，XNPU_IOCTL_SYNC 开关）：
+   ioctl 变体多 889 次 SYNC_BO，总耗时只多 **1.33ms（边际 ~1.5µs/次）**；
+   分布**双峰**——多数 <5µs，仅大脏块落在 40-60µs 桶。
+   **修正模型：SYNC_BO = syscall(~1-5µs) + 脏行回写（内核逐页 clflush
+   ~5GB/s 有效带宽）；干净行近乎免费**（所以整 BO 2.5MB ≈ 148KB region
+   ——两者脏字节相同）。quadloop 的 -48.8µs/exec 是**回写速度差**（用户态
+   CLFLUSHOPT 连续 VA 流式 ~32GB/s vs 内核逐页 ~5GB/s），不是 syscall 差。
+   E2E 对拍印证：fused X BO 仅 18.5KB 脏 → 每对只省 ~3µs × 63 ≈ 0.15ms
+   （噪声内，实测 ~0）；quad X 148KB 脏 → ~40µs/层 × 31 ≈ 1.2ms（实测
+   均值 -1.2ms，噪声内方向对）。
+   **通用律（修正版）：sync 预算 = 脏字节数预算；kernel 路径每字节
+   ~0.2ns（5GB/s），用户态 CLFLUSHOPT ~0.03ns（32GB/s）；干净行和
+   syscall 都不是成本。**
+8. 落地：`sync_to_device`（env XNPU_IOCTL_SYNC=1 可切回 ioctl 做 A/B），
+   默认 CLFLUSHOPT；FromDevice ioctl 保留（固件 fence 必需，见 4）。
