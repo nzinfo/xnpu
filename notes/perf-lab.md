@@ -2201,3 +2201,40 @@ DPU 指令路径里，发行时序不是变量。
 ring in, ring out]，ring = ObjectFifo worker i → worker (i+1)%8，
 trivial parrot 内核，单组 fills + drain(wait=True)。放置成功 ≠ 路由
 成功——实际上板跑通才算数。
+
+## P28-3（2026-09-29⑨）ring 探针 PASS：npu2 上 core↔core ObjectFifo 是共享内存，不是流
+
+**结果**：`test_ring`（design_ring.py / ring_probe.cc / test_ring.py，
+w4gemvu 目录）**5/5 PASS**，latency ~94-102µs/exec（16KB 总载荷——
+几乎全是单组固定成本，与 P27-3b 的 ~77-132µs/组闭合）。golden
+C[w]=pred(w)+1 五连中 = 两件事同时被证明：(1) 蛇形环 8 边全部放置+
+路由+锁流跑通（含两条跨列边 3→7 与 4→0）；(2) exec 边界环回空 +
+自启动序（先 produce 后 consume）在 persistent worker 上跨 exec 成立。
+
+**机制实锤（npu_insts.mlir + ELF 反汇编，比 P28-1 的推断更深一层）**：
+
+1. **core↔core ObjectFifo 不烧流端口**：整个 npu_insts 里 **零条
+   aie.flow/stream/packet 路由**；memDMA 块只服务 shim A（S2MM 入核）
+   与 shim C（MM2S 出核）。核间 fifo 的缓冲+锁放在**一个端点的 tile**
+   上（如 ring_0/ring_4 的 buff+lock 都在 tile_0_2），对端通过 NoC
+   远端 L1 读写。反汇编（core_1_2.elf）：`movxm r9,#0x50400` 预载
+   **远端**缓冲绝对地址（本 tile 视角的 NoC 映射）→ `acq #0x31,r14`
+   （锁指令编码远端 tile）→ `sel.nez` 二选一 depth-2 缓冲地址 →
+   向量拷贝 → `rel #0x30`。即 **SPSC 共享内存队列，acq 返回缓冲指针**。
+   P28-1 的「2-in/2-out 流端口预算」在 npu2 后端**不适用**——约束
+   变成 L1 容量 + NoC 带宽，环拓扑可以更自由。
+2. **缓冲 home tile 规则 = 首引用 worker**（不是「producer tile」——
+   swiglu 里是巧合）：ring_4（4→0）的缓冲在 consumer tile_0_2，因为
+   workers 列表里 worker 0 先引用它（cons 角色）。8 条边全部按此
+   复核吻合。layer-v2 可通过 worker 参数表顺序控制 home（让写侧本地、
+   读侧远端，或反之——两个方向本探针都已验证跑通）。
+3. **远端写与远端读都在硅上验证**：ring_4 = producer 远端写
+   （(1,2)→(0,2)），ring_0 = consumer 远端读（(0,3) 读 tile_0_2）。
+4. 编译坑留痕：内核符号必须 `extern "C"`（peano ld.lld 报
+   undefined symbol: ring_copy_bf16 + "did you mean to declare … as
+   extern C?"——IRON 现有内核都用 extern "C" 块包裹，我漏了）。
+
+**对 layer-v2 的直接结论**：三次 all-gather 走环的机制风险清零；
+环元素应取 per-worker chunk（2048/8=256 bf16=512B，depth-2，每 tile
+2 个环 fifo 仅 ~2KB L1），gather = 8 圈循环转发。L1 预算让给权重流
+（2×18560B）与胶水 staging。下一刀 = P28 本体（design_layerv2）。
