@@ -1979,3 +1979,67 @@ lm 段 3076→2690µs = 回到无税 solo）。默认开启，XNPU_TWOCU=1 复�
 成本（~30µs×2/层，FLM 同量级），是 pair exec 内部的流速率**（33.6 vs 47）。
 下一刀 = pair 填充率地板探针（v5s 技术：K 头打垃圾走零行路径，同 ctrl
 形状量纯 fill 地板），判 fill 机器（BD 尺寸/组边界）还是计算暴露。
+
+### P27-3b（2026-09-29⑤）pair 填充地板探针：计算暴露=0，「组固定成本」模型闭合
+
+**环境事故与修复（先留痕）**：系统升级删掉了 python3.12（pytest/aie 全断）。
+重建：`/home/nzinfo/.venvs/npu314`（python3.14 venv，--system-site-packages
+吃系统 dist-packages 的 **pyxrt cp314 .so**——这是唯一必须用 3.14 的原因，
+3.13 的 unsloth venv 装不了它）。pip 装入：mlir_aie==v1.2.1 cp314 wheel
+（GitHub release extra-index，requirements.txt 本来的安装源）+ llvm-aie
+nightly（py3-none wheel，网络断续要 `--resume-retries 10`）+ torch 2.12.1+cpu
+（pytorch cpu index 有 cp314）+ pytest/ml_dtypes + `pip install -e IRON --no-deps`。
+运行配方照旧（sudo + prlimit memlock）。**教训：IRON 的可运行性依赖三个
+非 PyPI 的 GitHub release wheel，环境重建配方记在这里。**
+
+**探针（iron/operators/w4gemvu/test_fuseds.py）**：v5s 技术移植到 fused pair——
+把 packed1/packed2 里每个权重块的 K 头（块尾 ELEM-8）改成 0xBEEF，内核守卫走
+零行路径（无 mmul、无操作数重建）；X 元素（K=0）、rms 窗（K=1）、w 元素（K=3）
+保持活——胶水口味照跑。线上字节/fill/drain/内核镜像全同。PERF ONLY（zeros-in
+zeros-out，无金标断言；run_test 对 zeros 参考的 mismatch 恰好是探针有效性的
+证据：100 条 mismatch 全部落在 [2304,6409] = rms 窗活数据区，权重段全零匹配）。
+
+**结果一（假设裁决：计算暴露 = 0）**：同一 pytest 会话、同工具链、同板窗，
+5 次重复取中位：
+
+| | full（test_fused） | probe（test_fuseds） | 差 |
+|---|---|---|---|
+| pair A (o→gateup, 17.08MB) | 552.8µs | 546.6µs | ≈0（噪声内）|
+| pair B (down→qkv, 10.66MB) | 422.1µs | 435.4µs | ≈0（噪声内）|
+
+**去掉全部计算，pair 时间不变**——v5.4 双累加器内核的计算完全藏在 fill 后面。
+P27-3 立的「fill 机器 vs 计算暴露」二选一：答案是 fill 机器，且不是内核循环。
+
+**结果二（长度标定，同板窗 plain 探针）**：test_v5s 四形状 5 次中位，
+latency = **固定 132µs + 字节/55.1GB/s** 拟合（四点全中：o 175/175、
+down 252/260、gateup 378/389、lm 2660/2661）。即：
+
+- **边际流速率 55.1GB/s = 器件墙**（P12 的 55.6 复现），长短流通用；
+- **每个 task group ~132µs 固定成本**（隔离口径；plain op = 1 组）；
+- pair probe 547 ≈ o(175) + gateup(378) 的**串行和**（−6µs）——pair 的两
+  组各付一次固定成本，组间无重叠也无额外罚金；
+- E2E 链上有效值 ~77µs/组（A:wait 460 − 307 流 = 153 = 2×77；B 同），
+  链比隔离好 ~55µs = submit/syncobj 往返被链式掩掉的部分；
+- **模型闭合**：E2E 设备 28.3ms = 流 18.3ms（1.01GB@55.1）+ 129 组 ×
+  77µs ≈ 9.9ms ✓。**与 FLM 的全部剩余差距 = 组数 × 组固定成本。**
+  FLM 每层 1 exec、~30-90µs 固定（585−555），我们每层 4 组 × 77 = 308µs。
+
+**结果三（pair ctrl 解剖，stream_bytes.py + npu_insts.mlir）**：
+- npu2 分区 = **8 核（2 列 × 4 行）+ 4 shim**，每 shim 2 MM2S 通道各喂
+  1 核——IRON 的「8 columns」= 8 核，ctrl 列字段 0-3 = shim；
+- pair A 每 shim：2D BD 544B（C1 drain tap）+ 2D 3136B（C2 drain tap）+
+  4×18560B 线性（X×2 + 窗×2，两逻辑列）+ 296,960B×2（o 块/核）+
+  1,800,320B×2（gateup 96 块/核）——**权重早已是单条大线性 BD**，BD
+  尺寸/形状不是慢的原因（推翻「BD 机器」嫌犯）；
+- rms 窗 fill = C 源**线性** 18560B（RMS_taps sizes=[1,1,1,9280]），非 2D；
+- 每组末 8 条 npu.sync（4 shim × 2 通道，direction=0 只等 drain）；
+  整 pair ctrl 881 行 mlir ≈ 480 指令。
+
+**结论与下一刀**：填充机器的慢不在 BD 形状、不在计算、不在带宽，在
+**task group 边界的串行化**：tg2 的权重流必须等 [tg1 流尾 → 核计算 →
+C drain → DDR 落地 → TCT → 窗 fill] 整条链走完才开始（窗元素与权重同
+fifo，消费序=压栈序，权重不能先压）。P27-4 = ctrl 手术探针：把 tg2 的
+BD 写+push 整块搬到 tg1 sync 之前（消费序破坏 → 数值垃圾，PERF ONLY），
+若 pair → ~360-400µs 则「跨组 enqueue-ahead」就是 FLM 的 309-TCT 图的
+本质，剩余差距的工程路线随之确定（FLM：独立 fill 早发 + 依赖只约束
+窗/激活，整层 1 组）。
