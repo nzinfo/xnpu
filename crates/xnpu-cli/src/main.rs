@@ -2631,7 +2631,12 @@ fn cmd_run_w4layer(w4dir: &str, nlayers: usize, iters: usize) -> ExitCode {
                 for (i, b) in x_bits.iter().enumerate() {
                     map.as_mut_slice()[i * 2..i * 2 + 2].copy_from_slice(&b.to_le_bytes());
                 }
-                bo.sync(SyncDirection::ToDevice, 0, bo.size() as u64).ok();
+                // P24 axcache A/B: with BD AxCache=aggressive (0x0e) the
+                // flush may be load-bearing or not — gate it so both arms
+                // run from one binary.
+                if std::env::var_os("XNPU_NO_IN_FLUSH").is_none() {
+                    bo.sync(SyncDirection::ToDevice, 0, bo.size() as u64).ok();
+                }
             }
             let op = &mut ops[si];
             let seq = match op.pkt.submit(&dev, &ctx, &op_handles[si]) {
@@ -2648,7 +2653,11 @@ fn cmd_run_w4layer(w4dir: &str, nlayers: usize, iters: usize) -> ExitCode {
                 return ExitCode::FAILURE;
             }
             let (c_bo, c_map) = &live[2 + si];
-            let _ = c_bo.sync(SyncDirection::ToDevice, 0, c_bo.size() as u64);
+            // P24 axcache A/B: this ToDevice-direction sync is really the
+            // post-exec cache invalidate (see note at sync_to_device).
+            if std::env::var_os("XNPU_NO_OUT_FLUSH").is_none() {
+                let _ = c_bo.sync(SyncDirection::ToDevice, 0, c_bo.size() as u64);
+            }
             let cs = c_map.as_slice();
             let mut worst = 0f32;
             let mut bad = 0usize;
