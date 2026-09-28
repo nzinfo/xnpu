@@ -7149,8 +7149,14 @@ fn cmd_run_decode(
             if argmax_n == argmax_g && rel_rms < 0.05 { "PASS" } else { "FAIL" }
         );
         if argmax_n != argmax_g || rel_rms >= 0.05 {
-            eprintln!("lm_head gate FAILED — token 路径结果不可信");
-            return ExitCode::FAILURE;
+            // XNPU_SKIP_GATES: PERF-ONLY escape for ctrl-surgery probes
+            // (P27-4 hoist) whose checked step is garbage by design.
+            if std::env::var("XNPU_SKIP_GATES").is_ok() {
+                eprintln!("lm_head gate FAILED — continuing (XNPU_SKIP_GATES, PERF ONLY)");
+            } else {
+                eprintln!("lm_head gate FAILED — token 路径结果不可信");
+                return ExitCode::FAILURE;
+            }
         }
     }
 
