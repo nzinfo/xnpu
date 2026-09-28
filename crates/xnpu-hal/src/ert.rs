@@ -18,6 +18,11 @@
 //! bo0..boN u64`. Instruction address is the ctrl BO's heap `xdna_addr`;
 //! tensor addresses are the SHMEM BOs' *user* VAs (fw walks host page
 //! tables via SVM/PASID — heap addresses there are silently ignored).
+//! `ninstr` counts 32-bit WORDS, not bytes (P20b: mlir_aie's host runtime
+//! passes `len(np.frombuffer(data, np.uint32))`; bytes here made the fw
+//! pull 4x the ctrl code — 48KB of heap garbage past the quad's 16528B
+//! ctrl BO — the intermittent corrupt/hang on the engine path while the
+//! pyxrt path stayed bit-stable).
 
 use std::io;
 

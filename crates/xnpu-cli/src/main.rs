@@ -227,6 +227,21 @@ fn main() -> ExitCode {
             let npu_attn = !args.iter().any(|s| s.as_str() == "cpu");
             cmd_run_decode(arch, &decdir, &w4dir, iters, npu_attn, fused, quad)
         }
+        Some("run-quadloop") => {
+            // P20: engine-side quad hang probe (see cmd_run_quadloop).
+            let iters = args
+                .iter()
+                .skip(1)
+                .find_map(|s| s.parse::<usize>().ok())
+                .unwrap_or(200);
+            let mode = args
+                .iter()
+                .skip(1)
+                .find(|s| s.parse::<usize>().is_err())
+                .map(|s| s.as_str())
+                .unwrap_or("plain");
+            cmd_run_quadloop(iters, mode)
+        }
         Some("run-lmhead") => {
             // M8/P8: hy lm_head on NPU — isolated probe (correctness + perf).
             let iters = args
@@ -530,7 +545,7 @@ fn cmd_run_add(prj: &str, dtype: &str) -> ExitCode {
         .set_ctrl(ctrl_addr, instr.len() as u32)
         .and_then(|_| pkt.arg64(3)) // opcode: DPU txn start
         .and_then(|_| pkt.arg64(ctrl_addr))
-        .and_then(|_| pkt.arg32(instr.len() as u32))
+        .and_then(|_| pkt.arg32((instr.len() / 4) as u32))
         .and_then(|_| pkt.arg64(in1_addr))
         .and_then(|_| pkt.arg64(in2_addr))
         .and_then(|_| pkt.arg64(out_addr));
@@ -826,7 +841,7 @@ fn cmd_run_gemm(prj: &str, m: usize, k: usize, n: usize, dtype: &str) -> ExitCod
     let build = pkt
         .arg64(3)
         .and_then(|_| pkt.arg64(ctrl_addr))
-        .and_then(|_| pkt.arg32(instr.len() as u32))
+        .and_then(|_| pkt.arg32((instr.len() / 4) as u32))
         .and_then(|_| pkt.arg64(a_map.as_ptr() as u64))
         .and_then(|_| pkt.arg64(b_map.as_ptr() as u64))
         .and_then(|_| pkt.arg64(c_map.as_ptr() as u64));
@@ -1398,7 +1413,7 @@ fn cmd_run_pipe(gemm_prj: &str, m: usize, k: usize, n: usize, iters: usize) -> E
             .set_ctrl(ctrl_addr, instr.len() as u32)
             .and_then(|_| p.arg64(3))
             .and_then(|_| p.arg64(ctrl_addr))
-            .and_then(|_| p.arg32(instr.len() as u32));
+            .and_then(|_| p.arg32((instr.len() / 4) as u32));
         for va in &tensor_vas {
             r = r.and_then(|_| p.arg64(*va));
         }
@@ -1554,7 +1569,7 @@ fn chain_op(
         .set_ctrl(ctrl_addr, instr.len() as u32)
         .and_then(|_| pkt.arg64(3))
         .and_then(|_| pkt.arg64(ctrl_addr))
-        .and_then(|_| pkt.arg32(instr.len() as u32));
+        .and_then(|_| pkt.arg32((instr.len() / 4) as u32));
     for va in tensor_vas {
         r = r.and_then(|_| pkt.arg64(*va));
     }
@@ -2310,7 +2325,7 @@ fn cmd_run_w4gemv(
             .set_ctrl(ctrl_addr, instr.len() as u32)
             .and_then(|_| p.arg64(3))
             .and_then(|_| p.arg64(ctrl_addr))
-            .and_then(|_| p.arg32(instr.len() as u32));
+            .and_then(|_| p.arg32((instr.len() / 4) as u32));
         for va in &[w_va, x_va, c_va] {
             r = r.and_then(|_| p.arg64(*va));
         }
@@ -3023,6 +3038,37 @@ const W4Q_SEC_DN: usize = 800;
 const W4Q_QKV_OFF: usize = 37120;
 const W4Q_SEC_Q: usize = 448;
 const W4Q_RES1_ROW: usize = 2304;
+
+// P20: on a wedged quad exec, dump C and summarize which sections'
+// data rows made it out — the stall site fingerprint. Sections'
+// first-data-row boundaries are exactly where the parked-Cs race
+// stalled before, so a repeat there vs somewhere new is the split
+// between "design fix incomplete" and "engine-path bug".
+fn c_bo_wait_dump(cm: &(BufferObject, Mapping), n: usize, it: u32) -> std::io::Result<()> {
+    let (bo, map) = cm;
+    let _ = bo.sync(SyncDirection::FromDevice, 0, bo.size() as u64);
+    let cs = map.as_slice();
+    let nz = |lo: usize, hi: usize| -> usize {
+        (lo..hi).filter(|&r| cs[r * 2] != 0 || cs[r * 2 + 1] != 0).count()
+    };
+    let (mut o_nz, mut gu_nz, mut dn_nz, mut q_nz) = (0usize, 0usize, 0usize, 0usize);
+    for col in 0..8 {
+        o_nz += nz(col * 288 + 16, col * 288 + 288);
+        gu_nz += nz(9280 + col % 4 * 1568 + 32, 9280 + col % 4 * 1568 + 32 + 1536)
+            + nz(18560 + col % 4 * 1568 + 32, 18560 + col % 4 * 1568 + 32 + 1536);
+        dn_nz += nz(27840 + col * 800 + 32, 27840 + col * 800 + 32 + 768);
+        q_nz += nz(37120 + col * 448 + 48, 37120 + col * 448 + 48 + 384);
+    }
+    println!(
+        "[quad-hang] L{n} it{it}: data rows nonzero o {o_nz}/2048 gate+up {gu_nz}/12288 down {dn_nz}/6144 qkv {q_nz}/3072"
+    );
+    let _ = std::fs::create_dir_all("/tmp/qkvdump");
+    std::fs::write(
+        format!("/tmp/qkvdump/hang_L{n}_it{it}.bin"),
+        cs,
+    )?;
+    Ok(())
+}
 
 /// P19 quad packed1: per column [X element | that column's 16 o blocks]
 /// (op_quad.py build_packed1). The X head is zeroed here — the exec
@@ -4635,6 +4681,242 @@ fn attention_bf16(
     }
 }
 
+/// P20: engine-side quad hang probe. The pyxrt-path loop (quad_probe2.py)
+/// is 500-clean on the restructured design while the E2E still hangs
+/// ~2%/exec AND occasionally completes with garbage — so the trigger lives
+/// in something the E2E does that the probe doesn't. This loops ONE quad
+/// exec (layer-0 real weights) through the ENGINE's own ERT submission and
+/// strips the E2E variables one at a time:
+///   plain   = pure submit+wait loop (tests the submission machinery alone)
+///   xwrite  = + the E2E per-exec host writes (X element rewrite into the
+///             packed1 heads + whole-BO ToDevice clflush, res1 seed into C
+///             + 4KB region sync)
+///   data    = xwrite + varying X/res1 content per iter (bf16 LSB rotation)
+/// C is snapshotted each iter and diffed against iter 0, so the SILENT
+/// corruption variant (an E2E run finished with NaN final hidden) is
+/// caught the same way as the hang.
+fn cmd_run_quadloop(iters: usize, mode: &str) -> ExitCode {
+    let build = "/home/nzinfo/qwen/xnpu/build";
+    let w4dir = "/home/nzinfo/qwen/xnpu/build/w4u_hy";
+    let decdir = "/home/nzinfo/qwen/xnpu/build/dec_hy";
+    let (pdi, instr, _) = match load_fixture(&format!(
+        "{build}/w4gemvuq_2048x2048_12288_2048x6144_3072.mlir.prj"
+    )) {
+        Some(f) => f,
+        None => {
+            eprintln!("load quad fixture failed (run test_quad first)");
+            return ExitCode::FAILURE;
+        }
+    };
+    let blocks: [usize; 4] = [16, 96, 48, 24]; // o, gateup, down, qkv
+    let rd = |stem: &str| -> Option<Vec<u8>> {
+        let d = std::fs::read(format!("{w4dir}/{stem}")).ok()?;
+        Some(d)
+    };
+    let (o, g, dn, q) = match (
+        rd("layer00_o.bin"),
+        rd("layer00_gateup.bin"),
+        rd("layer00_down.bin"),
+        rd("layer01_qkv.bin"),
+    ) {
+        (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
+        _ => {
+            eprintln!("layer weights absent in {w4dir}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let norms = match std::fs::read(format!("{decdir}/norms.bin")) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("read {decdir}/norms.bin: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let norms_u16: Vec<u16> = norms
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    // layer-0 quad: rms1 w = ln2_0 = norms[1], rms2 w = ln1_1 = norms[2].
+    let p1 = w4q_build_packed1(&o, blocks[0]);
+    let p2 = w4uf_build_packed2(&g, &norms_u16[1 * 2048..][..2048], blocks[0], blocks[1]);
+    let p4 = w4uf_build_packed2(&q, &norms_u16[2 * 2048..][..2048], blocks[2], blocks[3]);
+    let cdata = w4q_build_c_init();
+    let mut x_bits = match std::fs::read(format!("{decdir}/x0.bin")) {
+        Ok(v) => v
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect::<Vec<u16>>(),
+        Err(_) => (0..2048).map(|i| 0x3f80u16 | ((i as u16) & 0x7f)).collect(),
+    };
+    x_bits.resize(2048, 0x3f80);
+
+    let dev = match Device::open_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("open amdxdna device: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let md = match dev.aie_metadata() {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("AIE metadata: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut ctx = match HwContext::create(&dev, 8 * md.core.row_count as u32) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("create hwctx: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(e) = ctx.configure_cus(&[(pdi.as_slice(), 0)]) {
+        eprintln!("configure_cus: {e}");
+        return ExitCode::FAILURE;
+    }
+    let mut live: Vec<(BufferObject, Mapping)> = Vec::new();
+    let mut vas = Vec::new();
+    for (tag, data) in [("p1", p1), ("p2", p2), ("p3", dn), ("p4", p4), ("c", cdata)] {
+        match chain_tensor(&dev, &mut live, &format!("quadloop.{tag}"), &data) {
+            Some(va) => vas.push(va),
+            None => return ExitCode::FAILURE,
+        }
+    }
+    let mut op = match chain_op(&dev, "quadloop", &instr, 0, &vas) {
+        Some(op) => op,
+        None => return ExitCode::FAILURE,
+    };
+    let seed_x = |live: &mut Vec<(BufferObject, Mapping)>, x: &[u16], it: usize| {
+        let (q, d) = w4u_quantize_x(x, 2048);
+        let xe = w4u_build_x_elem(&q, &d, 2048);
+        let (bo, map) = &mut live[0];
+        let bytes = map.as_mut_slice();
+        for col in 0..8 {
+            let off = col * 17 * W4U_ELEM;
+            bytes[off..off + W4U_ELEM].copy_from_slice(&xe);
+        }
+        if bo.sync(SyncDirection::ToDevice, 0, bo.size() as u64).is_err() {
+            eprintln!("quadloop x sync failed (it {it})");
+            return false;
+        }
+        true
+    };
+    let seed_res = |live: &mut Vec<(BufferObject, Mapping)>, x: &[u16]| {
+        let (bo, map) = &mut live[4];
+        let bytes = map.as_mut_slice();
+        let r0 = W4Q_RES1_ROW * 2;
+        for j in 0..2048 {
+            bytes[r0 + j * 2..r0 + j * 2 + 2].copy_from_slice(&x[j].to_le_bytes());
+        }
+        if bo.sync(SyncDirection::ToDevice, r0 as u64, 4096).is_err() {
+            eprintln!("quadloop res sync failed");
+            return false;
+        }
+        true
+    };
+    // data mode's X pattern has period 2 in `it` (the XOR flips half the
+    // groups each iter), so odd iters legitimately differ from iter 0 —
+    // keep two baselines and only compare same-parity iterations.
+    let mut base: [Option<Vec<u8>>; 2] = [None, None];
+    let t0 = std::time::Instant::now();
+    for it in 0..iters {
+        // "sleep"/"syncs": plain + an inter-exec barrier, bisecting whether
+        // the corruption is a posted-write race (exec N's tail drains still
+        // landing while exec N+1's C-fills read / drains write the same C)
+        // or something in the packet itself. "syncs" mimics pyxrt's
+        // run_runlist (whole-BO TO_DEVICE syncs ahead of every exec — the
+        // probe path's accidental barrier).
+        if mode == "sleep" {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        if mode == "syncs" {
+            for (bo, _) in live.iter() {
+                let _ = bo.sync(SyncDirection::ToDevice, 0, bo.size() as u64);
+            }
+        }
+        if mode != "plain" && mode != "sleep" && mode != "syncs" && mode != "fresh" {
+            let x: Vec<u16> = if mode == "data" {
+                x_bits
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &v)| v ^ (((it + i / 256) as u16) & 1))
+                    .collect()
+            } else {
+                x_bits.clone()
+            };
+            if !seed_x(&mut live, &x, it) {
+                return ExitCode::FAILURE;
+            }
+            if !seed_res(&mut live, &x) {
+                return ExitCode::FAILURE;
+            }
+        }
+        // "fresh": rebuild the ctrl BO AND the ERT packet every exec — the
+        // one thing pyxrt does per call that this loop doesn't (XRT builds a
+        // fresh run object + exec packet; M3b taught that submit never
+        // resets packet-header state). If this mode is clean where plain
+        // corrupts, the bug is packet/ctrl reuse, not device cross-exec
+        // state.
+        if mode == "fresh" {
+            op = match chain_op(&dev, "quadloop", &instr, 0, &vas) {
+                Some(o) => o,
+                None => return ExitCode::FAILURE,
+            };
+        }
+        let handles = {
+            let mut h = vec![op.ctrl_bo.handle()];
+            h.extend(live.iter().map(|(bo, _)| bo.handle()));
+            h
+        };
+        let seq = match op.pkt.submit(&dev, &ctx, &handles) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("quadloop submit (it {it}): {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        if let Err(e) = syncobj_timeline_wait(&dev, ctx.syncobj_handle, seq, 5_000_000_000) {
+            eprintln!("quadloop wait (it {it}, seq {seq}): {e}");
+            let _ = c_bo_wait_dump(&live[4], 0, it as u32);
+            return ExitCode::FAILURE;
+        }
+        // FromDevice + divergence check vs iter 0 (silent-corruption catch).
+        {
+            let (bo, map) = &live[4];
+            let _ = bo.sync(SyncDirection::FromDevice, 0, bo.size() as u64);
+            let cs = map.as_slice().to_vec();
+            let slot = &mut base[it % 2];
+            match slot {
+                None => {
+                    if it < 2 {
+                        let _ = std::fs::create_dir_all("/tmp/qkvdump");
+                        let _ = std::fs::write("/tmp/qkvdump/loopbase.bin", &cs);
+                    }
+                    *slot = Some(cs);
+                }
+                Some(b) => {
+                    let d = cs.iter().zip(b.iter()).filter(|(a, c)| a != c).count();
+                    if d != 0 {
+                        eprintln!("quadloop DIVERGENCE at it {it}: {d} bytes differ from iter {}", it % 2);
+                        let _ = std::fs::create_dir_all("/tmp/qkvdump");
+                        let _ = std::fs::write(format!("/tmp/qkvdump/loopdiv_it{it}.bin"), &cs);
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+        }
+        if it > 0 && it % 50 == 0 {
+            println!("it {it} clean ({:.1} us/exec)", t0.elapsed().as_micros() as f64 / it as f64);
+        }
+    }
+    println!(
+        "quadloop: {iters} iters clean (mode {mode}, {:.1} us/exec avg)",
+        t0.elapsed().as_micros() as f64 / iters as f64
+    );
+    ExitCode::SUCCESS
+}
+
 /// M3b/M4a: one full 42-layer decode step over real weights — the engine
 /// skeleton. Projections run on the universal w4gemvu CU (run-w4ulayer
 /// machinery); rope, rms-norm, swiglu and the residuals run in Rust (f32
@@ -5841,6 +6123,10 @@ fn cmd_run_decode(
         };
         if let Err(e) = syncobj_timeline_wait(&dev, ctx.syncobj_handle, seq, 10_000_000_000) {
             eprintln!("quad wait (L{n}, seq {seq}): {e}");
+            // P20: dump the wedged exec's C state — which sections made it
+            // out names the stall site (the same fingerprint technique that
+            // localized the parked-Cs race).
+            let _ = c_bo_wait_dump(&live_quad[n * 5 + 4], n, it);
             return false;
         }
         if it > 0 {
