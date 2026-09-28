@@ -1815,3 +1815,63 @@ P24 之后的自然问题：46.6 vs 26.7 tok/s 的差距到底在 DMA 效率还�
 8. **方法论入档**：反推式"验证"（先有结论再找一组能凑上的算术）比不
    验证更危险——它会给错误结论盖合格的章。交叉闭合（流测↔文件格式↔
    BO 尺寸三方独立来源）这次真正起了作用。
+
+## P27（2026-09-29）追平 FLM 战役：杠杆 1-4 执行（目标 ≤21.5ms / ≥45 tok/s）
+
+P26b 修正后的路线图落地。目标分解（从 37.6ms 出发）：L2 host 11→~0.5、
+L3 exec 结构 7.6→~2、地板 18.9 不动（量化密度属杠杆 5，本次不做）。
+执行序按风险升序，每步 golden 双门把关：
+
+- **P27-1 host attention SIMD 化**（纯 Rust，零 IRON 风险）：现 6.2ms 的
+  真凶是标量 `d += a*b` 的 128 长 FMA 依赖链（4 拍延迟串行）+ 51.7K 次
+  libc expf。AVX-512（Zen5 全宽原生）16-wide 重写三个热循环；数值上
+  转换精确（bf16 位左移）、dot/求和改 lane-tree、exp 用 6 项多项式
+  （漂移 ~1e-7 ≪ bf16 噪声），输出端 f32_to_bf16 epilogue 保持标量
+  逐位不变。预期 6.2→~1ms。
+- P27-2 swiglu 上设备（pair B 入口胶水 K=4/K=5，机器来自 quad P19b）
+- P27-3 exec 链化 + 提交流水（P14 定律：host 出链后才兑现）
+- P27-4 杂项（X 布局前聚 / CU 翻转 / 复测）
+
+
+### P27-1（2026-09-29）AVX-512 attention + host 分段显微镜
+
+**执行**：`attention_avx512`（target_feature avx512f/bw，运行时 dispatch：pos≥15 且
+CPUID 具备）——bf16→f32 位左移精确转换、QK/PV 均 8×FMA+reduce、exp 走 6 项
+ln2 级数多项式（RNE roundscale 取 n、指数位相加、x≥−80 clamp）、epilogue 保持
+标量 f32_to_bf16 逐位不变。edition-2024 坑：unsafe fn 体内要显式 unsafe{}。
+
+**结果一（预期落空）**：同日背靠背 A/B，37,525→37,017µs（med 37,327→36,985），
+只省 **−0.5ms**，不是预期 −5ms。门全过（hidden rms 0.0447=1.7%、argmax 对、
+top-8 8/8）。原因：P15 的"6.2ms attention"是 split 时代的 gap 归因，把
+rope/qk-norm/KV-append/staging 与 attention 核捆在一起；fused 路径上核只有
+~1ms 量级。**教训：gap 归因的颗粒度会随结构变化失效，换结构后必须重测。**
+
+**结果二（显微镜，XNPU_HOSTPROF=1 分段计时，5 iters）**：给 fused 循环加
+HostProf（thread_local 分段纳秒累加，timed 相起止 reset/print；wait 段含
+submit→syncobj-wait 为设备主导）：
+
+| 段 | µs/token | 判读 |
+|---|---|---|
+| A:wait+B:wait+lm | 32,129 | 设备执行+submit（串行、零重叠） |
+| **B:quant** | **3,563** | 量化 6144 激活+打包+sync，最大 host 单项 |
+| attn | 1,344 | AVX 后全程（含 K/V staging），~42µs/层 |
+| **A:quant** | **1,179** | 量化 2048+sync，36.8µs/层 |
+| A:read+B:read | 1,182 | FromDevice+w4u_read_c+add |
+| swiglu | 763 | 宿主标量 |
+| qknorm | 193 | 标量 rms |
+| rope+kvapp+res×2+finalnorm | ~180 | 已不构成目标 |
+| SUM | 40,539 | 对 wall 41,770，未归属 ~1.2ms（L0 plain 路径/argmax/循环） |
+
+（本轮板况偏慢：steady 41.77ms，med 41,948——P21-5 漂移定律，跨日绝对值不可比，
+分段**比例**可靠。）
+
+**修正后的账**：host 胶水合计 **~8.4ms**（不是 P26b 估的 ~11：attention 核被
+高估、swiglu 实测 0.76 而非 2.7——2.7 是 split 时代含量化/读回的捆绑口径）。
+设备侧 A:wait 525µs/层、B:wait 389µs/层 vs 流地板（16.9MB/10.6MB @48.9GB/s =
+345/217µs）→ **每对设备固定成本 ~120-130µs**，63 对 ≈ 8ms——与 P26b 的
+"7.6ms exec 结构"闭合。
+
+**下一刀的裁决数据**：P27-2（swiglu 上设备、pair B 入口胶水）一刀切掉
+swiglu 763 + B:quant 3563 = **−4.3ms**；随后 A:quant/attn/read 的 SIMD 化
+再收 ~2ms；剩下的 ~8ms 设备固定成本要靠 P27-3 链化/更深融合。FLM 每层
+585µs vs 流地板 555µs（+30µs 固定）是我们 exec 结构差距的坐标。
