@@ -2379,3 +2379,71 @@ golden 把反量化权重多舍入了一次 bf16，而设备做的是精确 int3
   波动同理（P21-5 漂移定律不变）。
 - 存档：tools/p28/（sim.py 假设机、dumps、修后 .o、PMEM 考古、
   cdo_fail.log、README 含工具坑）。
+
+## P28-5（2026-09-29）：layer-v2 host E2E 集成 —— 33 exec/token，30.6ms，双门 PASS
+
+### 5a. 架构（半层错位 + 零核改动头尾填充）
+
+layerv2 一 exec 算"半层错位"：[o+MLP of 层 e−2] + [qkv of 层 e−1]。
+依赖链强迫错位：qkv_L → host rope/qk-norm/attention → 下一 exec 的 X
+元素，宿主注意力必然横在两 exec 之间。33 exec/token：exec1 = 头（X
+q=0 → o 精确为 0；w2=零元素 → 整个 MLP 精确为零 → xn1 = xn），exec
+33 = 尾（w1=0 → qkv 段精确零；其 xn1 drain = 最终 hidden）。板测实证
+零填充的精确性：exec1 xn1 与 x0 **逐 bit 相等**、exec33 qkv 段**逐 bit
+为零**——int 点积乘零 A 的"数值恰好为零"论证成立。
+
+设备侧全部复用 P28-4 内核/xclbin（零改动）；集成全在宿主：
+- 每 exec W BO（27.62MB × 33，离线 tools/layerv2_pack.py 重切
+  w4u_hy v4 包，无重量化）；X/XN/C 三个共享 BO（148KB×2 + 10KB）。
+- 每 exec 宿主步：填 XN（worker w ← 上一 drain 的 w 行 [384,640)，
+  同 worker 索引无换位）→ 填 X（attn 量化 q/d 复制 8 槽）→ clflush C
+  （P21）→ submit+wait → 读 drain → 按环位拼 qkv → host attention。
+- lm_head 走 plain w4gemvu PDI 在 CU1（每 token 一次 cu 翻转 ~650µs，
+  唯一残留 PDI reload）。
+
+### 5b. 踩坑一：打包约定的环形镜像（循环验证教训）
+
+首板测 hidden rel_rms 0.92。dump 全 33 exec 对拍定位：**exec1 xn1 精确
+、exec33 qkv 精确、但 exec1 qkv 的 worker 0-3 精确而 4-7 全错**；对拍
+矩阵 dump[w] vs golden[w′] 显示 w≥4 完美镜像（dump w4 == golden w7
+== max|d| 0.0000）。根因：**列 p 装 p 位** vs 设计契约 **列 w 装
+pos(w) 位**（test_layerv2 build_worker_weights(pos(w))；pos 为对合，
+w≥4 列 4-7 全镜像）。后果：ring2 all-gather 拼出的 sw = [s0,s1,s2,s3,
+s7,s6,s5,s4]，所有 down partial 吃镜像 K 段 → exec2+ xn1 漂 0.2-0.6，
+经 31 轮 host attention 复利到 50%+（每 exec ×~1.05 的混沌放大——
+fused 路当年 1.9% 是因为全链 bit-exact，任何 ulp 种子都会指数走）。
+教训留痕：**离线"验证 pack == 源列"是循环论证**（用同一错误约定两边
+自洽）；非循环验证必须对拍"列 w ↔ 源列 pos(w)"。修复 = packer 按
+pos(col) 取块；golden 无需重生成（与约定无关）。
+
+### 5c. 踩坑二：timed 循环 exec1 的 X 忘记清零
+
+e==1 分支跳过 X 填充（假设 setup 零永存）——但上一 token 的 exec33
+已把真实 attn q/d 写进槽里。修复：每 token e==1 显式写零 q/d。
+
+### 5d. 结果（两连跑全 PASS，5 iters warmed）
+
+- gates：hidden rel_rms **3.48%**，logits rel_rms 2.63%，argmax 同
+  token（25868），top-8 **8/8**。
+- steady **30.57 / 30.64 ms/token（32.7 tok/s）**，vs one-CU fused
+  30.1ms（预期内 ~1% regression，用户定律：向 NPU 更满用的路线过渡
+  可接受）。
+- hostprof/token：lv2:wait 25.77ms（设备 33 exec ≈ 781µs/exec）+
+  lm 3.21ms + attn 0.99ms + qknorm 0.11 + fills 0.38 + read 0.17。
+- per-op：lv2exec solo **765µs（n=165）= 36.1 GB/s stream（74% of
+  48.9 slot-stream 天花板）**；lmhead 3184µs = 44.1 GB/s（90%）。
+- 对标：FLM 21.44ms。差距 9.1ms 全在层外/带宽利用：33×~781µs 设备
+  （vs P28-4 独立 826µs——链上无惩罚）+ lm 3.2 + host 2。**P28-6
+  环加宽（8→16/32 worker，NPU2 有 8 shim 列 × 4 计算行 = 32 tile，
+  QoS partition 已含 column_width 8）是下一刀**：per-worker 流量 ÷4
+  → exec ~210-430µs → 设备 7-14ms → 总 12-19ms/token，越过 FLM。
+
+### 5e. 存档
+
+- tools/layerv2_pack.py（33-exec packer，pos(col) 约定）；tools/
+  layerv2_golden.py（E2E golden：unpack_deq32 逐 bit 复原 v4 权重 +
+  test_layerv2 内核链 + decode_export 宿主胶水；--execs/--skip-lm）。
+- build/lv2_hy/：exec01..33.bin + golden_exec01..33 + hidden/logits。
+- /tmp/lv2_dump/（LV2_DUMP_ALL 调试 dump）；/tmp/p28/*.log。
+- 引擎：run-decode hy lv2（HSeg 15→18：lv2:fill/wait/read；LV2_DUMP
+  排障；XNPU_SKIP_GATES 逃生门不变）。
