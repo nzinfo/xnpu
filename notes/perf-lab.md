@@ -1164,3 +1164,238 @@ DMA 通道 ~5GB/s 是当前流上限**，8 列 → ~40GB/s 封顶；FLM 21.44ms
 - **下一步**：attention/swiglu 元素化（M5 遗留）——cpu 口径剩余 gap =
   CPU attention 6.2ms + swiglu 2.7ms；npu 口径瓶颈 = flowkv strided 1GB/s
   需重排布。
+- **补记（尾层 down 741µs 结案）**：CU1→CU0 翻转后首个 exec，按 P9 机制
+  = ~500µs fw PDI 重载计入该 op solo（232 基线 + 税）。fused 链每 token
+  2 次翻转（首 plain qkv CU0→CU1、尾 down CU1→CU0）是结构性的（两 PDI
+  异 CU），非 bug。
+
+## P19（2026-09-27）：四联 exec（quad）——每层一个 exec，设计先行
+### 设计思路
+**拓扑**：把 pair A+B 合成每层一个 exec：
+`[o →rms1→ gateup →swiglu→ down →rms2→ qkv(n+1)]`，31 个 quad（n=0..30）
++ L0 plain qkv + L31 pair A + 尾层 down plain（沿用 P18 夹具）。exec 数
+65→**34**（−31×~95µs 固定成本 ≈ −2.9ms）+ 消宿主 gateup 读回/swiglu/
+量化/sync 路径（~140-150µs/层 ≈ −4.4ms，其中 swiglu 标量本体 2.7ms）。
+目标 37.55 → **~31-33 ms/token**。swiglu 必须上设备是本设计的根本前提
+（exec 内 host 往返不可能）。
+
+**C 布局（行）**：o sections 2304（16 blk/列）| win1 9280（residual1 @
++2304，hdr K=1/blocks1=16 @9276-9279）| gate cols0-3 6272 | padA 3008
+（宿主写 K=4 hdr @窗口行 9276-9279）| up cols4-7 6272 | padB 3008（K=5
+hdr）| down sections 6400（48 blk/列）| win2 9280（residual2 @+6400，
+hdr blocks1=48）| qkv sections 3328（24 blk/列）。合计 49152 行 = 96KB。
+padA/padB 存在的原因：C-sourced fill 必须产整元素（9280 行），而
+K=4/K=5 头部字（元素尾 ELEM-8/ELEM-4 = 窗口行 9276-9279）若落在
+live C 数据上会破坏 gate/up 输出——垫 3008 行宿主区，头字写进垫里。
+op2 的 drain 逐列偏移带 gap（col≥4 偏 +3008）。
+
+**tg/BD（≤4 fills/shim 律全过）**：tg1=[X, A1(o 块)]→C1(o) wait；
+tg2=[win1(K=1), A2(w1 K=3 元素+gateup 96 块)]→C2 gateup sections wait；
+tg3=[swA(K=4 gate 窗), swB(K=5 up 窗), A3(down 48 块，无 X)]→C3 down
+wait；tg4=[win2(K=1), A4(w2 K=3+qkv 24 块)]→C4 qkv。宿主每层写
+residual1+residual2（8KB）+ 一次性 padA/padB 头字；sync 策略=整 C BO
+一次 ToDevice（96KB clflush，1 ioctl/层，比 P18 每对 2 次更省）。
+
+**内核新口味**（K=1/K=3 原样复用——quad 的 win1 blocks1=16 同 pair A、
+win2 blocks1=48 同 pair B）：
+- **K=4（fused_stage3a）**：gate 窗（cols0-3）16 宽向量拷贝到
+  x_stage[0..12288) bf16——纯向量，stage1 同形。
+- **K=5（fused_stage3b）**：up 从 a_in（j→u16 idx (j/1536)*1568+32+
+  j%1536），gate 从暂存；逐 32 组：sw = g·sigmoid(g)·u，f32 向量；
+  sigmoid = 1/(1+2^{−g·log2e})（**硬件 exp2<bfloat16>，相位 1**，P4
+  偏差 mean+3.25%/max+5.67% 已知，E2E 双门裁决）；向量 f32 除法帧成本
+  未探（回退备选 tanh<bfloat16> 初等指令：sig=0.5+0.5·tanh(g/2) 免除法
+  ，同属硬件初等带偏差）。组内 amax=整数位序 max，d=bf16(amax/127)，
+  q=魔数加取整（P17 全套 trick 复用），**A 操作数直接按复制形态写目标
+  [128·gi)**（免中间 q 数组）；d[gi] @ kDStageOff+2gi；r 暂存 128B
+  temp @24960（x_stage 扩 128B，L1 预算 63.3KB<64KB）。
+
+**scratch 冲突消解（关键推导，写错就静默错数）**：K=5 单次调用内
+gate 暂存 [0..12288) 与 A-ops 目标 [0..24576) 同域。**块序倒序**
+（c=2,1,0）：A-ops 块 c 写 [8192c..8192(c+1))，未读 gate=[0..4096(c+1))
+恒在写区间下方 ✓（c=1 写 [8192..16384) vs 未读 gate [0..8192)；c=0
+时 gate 已全消费）。组序亦降序（gi 191→0：A-ops 写 [128gi,+128)，
+未读 gate ≤64gi+64 ≤ 128gi ✓）。sw f32 现算现用不落盘（寄存器），
+r/q 经 128B temp 中转。per-group broadcast(invd) 是已知编译 hazard
+（load_v/mac 环内 broadcast 运行时标量）→ **逐组 noinline 函数**
+（broadcast 在函数入口、无循环），sequencer 192 次调用；帧超 0x400 再
+对半拆 v/s 两函数。
+
+**风险清单**：(1) 向量 f32 除法/exp2/tanh 的可降形与帧成本——离线
+clang+objdump 先探（v24.cc）；(2) exp2 偏差经 31 层复利超 5% 门——
+E2E 裁决，回退=换 tanh 或（最坏）swiglu 留宿主+双 exec 妥协形态；
+(3) C-sourced fill×4（win1/swA/swB/win2）的 tap 维数/stride——照抄
+design_fused 的 C1_taps 形；(4) op2 drain 逐列 gap 偏移是新 ctrl 形，
+首次跑挂死优先查 BD slot 律；(5) per-group 函数代码量 192 调用点。
+
+### 尝试步骤（进行中）
+1. **离线探针 v24 系（P17b 方法，全部留档 /tmp/v24*.cc）**：
+   - API 事实：`aie::exp2<bfloat16>(vector<float>)`/`aie::tanh<bfloat16>
+     (vector<float>)` 都是 XDNA_2 门控、**float 进 bf16 出**；
+     `aie::div(v,v)` = mul(a, inv(b))，inv 是 ElementaryOp，返回直接是
+     vector（非 accum）。
+   - v24 单体（向量 sigmoid + 标量 amax/quant/提取同函数）：**>5min 挂死
+     clang**——P17b「u32 循环混 soft-float」定律再犯确认。
+   - bisect（v24a/b/c）：exp2+div 向量形 2.8s/0xc0（入口含栈上 temp 数组
+     的探针伪影，内层向量函数 0x0）；tanh 形同；**挂死全在标量尾**。
+   - v24d（每 chunk 相位化）：64 迭代 sigmoid 环编译出 **0x400 帧**（~9 个
+     活 f32 向量寄存器压力溢出）——链溢出。
+   - **v24e 终态（设计随之简化）**：sw chunk 暂存整个取消，改**全 per-group
+     流水**：sig(0x0)→amax(0x0)→quant(0x280)→x(0x40)，stage3b 序 0x40，
+     链 0x20+0x40+0x280=**0x2e0 ✓**，4.7s 编译。scratch 只剩 gate 暂存
+     [0..12288)（降序 gi 被 A-ops 覆盖：写 [128gi,+128) 恒在未读 gate
+     [64gi,+64) 上方）+ 专属 128B temp @24960（x_stage 扩至 25088，
+     L1 63.3KB）+ d[192] @kDStageOff。**降序 gi 是第 14 次推出同一结论：
+     任何升序都会写穿未读 gate。**
+2. **设计复核揪出两个错误（写 design 前闭卷重推 C 布局时发现，都改在设计里）**：
+   - **残差 2 宿主不可算**：residual2 = x'_n = x_n + o_out，而 o_out 是本
+     exec 内 tg1 才算出来的——P18 能算是因为 pair A 与 pair B 之间有读回。
+     原设计「宿主每层写 residual1+residual2」对 residual2 不成立。**解法 =
+     tg4 加第 3 个 fill：win1 窗重读**（o sections 在 C 里 tg1 drain 后一直
+     有效）：tg4 = [win2(K=2), win1-re(K=1'), A4(K=3+24块)]。新口味：
+     - **K=2（win2 变体）**：down sections 有 **2 个哑元组**（K=4/K=5 各产
+       1 个零 C），stage1 的 +16 跳过不够 → +32 变体 fused_stage1b；win2
+       hdr 是专属 pad 行，宿主直接写 K=2 字，无需 flag。
+     - **K=1'（win1 重读，flag 派发）**：重读窗=[0,9280) 行，其 hdr 字节
+       就是 tg2 用过的 K=1（数据即字节，无法改字）→ 用 **quad flag**：
+       stage3b（K=5）尾部写 flag=1 @temp+124（24960+124，K=5 循环后）；
+       K=1 派发见 flag → fused_stage1r 并清零。pair 流程 flag 恒 0（唯一
+       set 者是 quad-only 的 K=5，唯一 consume 者是其后第一个 K=1），向后
+       兼容。stage1r：o partials 紧凑化到 [4096,8192)（chunks=1，4096B），
+       与元素内 residual1（窗行 2304..4352，连续）向量求和 → h2' bf16 存
+       **kResStageOff**——正好是 stage2a 读 res 的位置，**K=3 零改动**；
+       stage1r 先跑（把 stage1b 暂存的 res2 覆盖成 h2'，x_n 不再需要，
+       宿主不写 residual2）。顺序闭环：stage2a 读 res=h2' + partials=
+       down（stage1b 暂存 [8192,20480)）→ h = x_{n+1} = down+x_n+o_out ✓。
+       曾考虑把重读放 tg3（K=5 后同组）——**死路**：K=5 的 A-ops 降序写
+       [0,24576) 会踩 h2'；重读必须在 tg4。
+   - **gate/up/down 窗口全是 2 哑元，内核 +16 全错**：gateup 段 C 元素 =
+     K=1 零 C + K=3 零 C + 96 块 = 98 组，真值在 [32,1568)——已写的
+     stage3a/stage3b 用了 +16（照抄 stage1 的 1 哑元形），要改 **+32**。
+     同理 qkv 段 3 哑元（win2 零 C + win1' 零 C + K=3 零 C）：27 组写入、
+     stride 28 组（448 行）、宿主读 section+48。
+   - **C 总行数勘误**：原记 49152 行是把 down sections 与 win2 重复计数；
+     win1/win2 都内含各自 op1 sections。实际 **40704 行 = 81408B**：
+     [0,9280) win1(o 2304+res1 2048+pad+hdr@9276) | [9280,15552) gate
+     cols0-3 | [15552,18560) padA(K=4 hdr@18556) | [18560,24832) up cols4-7
+     | [24832,27840) padB(K=5 hdr@27836) | [27840,37120) win2(down 6400+
+     res2 2048@+6400+pad+hdr@37116,K=2/48) | [37120,40704) qkv sections
+     （8×448，27 组写入）。op2 drain 逐列 gap：col≥4 偏 +3008 行。
+   - tg4 变 3 fill（win2/win1-re/A4）后 ≤4 fill/shim 律仍全过（2/2/3/3）；
+     P16 律按「每组 drain 前填充链 ≤4」读，quad 全部满足（若板上挂死，
+     回退=把 tg3/tg4 各拆两组，全回到已证 2F+1D 形）。
+
+## P19b（2026-09-28）：quad 点亮全程 —— PMEM 16KB 律、5-BO 上限、缺零 C 红鲱鱼、hw sigmoid 落地
+### 尝试步骤与成败
+1. **PMEM=16KB 是 CDO loader 的硬律（第三次实证）**：peano ld.script 声称
+   program LENGTH=0x20000，但 `_XAie_LoadProgMemSection` 实际只装 16KB。
+   链接胶水（crt0+MLIR core wrapper）恒 **3052B**（手工 aiecc 复现法：
+   mlir+w4gemvu.o 拷进同一 cwd，`--aie-generate-npu` 后看 .prj 里 ELF）。
+   三轮超标 18036→14868→13748→**11476**（.o text）：
+   - 轮1：sw_amax/sw_x/sumsq-reduce 加 `#pragma clang loop unroll(disable)`
+     （clang 全展开小标量循环，32 次比较链 ~0x1d0、8 存储体 ×16 展开
+     ~0x410——展开是 PMEM 之敌）；
+   - 轮2：stage1/stage1b 合并共享 `fused_stage1s(skip)`；
+   - 轮3：共享 `fused_h2make`（stage1r/stage2a 同一 h2 循环）+ 共享
+     `fused_zero_c`（5 个口味各自的 16 存零尾 ~100B×5）+ sumsq 标量归约
+     roll。热循环 w4gemvu_compute 2368B 一字未动。
+2. **NPU ctrl kernel 签名上限 5 个 BO（新律）**：mlir_aie
+   emit_design_kernel_json 硬编码 `[f"bo{i}" for i in range(5)]`
+   （aiecc/main.py:180-190）。第 6 个张量 → 宿主 prepare_runtime 在
+   `xrt::run::set_arg_at_index` SEGFAULT。修法=P12 老招：X 激活元素骑
+   packed1 头部（6→5 BO：packed1..4+output），rt.sequence 序 A1,A2,A3,A4,C。
+3. **npu_insts.mlir 可读（关键调试杠杆，新发现）**：aiecc 保留
+   `.prj/npu_insts.mlir` = 事务层 MLIR（write32/blockwrite/maskwrite/sync
+   全可读）。由此实测寄存器语义：每 shim 2×MM2S+2×S2MM 通道（8 核 2 列
+   ×4 行，4 shim 各带 2 核）；BD 槽号=**每组从 0 重数**（fill+drain 共用
+   计数）；MM2S 起始寄存器逐个 enqueue 槽号；S2MM 队列值=槽号；
+   `dma_free_task` **不产生任何指令**（纯编译期槽回收标记）；组末
+   npu.sync 只等 drain 方向（fill 完成由 drain 完成+核消费传递隐含）。
+   tg3/tg4（无 drain 组）fill 后无任何屏障——本次不是问题源头，但此
+   「无 sync 组的槽重用」仍是未证形，后续设计慎用。
+4. **红鲱鱼：『tg2 gateup 块重投递』两天的误诊**：首板现象=down 段
+   dummy0 全 8 列垃圾，值精确等于 gate col0 倒数第二块的已存 C（行
+   10816 配对命中）→ 以为是 BD 槽/队列碰撞（P16 律重演）。拆 tg3/tg4
+   （3F+1D→2F|1F+1D）**无效**→ 排除组结构。真相：**fused_stage3a
+   （K=4）漏写 fused_zero_c(c_out)**——C 元素契约（每个 A 元素恰产
+   一个 16 行 C）被破坏，tg3+tg3b 只产 49 C 对 drain 50 组，饿死的
+   S2MM 首组读了**陈旧 L1 fifo 缓冲**（恰是最后一块 gateup 的 C）再
+   自行对齐。一行修复（补 zero_c）后 dummy 全零、结构全对。
+   教训：值配对定位到「重投递」时，先数**元素收支**再怪 BD。
+5. **hw sigmoid 落地量化（相位 1 裁决数据）**：golden 用精确 exp，
+   内核用 exp2<bfloat16>。down 段 partial 是 ±8000 量级的抵消和，
+   组间 2-3% 微分偏差按**项规模**传播：max_abs=192（≈2.4% 项规模）、
+   max_rel=41（近零结果无界相对误差）、47/6144 行超 rel1.0/abs10。
+   但 rms2 重归一吸收：qkv 段（吃这些 partial）偏差 ≤**0.75 绝对**。
+   测试带：down 段 rel0.08/abs200（其余段 rel0.08/abs0.8 严格），
+   E2E 双门仍是数值最终裁判。若 E2E 失败，回退=div 换
+   tanh<bfloat16>（sig=0.5+0.5·tanh(g/2)，免除法，同族偏差）。
+6. **板上偶发漂移复现**：3 次 pytest 中 1 次 o/gate 段报错（不同行），
+   另 2 次+复跑 15 次全过——即积压的「run 间漂移」在 quad 长事务上
+   更易现。root cause 仍欠（backlog），E2E A/B 取多 run 口径。
+### 结果
+**test_quad 全过（15/15 稳定）**：quad 单发 **~1063-1118µs（均值
+~1087µs，25.5 GB/s 权重流）**。对照：P18 pair A+B 独立和=879µs+宿主
+swiglu/量化/往返（E2E 每层 ~1173µs）——quad 单发看似更贵，但省掉一次
+exec 提交+宿主回读往返；净赚多少由 E2E A/B 裁决（Rust `quad` flag 下
+一步）。
+
+## P19c (2026-09-28): Intel NPU 开源调研(跨厂商借鉴)
+
+用户命题:不限 AMD,调研 Intel NPU(MTL 37xx/LNL 40xx)开放资料里可移植的优化思路。
+全文见 `notes/intel-npu-survey.md`(来源分级:driver 头文件=硬契约 / OpenVINO=官方 / 媒体 / 逆向)。
+最有价值的不是文档而是 **linux-npu-driver 的 firmware/include 头文件**:WLM(workload
+management)、DMA 描述符、NCE 寄存器、CMX 布局全是硬事实。
+
+对我们最有用的五条(按与 65-exec 问题的相关度排序):
+1. **invariant/variant 两级描述符**(260B 层静态 + 44B workload 动态,LUT 关联,从 DDR
+   预取进 CMX 固定槽双缓冲)→ 直接对应我们的 16-BD 槽 + 每 exec 重发:描述符能分层复用,
+   层间只换 variant。
+2. **同步前移数据化**:编译器把整图编成 work items + barrier 重编程表,DMA 任务自己往
+   引擎 FIFO 喂描述符,barrier 编程也可 DMA 化(ALL_BARRIER_DMAS_SCHEDULED 运行时零参与)
+   → 固件/host 彻底退出热路径,是 65-exec 问题的正面答案(XDNA2 上等价物 = 把 task-group
+   链编进一个 ctrl 序列,host 每 token 只提交 1-2 次)。
+3. **写回侧 swizzle**:ODU 带 swizzle_key/permutation、IDU nthw_ntk 布局,硬件做 transpose
+   → 对应 flowkv 的显式转置开销(strided 主导 118ms 的 npu 口径)。
+4. **PPE/ODU 融后处理**:scale/bias/prelu/LUT/dtype 融在矩阵消费侧 → 与我们 rms/swiglu
+   融进 GEMV 消费端同构,佐证 P16-P19 路线。
+5. **latency/throughput 双拓扑编译期选择**:LATENCY 用满 tile、THROUGHPUT 少 tile + 8
+   outstanding requests → 我们的 8 核 decode 是 LATENCY 型,可借鉴其"多 tile vs 深 FIFO"权衡。
+
+另:barrier 每组 32/16、64 位 prod/cons 掩码;CMX 描述符槽 256 DMA/32 inv/256 var(37xx);
+DMA 描述符 80B/64B 对齐/链表式;I4/U4/FP8 + pallet[8] 权重调色板;npunlock 证实 blob=ELF+
+MMIO preactions(可在 MTL 上写 C 编 ACT-SHAVE)。不开放别追:固件二进制、barrier FIFO
+深度、STT/SIF 互连、SHAVE 工具链官方分发、NPU5 细节。
+
+## P19d（2026-09-28）：quad E2E 点亮 —— missing-down host bug、双门 PASS、间歇 hang 未解
+
+1. 现象：E2E 雪球 L0 64/2048 → L1 196 → L2 705 → 垃圾（final rms 2.639 = golden 能量
+   的 100.1%、max err 105 —— "同能量、不相关"），且 ~50% run 在随机层 hang。
+2. 定位手段（可复用）：
+   - in-process 对拍：quad(0) 的 o sections vs plain op = **0/4608 bytes differ** → o 路径 bit-exact；
+   - QUAD_DUMP 逐层原始 qkv(n+1) 读回，quad vs fused 对拍：v-slice max_abs **2e-4**（L1）
+     → 5e-3（L10），L11 才跳 0.18 → qkv 读回与数值全程正确，排除读回 bug；
+   - 决定性一步：golden_L00 − (x0+o) 就是 down(0)：max 0.035、mean 0.0073 ——
+     L0 的 64 行"超差"正是**缺失的 down 本身**。
+3. 根因：gemv_quad 的 host 残差更新只做 x+o，**漏了 down**。device 内部 h2''=(x+o)+down
+   是对的（所以 qkv 全对），host 轨迹每层丢一个 down → Σdown 逐层累积 → L11 起
+   attention 去相关 → 雪球。早先"L0 64 行 = hw sigmoid 数值类"的判断是**错的**：
+   hw sigmoid 的微分误差实测只有 ~2e-4 量级（v-diff），phase-1 预留的 tanh fallback
+   **不需要**。
+4. 修复：读 quad C 的 win2 down sections（base **27840**、8×800 行、2 dummy groups、
+   chunk-major 3×256），x_{n+1} = bf16(f32(bf16(x+o)) + Σ_c f32(p_c))，与
+   golden/device 的舍入顺序一致。（第一次把 base 写成 37116 —— 那是 K=2 header
+   words 的位置，越界 panic 暴露。）
+5. 结果：**双门 PASS** —— final hidden rms 0.0454（golden 2.635 的 1.7%）、
+   lm_head rel_rms 0.0221、argmax 25868 一致、top-8 8/8；逐层 ≤16 bad rows
+   （无 debug 行触发）；跨 run 数值完全确定。
+6. 性能（run-decode hy cpu，5 iters）：quad **43.76 ms/token** vs fused 38.46 ——
+   回归 +5.3ms（用户裁定：向 NPU 最大化路线的短暂回归可接受）。分解：quad exec
+   solo 1066µs × 31 = 33.0ms；serial est 39.7ms vs fused 59.0ms（**串行口径省
+   19.4ms**），但 quad 链 Δ=+4100µs（零流水 + host 开销）vs fused Δ=−20582µs。
+   已知可改：(a) X 重写现在整 BO clflush 2.5MB/exec，应只 sync 8 个 head 区
+   148KB；(b) K=5 glue 计算成本；(c) 层间 submit 流水化。
+7. 遗留：**间歇 hang**（~1%/exec，Timer expired，dmesg 无驱动错误）——与数值无关
+   （gates pass 后 timed iters 也 hang），quad 专属（fused 全天稳定），命中层随机
+   （L12/L15/L29，seq 13/100/191）。疑点：5 task-group 链 / win1 re-read /
+   BD slot 交互。→ P20。
