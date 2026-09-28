@@ -1620,3 +1620,21 @@ packed1 头部连续区 `[X0..X7 | blocks0..blocks7]`，tg1 每列改两次 fill
    vs 我们 fused 63 exec；其代价是每层 51.5KB×32=1.65MB ctrl-code
    复用（BO 每轮重建）与 309×32≈9.9k 条 TCT 的流内等待。ctrl-code
    密度（指令/有效计算）是我们的差距方向，也是融合深度的度量。
+10. **0-SYNC_BO 之谜破解（axcache 定律）**：objdump 扫 engine 全家
+    （libhunyuan_npu/libmha/liblm_head 等 27 个 .so）0 条 clflush/sfence，
+    FLM 用的是系统 XRT（libxrt_coreutil）——不是用户态 flush。真机制在
+    **BD 描述符的 AxCACHE 属性**（write_dma.hpp: no_cache=0 /
+    normal_cache=0x02 / aggressive_cache=0x0e，payload 第 5 字 <<24）：
+    - FLM 层 blob：311/316 个 BD = 0x0e（aggressive，全部大流量 BD），
+      例外 5 个 0x02 恰是 c2 分发列的小 op
+    - IRON quad：128/128 全是 0x02（normal）
+    即 **DMA 描述符声明 snoop/一致性 → NPU 读写直接命中 CPU cache 行，
+    软件缓存维护（SYNC_BO/clflush）整体可省**。我们 P21 测的 ToDevice
+    clflush 成本，根源就是 IRON 产出的 normal_cache BD。
+11. **P24 候选实验（axcache 移植）**：patch 我们 fixture ctrl bin 的
+    BD w[9] 0x02000000→0x0e000000（python 补丁器）+ 引擎加
+    XNPU_NO_DATASYNC 环境变量跳过数据面 ToDevice clflush → golden
+    对拍。PASS 则"SYNC_BO 消除"从 FLM 观测变为我方工程事实；
+    FAIL 则 0x0e 在 x86+此代互联上另有条件（IOMMU/非 snoop 路由）。
+    注意 ctrl-code BO 本身的一致性另算（amdxdna exec 路径 kernel 侧
+    对 cmd BO 有 dma map，P20b 的首 exec 竞态与之相符）。
