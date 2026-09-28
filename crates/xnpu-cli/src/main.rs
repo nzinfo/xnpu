@@ -198,6 +198,7 @@ fn main() -> ExitCode {
             let arch: &DecArch = if is_hy { &DEC_HY } else { &DEC_MINICPM };
             let fused = args.iter().any(|s| s.as_str() == "fused");
             let quad = args.iter().any(|s| s.as_str() == "quad");
+            let lv2 = args.iter().any(|s| s.as_str() == "lv2");
             if (fused || quad) && !is_hy {
                 eprintln!("fused/quad chains need the hy arch (qkv_m 3072)");
                 return ExitCode::FAILURE;
@@ -205,6 +206,32 @@ fn main() -> ExitCode {
             if fused && quad {
                 eprintln!("fused and quad are exclusive chain modes");
                 return ExitCode::FAILURE;
+            }
+            if lv2 {
+                if !is_hy {
+                    eprintln!("lv2 chain needs the hy arch (layerv2 packs are hy-only)");
+                    return ExitCode::FAILURE;
+                }
+                if fused || quad {
+                    eprintln!("lv2 is exclusive with fused/quad");
+                    return ExitCode::FAILURE;
+                }
+                let pos_args: Vec<&String> = args[1..]
+                    .iter()
+                    .filter(|s| !matches!(s.as_str(), "cpu" | "hy" | "hy-mt2" | "lv2"))
+                    .collect();
+                let decdir = pos_args
+                    .first()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| arch.decdir.to_string());
+                let w4dir = pos_args
+                    .get(1)
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| arch.w4dir.to_string());
+                let iters = pos_args.get(2).and_then(|s| s.parse().ok()).unwrap_or(5);
+                // P28-5: host attention between execs is inherent to the
+                // half-layer-shifted chain — no flowkv mode here (yet).
+                return cmd_run_decode_lv2(arch, &decdir, &w4dir, iters);
             }
             let pos_args: Vec<&String> = args[1..]
                 .iter()
@@ -287,7 +314,7 @@ fn main() -> ExitCode {
         }
         _ => {
             eprintln!(
-                "usage: xnpu-cli <info | ctx-probe [max] [cols] | run-add [prj-dir] [bf16|i8] | run-gemm [prj-dir] [M K N] [bf16|i8] | run-multi [add-prj] [gemm-prj] [M K N] | run-pipe [prj-dir] [M K N] [iters] | run-chain [add-prj] [gemm-prj] [M K N] [reps] | run-q8 [gemm-prj] [rescale-prj] [M K N tile_m] [reps] | run-w4gemv [prj-dir] [M K] [group] [tsi] [iters] | run-w4layer [w4-dir] [layers] [iters] | run-w4ulayer [w4u-dir] [layers] [iters] | run-decode [dec-dir] [w4u-dir] [iters] [hy] [cpu] [fused|quad] | run-lmhead [iters] | perf-calibrate [hy] [iters]>"
+                "usage: xnpu-cli <info | ctx-probe [max] [cols] | run-add [prj-dir] [bf16|i8] | run-gemm [prj-dir] [M K N] [bf16|i8] | run-multi [add-prj] [gemm-prj] [M K N] | run-pipe [prj-dir] [M K N] [iters] | run-chain [add-prj] [gemm-prj] [M K N] [reps] | run-q8 [gemm-prj] [rescale-prj] [M K N tile_m] [reps] | run-w4gemv [prj-dir] [M K] [group] [tsi] [iters] | run-w4layer [w4-dir] [layers] [iters] | run-w4ulayer [w4u-dir] [layers] [iters] | run-decode [dec-dir] [w4u-dir] [iters] [hy] [cpu] [fused|quad|lv2] | run-lmhead [iters] | perf-calibrate [hy] [iters]>"
             );
             ExitCode::FAILURE
         }
@@ -4813,14 +4840,18 @@ enum HSeg {
     ReadB,
     FinalNorm,
     Lm,
+    Lv2Fill,
+    Lv2Wait,
+    Lv2Read,
 }
-const HSEG_NAMES: [&str; 15] = [
+const HSEG_NAMES: [&str; 18] = [
     "rope", "qknorm", "kvapp", "attn", "swiglu", "A:quant", "A:res", "A:wait", "A:read",
-    "B:quant", "B:res", "B:wait", "B:read", "finalnorm", "lm",
+    "B:quant", "B:res", "B:wait", "B:read", "finalnorm", "lm", "lv2:fill", "lv2:wait",
+    "lv2:read",
 ];
 
 thread_local! {
-    static HOSTPROF: std::cell::RefCell<Option<Box<[u64; 15]>>> =
+    static HOSTPROF: std::cell::RefCell<Option<Box<[u64; 18]>>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -4839,7 +4870,7 @@ fn hp_add(seg: HSeg, ns: u64) {
 
 fn hp_reset() {
     if hp_enabled() {
-        HOSTPROF.with(|h| *h.borrow_mut() = Some(Box::new([0u64; 15])));
+        HOSTPROF.with(|h| *h.borrow_mut() = Some(Box::new([0u64; 18])));
     }
 }
 
@@ -5393,8 +5424,657 @@ fn cmd_run_quadloop(iters: usize, mode: &str) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// M3b/M4a: one full 42-layer decode step over real weights — the engine
-/// skeleton. Projections run on the universal w4gemvu CU (run-w4ulayer
+/// P28-5: host E2E integration of the layer-v2 chain (design_layerv2 +
+/// w4gemvu_layer.cc, P28-4: one exec = half a transformer layer shifted —
+/// [o+MLP of layer e-2] + [qkv of layer e-1] — on 8 persistent ring
+/// workers). 33 execs/token, all attention on host. The dependency
+/// qkv_L -> host rope/qk-norm/attention -> next exec's X element forces
+/// the half-layer shift; exec 1 pads with exact-zero weight packs (X q=0
+/// -> o=0, w2=0 -> the whole MLP is exactly zero, so xn1 = xn) and exec
+/// 33 has no qkv phase (w1=0 -> qkv section exact zeros; its xn1 drain
+/// IS the final hidden). Weights are pre-packed offline per exec
+/// (tools/layerv2_pack.py, every bit re-sliced from the verified w4u_hy
+/// v4 packs) so the runtime only fills X/XN per exec and reads the drain.
+///
+/// Drain geometry (test_layerv2): worker w's C rows = [qkv pos(w)-slice
+/// 384 | xn1 pos(w)-chunk 256]; XN(w) of the NEXT exec <- C(w)[384:640]
+/// at [0,512) of its element — same worker index, no permutation. Worker
+/// id u32 at X element [6400,6404) is static (the kernel derives its ring
+/// position from it); K headers ride the element tails, also static.
+fn cmd_run_decode_lv2(
+    arch: &DecArch,
+    decdir: &str,
+    w4dir: &str,
+    iters: usize,
+) -> ExitCode {
+    let build = "/home/nzinfo/qwen/xnpu/build";
+    let lv2dir = format!("{build}/lv2_hy");
+    let layers = arch.layers;
+    let execs = layers + 1; // head/tail-padded half-layer pipeline: L+1
+    const LV2_WELEM: usize = 186;
+    const DRAIN_ROWS: usize = 640; // [qkv 384 | xn1 256] bf16 per worker
+    let w_bytes = 8 * LV2_WELEM * W4U_ELEM;
+    let c_bytes = 8 * DRAIN_ROWS * 2;
+    println!(
+        "lv2 decode chain: {name} {layers} layers = {execs} half-layer execs on CU0 (8 ring workers, {mb:.2} MB weights/exec), host rope+qk-norm+GQA attention, lm_head CU1, {iters} iters",
+        name = arch.name,
+        mb = w_bytes as f64 / 1e6,
+    );
+
+    // ring position of worker w (design_layerv2 serpentine SUCC table).
+    let pos_of = |w: usize| if w < 4 { w } else { 11 - w };
+
+    // fixtures: the layerv2 xclbin (P28-4 test artifact) + the plain
+    // w4gemvu PDI carrying the M=121088 lm_head ctrl code.
+    let (lv2_pdi, lv2_instr, _) = match load_fixture(&format!("{build}/w4gemvu_layerv2_8.mlir.prj")) {
+        Some(f) => f,
+        None => {
+            eprintln!("load w4gemvu_layerv2_8 fixture failed (run test_layerv2 + copy first)");
+            return ExitCode::FAILURE;
+        }
+    };
+    const LM_M: usize = W4U_LM_M;
+    const LM_K: usize = 2048;
+    let (lm_pdi, lm_instr, _) = match load_fixture(&format!("{build}/w4gemvu_{LM_M}x{LM_K}.mlir.prj")) {
+        Some(f) => f,
+        None => {
+            eprintln!("load w4gemvu_{LM_M}x{LM_K} fixture failed");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let dev = match Device::open_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("open amdxdna device: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let md = match dev.aie_metadata() {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("AIE metadata: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let cols = 8u32;
+    let num_tiles = cols * md.core.row_count as u32;
+    let mut ctx = match HwContext::create(&dev, num_tiles) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("create hwctx: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // layerv2 on CU0, plain w4gemvu (lm_head ctrl) on CU1 — ONE cu flip
+    // per token at the lm boundary (~650µs, the P18 reload tax, once).
+    if let Err(e) = ctx.configure_cus(&[(lv2_pdi.as_slice(), 0), (lm_pdi.as_slice(), 0)]) {
+        eprintln!("configure_cus: {e}");
+        return ExitCode::FAILURE;
+    }
+
+    // ---- device buffers: [x, xn, c] shared by all 33 ops, then W_01..W_33.
+    // live layout: [X, XN, C, W_1 .. W_33]; live_lm: [w, x, c]. ----
+    let mut live: Vec<(BufferObject, Mapping)> = Vec::new();
+    // X: exec-1 zeros (q=0/d=0) + per-worker id + K=0 header — the q/d
+    // ranges are rewritten per exec, id/header stay for the process life.
+    let mut xdata = vec![0u8; 8 * W4U_ELEM];
+    for w in 0..8usize {
+        let e = w4u_build_x_elem(&[], &[], 2048); // q=0, d=0, K=0 header
+        xdata[w * W4U_ELEM..(w + 1) * W4U_ELEM].copy_from_slice(&e);
+        xdata[w * W4U_ELEM + 6400..w * W4U_ELEM + 6404]
+            .copy_from_slice(&(w as u32).to_le_bytes());
+    }
+    if chain_tensor(&dev, &mut live, "X", &xdata).is_none() {
+        eprintln!("X BO failed");
+        return ExitCode::FAILURE;
+    }
+    // XN: header K=100 per element; [0,512) is the residual chunk (exec 1
+    // = x0 by ring position, later execs = the previous exec's drain).
+    let host = Lv2Host::load(arch, decdir);
+    let mut xndata = vec![0u8; 8 * W4U_ELEM];
+    for w in 0..8usize {
+        let p = pos_of(w);
+        let off = w * W4U_ELEM;
+        for j in 0..256usize {
+            xndata[off + j * 2..off + j * 2 + 2]
+                .copy_from_slice(&host.x0[p * 256 + j].to_le_bytes());
+        }
+        xndata[off + W4U_ELEM - 8..off + W4U_ELEM - 4].copy_from_slice(&100u32.to_le_bytes());
+    }
+    if chain_tensor(&dev, &mut live, "XN", &xndata).is_none() {
+        eprintln!("XN BO failed");
+        return ExitCode::FAILURE;
+    }
+    if chain_tensor(&dev, &mut live, "C", &vec![0u8; c_bytes]).is_none() {
+        eprintln!("C BO failed");
+        return ExitCode::FAILURE;
+    }
+    let mut ops: Vec<ChainOp> = Vec::with_capacity(execs);
+    let mut handles: Vec<Vec<u32>> = Vec::with_capacity(execs);
+    for e in 1..=execs {
+        let data = match std::fs::read(format!("{lv2dir}/exec{e:02}.bin")) {
+            Ok(d) => d,
+            Err(err) => {
+                eprintln!("read exec{e:02}.bin: {err} (tools/layerv2_pack.py)");
+                return ExitCode::FAILURE;
+            }
+        };
+        if data.len() != w_bytes {
+            eprintln!("exec{e:02}.bin: {} B != {w_bytes} (stale pack)", data.len());
+            return ExitCode::FAILURE;
+        }
+        let w_va = match chain_tensor(&dev, &mut live, &format!("W{e:02}"), &data) {
+            Some(v) => v,
+            None => {
+                eprintln!("W{e:02} BO failed");
+                return ExitCode::FAILURE;
+            }
+        };
+        // rt.sequence(W, X, XN, C) — tensor VAs in that order.
+        let op = match chain_op(
+            &dev,
+            &format!("lv2E{e:02}"),
+            &lv2_instr,
+            0,
+            &[w_va, live[0].1.as_ptr() as u64, live[1].1.as_ptr() as u64, live[2].1.as_ptr() as u64],
+        ) {
+            Some(o) => o,
+            None => {
+                eprintln!("op exec{e:02} setup failed");
+                return ExitCode::FAILURE;
+            }
+        };
+        handles.push(vec![
+            op.ctrl_bo.handle(),
+            live[2 + e].0.handle(), // W_e
+            live[0].0.handle(),
+            live[1].0.handle(),
+            live[2].0.handle(),
+        ]);
+        ops.push(op);
+    }
+
+    // ---- lm_head on CU1 (plain w4gemvu + the M=121088 ctrl code) ----
+    let mut live_lm: Vec<(BufferObject, Mapping)> = Vec::new();
+    let lm_wdata = match std::fs::read(format!("{w4dir}/lmhead.bin")) {
+        Ok(d) if d.len() == 8 * w4u_blocks(LM_M, LM_K) * W4U_ELEM => d,
+        _ => {
+            eprintln!("lmhead.bin absent/stale (q4nx_import.py --lmhead)");
+            return ExitCode::FAILURE;
+        }
+    };
+    let lm_x = chain_tensor(&dev, &mut live_lm, "x_lm", &vec![0u8; W4U_ELEM]);
+    let lm_c = chain_tensor(&dev, &mut live_lm, "c_lm", &vec![0u8; w4u_c_rows(LM_M, LM_K) * 2]);
+    let lm_w = chain_tensor(&dev, &mut live_lm, "w_lm", &lm_wdata);
+    if lm_x.is_none() || lm_c.is_none() || lm_w.is_none() {
+        eprintln!("lm BO failed");
+        return ExitCode::FAILURE;
+    }
+    let mut lm_op = match chain_op(
+        &dev,
+        "lmhead",
+        &lm_instr,
+        1,
+        &[lm_w.unwrap(), lm_x.unwrap(), lm_c.unwrap()],
+    ) {
+        Some(o) => o,
+        None => {
+            eprintln!("lm op setup failed");
+            return ExitCode::FAILURE;
+        }
+    };
+    let lm_handles = vec![
+        lm_op.ctrl_bo.handle(),
+        live_lm[2].0.handle(),
+        live_lm[0].0.handle(),
+        live_lm[1].0.handle(),
+    ];
+
+    // ---- goldens (tools/layerv2_golden.py: kernel-chain numerics + host
+    // glue in the engine's exact forms) ----
+    let rd_u16file = |p: String| -> Option<Vec<u16>> {
+        let d = std::fs::read(p).ok()?;
+        Some(d.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect())
+    };
+    let golden_execs: Vec<Vec<u16>> = (1..=execs)
+        .map(|e| rd_u16file(format!("{lv2dir}/golden_exec{e:02}.bin")))
+        .collect::<Option<Vec<_>>>()
+        .unwrap_or_default();
+    let golden_hidden = rd_u16file(format!("{lv2dir}/golden_hidden.bin"));
+    let golden_logits = rd_u16file(format!("{lv2dir}/golden_logits.bin"));
+    if golden_execs.len() != execs || golden_hidden.is_none() || golden_logits.is_none() {
+        println!("lv2 goldens absent — running UNGATED (perf only)");
+    }
+
+    let mut rec = Recorder::new();
+    let mut rec_seq = 0u64;
+    let mut lv2_meta = OpMeta::new(
+        "lv2exec",
+        "layerv2",
+        0,
+        (2 * 8 * W4U_ELEM) as u64,
+        c_bytes as u64,
+        // 2*(o + gate + up + down + qkv rows * K) per exec
+        (2 * 2048 * (2048 + 2 * 6144 + 6144 + 3072)) as u64,
+    )
+    .with_tier(tier::SLOT_STREAM);
+    lv2_meta.bytes_stream = Some(w_bytes as u64);
+    let mut lm_meta = OpMeta::new(
+        "lmhead",
+        "w4gemvu",
+        1,
+        (LM_K * 2) as u64,
+        (w4u_c_rows(LM_M, LM_K) * 2) as u64,
+        (2 * LM_M * LM_K) as u64,
+    )
+    .with_tier(tier::SLOT_STREAM);
+    lm_meta.bytes_stream = Some((8 * w4u_blocks(LM_M, 2048) * W4U_ELEM) as u64);
+    let metas = vec![lv2_meta.clone(), lm_meta.clone()];
+
+    // ---- one token: 33 execs + final norm + lm_head ----
+    // scratch: drain image (5120 u16), qkv assembly, rope/qk/attn temps.
+    let mut drain: Vec<u16> = vec![0u16; 8 * DRAIN_ROWS];
+    let mut qkv = vec![0u16; arch.qkv_m];
+    let mut qr = vec![0u16; arch.heads * 128];
+    let mut kr = vec![0u16; arch.kv * 128];
+    let mut attn = vec![0u16; 2048];
+    let cache_seq = 1024usize;
+    let pos = 100usize;
+    let (rc, rs) = rope_table(pos, arch.rope_base);
+    let posn = pos; // silence borrow lengthener below
+
+    // ONE token step. `check` gates the per-exec drain comparison (the
+    // checked step only; timed steps skip the read entirely when goldens
+    // are absent).
+    let mut token_step = |kcache: &mut Vec<u16>,
+                          vcache: &mut Vec<u16>,
+                          hidden: &mut [u16],
+                          it: u32,
+                          check: bool,
+                          rec: &mut Recorder,
+                          rec_seq: &mut u64|
+     -> bool {
+        for e in 1..=execs {
+            // (a) fill XN(e): exec 1 <- x0 by ring position, else the
+            // previous exec's xn1 drain (worker-index-keyed, no perm).
+            hp!(HSeg::Lv2Fill, {
+                {
+                    let (_, map) = &mut live[1];
+                    let bytes = map.as_mut_slice();
+                    for w in 0..8usize {
+                        let off = w * W4U_ELEM;
+                        let src: &[u16] = if e == 1 {
+                            &host.x0[pos_of(w) * 256..][..256]
+                        } else {
+                            &drain[w * DRAIN_ROWS + 384..][..256]
+                        };
+                        for j in 0..256 {
+                            bytes[off + j * 2..off + j * 2 + 2]
+                                .copy_from_slice(&src[j].to_le_bytes());
+                        }
+                    }
+                }
+                let (bo, map) = &live[1];
+                for w in 0..8usize {
+                    sync_to_device(bo, map, w * W4U_ELEM, 512);
+                }
+            });
+            // (b) fill X(e): exec 1 needs q=0/d=0 (-> o=0 exactly) EVERY
+            // token — the previous token's exec-33 fill left real attn in
+            // the slots; else quantize the attention output into every
+            // worker slot (replicated attn: all 8 read the same q/d).
+            {
+                hp!(HSeg::Lv2Fill, {
+                    let (zq, zd) = if e == 1 {
+                        (vec![0i8; 2048], vec![0u16; 64])
+                    } else {
+                        w4u_quantize_x(&attn, 2048)
+                    };
+                    let (q, d): (&[i8], &[u16]) = (&zq, &zd);
+                    {
+                        let (_, map) = &mut live[0];
+                        let bytes = map.as_mut_slice();
+                        for w in 0..8usize {
+                            let off = w * W4U_ELEM;
+                            for j in 0..2048 {
+                                bytes[off + j] = q[j] as u8;
+                            }
+                            for g in 0..64 {
+                                bytes[off + W4U_K_MAX + g * 2..off + W4U_K_MAX + g * 2 + 2]
+                                    .copy_from_slice(&d[g].to_le_bytes());
+                            }
+                        }
+                    }
+                    let (bo, map) = &live[0];
+                    for w in 0..8usize {
+                        let off = w * W4U_ELEM;
+                        sync_to_device(bo, map, off, 2048);
+                        sync_to_device(bo, map, off + W4U_K_MAX, 128);
+                    }
+                });
+            }
+            // (c) P21: flush C so the DMA's writes land in memory the host
+            // will read post-wait (previous iteration's clean lines).
+            {
+                let (bo, map) = &live[2];
+                sync_to_device(bo, map, 0, c_bytes);
+            }
+            // (d) submit + wait on CU0 (device-dominated segment).
+            let ts = std::time::Instant::now();
+            let seq = hp!(HSeg::Lv2Wait, {
+                match ops[e - 1].pkt.submit(&dev, &ctx, &handles[e - 1]) {
+                    Ok(s) => s,
+                    Err(err) => {
+                        eprintln!("lv2 submit (exec {e}): {err}");
+                        return false;
+                    }
+                }
+            });
+            hp!(HSeg::Lv2Wait, {
+                if let Err(err) =
+                    syncobj_timeline_wait(&dev, ctx.syncobj_handle, seq, 60_000_000_000)
+                {
+                    eprintln!("lv2 wait (exec {e}, seq {seq}): {err}");
+                    return false;
+                }
+            });
+            if it > 0 {
+                rec.solo(&lv2_meta, it, ts, *rec_seq);
+                *rec_seq += 1;
+            }
+            // (e) read the drain image.
+            hp!(HSeg::Lv2Read, {
+                let _ = live[2].0.sync(SyncDirection::FromDevice, 0, live[2].0.size() as u64);
+                let cs = live[2].1.as_slice();
+                for i in 0..8 * DRAIN_ROWS {
+                    drain[i] = u16::from_le_bytes([cs[i * 2], cs[i * 2 + 1]]);
+                }
+            });
+            if std::env::var("LV2_DUMP_ALL").is_ok() {
+                let _ = std::fs::create_dir_all("/tmp/lv2_dump");
+                let bytes: Vec<u8> = drain.iter().flat_map(|b| b.to_le_bytes()).collect();
+                let _ = std::fs::write(format!("/tmp/lv2_dump/exec{e:02}.bin"), bytes);
+            }
+            // (f) golden gate: qkv rows strict (rel .08 abs .8 — rms1
+            // renormalization absorbs the common mode), xn1 rows loose
+            // (rel .08 abs 200 — the hw-sigmoid rides the down partials).
+            if check && !golden_execs.is_empty() {
+                let g = &golden_execs[e - 1];
+                let mut bad = 0usize;
+                let mut worst = 0f32;
+                let mut worst_at = (0usize, 0f32, 0f32);
+                for r in 0..8 * DRAIN_ROWS {
+                    let (af, gf) = (bf16_to_f32(drain[r]), bf16_to_f32(g[r]));
+                    let xn1 = (r % DRAIN_ROWS) >= 384;
+                    let (rel, abs) = if xn1 { (0.08f32, 200.0f32) } else { (0.08, 0.8) };
+                    if (af - gf).abs() > rel * gf.abs() + abs {
+                        bad += 1;
+                        if (af - gf).abs() > worst {
+                            worst = (af - gf).abs();
+                            worst_at = (r, af, gf);
+                        }
+                    }
+                }
+                if bad > 16 {
+                    eprintln!(
+                        "exec {e:02} drain gate FAILED: {bad}/5120 rows, worst |err| {worst:.2} @row {} (act {:-.2} vs golden {:-.2})",
+                        worst_at.0, worst_at.1, worst_at.2
+                    );
+                    if std::env::var("LV2_DUMP").is_ok() {
+                        let _ = std::fs::create_dir_all("/tmp/lv2_dump");
+                        let bytes: Vec<u8> =
+                            drain.iter().flat_map(|b| b.to_le_bytes()).collect();
+                        let _ = std::fs::write(format!("/tmp/lv2_dump/exec{e:02}.bin"), bytes);
+                    }
+                    return false;
+                }
+            }
+            // (g) host attention for the NEXT exec's X element: layer
+            // e-1's qkv (assembled by ring position) -> rope -> qk-norm
+            // -> kv append -> GQA attention.
+            if e < execs {
+                let l = e - 1;
+                for w in 0..8usize {
+                    let p = pos_of(w);
+                    qkv[p * 384..(p + 1) * 384]
+                        .copy_from_slice(&drain[w * DRAIN_ROWS..w * DRAIN_ROWS + 384]);
+                }
+                let kdim = arch.kv * 128;
+                hp!(HSeg::Rope, {
+                    rope_apply(&qkv[..2048], &rc, &rs, arch.heads, &mut qr);
+                    rope_apply(&qkv[2048..2048 + kdim], &rc, &rs, arch.kv, &mut kr);
+                });
+                hp!(HSeg::QkNorm, {
+                    let qlen = qr.len();
+                    qk_rms_bf16(&qr, &host.qknorms[l * 256..][..128], &mut attn);
+                    qr.copy_from_slice(&attn[..qlen]);
+                    qk_rms_bf16(&kr, &host.qknorms[l * 256 + 128..][..128], &mut attn[..kdim]);
+                    kr.copy_from_slice(&attn[..kdim]);
+                });
+                hp!(HSeg::KvApp, {
+                    for kv in 0..arch.kv {
+                        let off = (l * arch.kv + kv) * cache_seq * 128 + posn * 128;
+                        kcache[off..off + 128].copy_from_slice(&kr[kv * 128..(kv + 1) * 128]);
+                        vcache[off..off + 128].copy_from_slice(
+                            &qkv[2048 + kdim + kv * 128..2048 + kdim + (kv + 1) * 128],
+                        );
+                    }
+                });
+                hp!(HSeg::Attn, {
+                    let klo = l * arch.kv * cache_seq * 128;
+                    attention_bf16(
+                        &qr,
+                        &kcache[klo..],
+                        &vcache[klo..],
+                        posn,
+                        cache_seq,
+                        &mut attn,
+                        arch.heads,
+                        arch.kv,
+                    );
+                });
+            }
+        }
+        // exec 33's xn1 drain = final hidden, assembled by ring position.
+        for w in 0..8usize {
+            let p = pos_of(w);
+            hidden[p * 256..(p + 1) * 256]
+                .copy_from_slice(&drain[w * DRAIN_ROWS + 384..w * DRAIN_ROWS + DRAIN_ROWS]);
+        }
+        true
+    };
+
+    // ---- checked step (gates vs the offline golden chain) ----
+    let mut kcache = host.kcache.clone();
+    let mut vcache = host.vcache.clone();
+    let mut hidden = vec![0u16; 2048];
+    let t0 = std::time::Instant::now();
+    if !token_step(&mut kcache, &mut vcache, &mut hidden, 0, true, &mut rec, &mut rec_seq) {
+        return ExitCode::FAILURE;
+    }
+    let mut xn = vec![0u16; 2048];
+    rms_norm_bf16(&hidden, &host.norms[2 * layers * 2048..][..2048], &mut xn);
+
+    // lm_head on CU1 (one cu flip per token, the only PDI reload left).
+    let mut lm_run = |xn: &[u16], it: u32, rec: &mut Recorder, rec_seq: &mut u64| -> Option<Vec<u16>> {
+        let (q, d) = w4u_quantize_x(xn, 2048);
+        let xe = w4u_build_x_elem(&q, &d, 2048);
+        {
+            let (_, xmap) = &mut live_lm[0];
+            xmap.as_mut_slice()[..W4U_ELEM].copy_from_slice(&xe);
+        }
+        let (bo, xmap) = &live_lm[0];
+        sync_to_device(bo, xmap, 0, W4U_ELEM);
+        let ts = std::time::Instant::now();
+        let seq = match lm_op.pkt.submit(&dev, &ctx, &lm_handles) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("lm submit: {e}");
+                return None;
+            }
+        };
+        if let Err(e) = syncobj_timeline_wait(&dev, ctx.syncobj_handle, seq, 60_000_000_000) {
+            eprintln!("lm wait: {e}");
+            return None;
+        }
+        if it > 0 {
+            rec.solo(&lm_meta, it, ts, *rec_seq);
+            *rec_seq += 1;
+        }
+        let _ = live_lm[1].0.sync(SyncDirection::FromDevice, 0, live_lm[1].0.size() as u64);
+        Some(w4u_read_c(live_lm[1].1.as_slice(), 2048, LM_M))
+    };
+    let logits = match lm_run(&xn, 0, &mut rec, &mut rec_seq) {
+        Some(l) => l,
+        None => return ExitCode::FAILURE,
+    };
+
+    // gates: final hidden rms + logits argmax/rel_rms/top-8.
+    let f32of = |b: u16| bf16_to_f32(b);
+    if let (Some(gh), Some(gl)) = (&golden_hidden, &golden_logits) {
+        let mut num = 0f64;
+        let mut den = 0f64;
+        for i in 0..2048 {
+            let d = f32of(hidden[i]) - f32of(gh[i]);
+            num += (d * d) as f64;
+            den += (f32of(gh[i]) * f32of(gh[i])) as f64;
+        }
+        let rms = (num / den).sqrt() as f32;
+        let argmax = |v: &[u16]| -> usize {
+            let mut a = 0usize;
+            let mut b = f32of(v[0]);
+            for (i, x) in v.iter().enumerate() {
+                let t = f32of(*x);
+                if t > b {
+                    b = t;
+                    a = i;
+                }
+            }
+            a
+        };
+        let (an, ag) = (argmax(&logits), argmax(gl));
+        let mut num2 = 0f64;
+        let mut den2 = 0f64;
+        for i in 0..LM_M {
+            let d = f32of(logits[i]) - f32of(gl[i]);
+            num2 += (d * d) as f64;
+            den2 += (f32of(gl[i]) * f32of(gl[i])) as f64;
+        }
+        let rel = (num2 / den2).sqrt() as f32;
+        let ids = |v: &[u16]| -> Vec<usize> {
+            let mut t: Vec<(usize, f32)> = (0..LM_M).map(|i| (i, f32of(v[i]))).collect();
+            t.sort_by(|a, b| b.1.total_cmp(&a.1));
+            t.into_iter().take(8).map(|(i, _)| i).collect()
+        };
+        let overlap = ids(&logits).iter().filter(|i| ids(gl).contains(i)).count();
+        println!(
+            "lv2 gates: hidden rel_rms {rms:.4} (<0.05), logits rel_rms {rel:.4} argmax NPU {an} vs golden {ag}, top-8 {overlap}/8 -> {}",
+            if rms < 0.05 && an == ag && rel < 0.05 { "PASS" } else { "FAIL" }
+        );
+        if rms >= 0.05 || an != ag || rel >= 0.05 {
+            if std::env::var("XNPU_SKIP_GATES").is_ok() {
+                eprintln!("gate FAILED — continuing (XNPU_SKIP_GATES, PERF ONLY)");
+            } else {
+                return ExitCode::FAILURE;
+            }
+        }
+    } else if std::env::var("XNPU_SKIP_GATES").is_err() {
+        eprintln!("goldens absent and XNPU_SKIP_GATES unset — refusing to run blind");
+        return ExitCode::FAILURE;
+    }
+
+    // ---- timed iterations (caches idempotent at fixed pos) ----
+    hp_reset();
+    let t1 = std::time::Instant::now();
+    for it in 1..=iters as u32 {
+        let tb = std::time::Instant::now();
+        if !token_step(&mut kcache, &mut vcache, &mut hidden, it, false, &mut rec, &mut rec_seq) {
+            eprintln!("timed lv2 step failed");
+            return ExitCode::FAILURE;
+        }
+        hp!(HSeg::FinalNorm, {
+            rms_norm_bf16(&hidden, &host.norms[2 * layers * 2048..][..2048], &mut xn);
+        });
+        if hp!(HSeg::Lm, { lm_run(&xn, it, &mut rec, &mut rec_seq) }).is_none() {
+            eprintln!("timed lm failed");
+            return ExitCode::FAILURE;
+        }
+        rec.burst_done("lv2-decode-step", Mode::Solo, it, tb, execs as u32 + 1, 1);
+    }
+    let per = t1.elapsed() / iters as u32;
+    println!(
+        "lv2 decode step: first (checked) {:?}, steady {:.2?} /token ({:.1} tok/s)",
+        t0,
+        per,
+        1e3 / per.as_secs_f64() / 1e3
+    );
+    hp_print(iters as u32);
+    println!(
+        "  (CPU: rope+qk-norm+GQA-attention+quant; NPU: {execs} layerv2 execs on CU0 + lm_head on CU1)"
+    );
+
+    let model = machine_model_or_default();
+    let title = format!("run-decode lv2: {} {layers}L, {execs} half-layer execs, {iters} iters", arch.name);
+    let (md, summary) = xnpu_perf::render_markdown(&rec, &metas, &model, &title);
+    println!("\n{md}");
+    let dir = "/home/nzinfo/qwen/xnpu/build/perf";
+    if std::fs::create_dir_all(dir).is_ok() {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let stem = format!("{dir}/decode_lv2_{iters}it_{ts}");
+        let json = trace_json(&rec, &model, &title, &summary);
+        match std::fs::write(format!("{stem}.md"), &md)
+            .and_then(|()| std::fs::write(format!("{stem}.json"), json))
+        {
+            Ok(()) => println!("perf written: {stem}.md/.json"),
+            Err(e) => eprintln!("perf write failed: {e}"),
+        }
+    }
+    drop(ctx);
+    ExitCode::SUCCESS
+}
+
+/// Host-side state for the lv2 chain (decdir fixtures + norms).
+struct Lv2Host {
+    norms: Vec<u16>,
+    qknorms: Vec<u16>,
+    x0: Vec<u16>,
+    kcache: Vec<u16>,
+    vcache: Vec<u16>,
+}
+
+impl Lv2Host {
+    fn load(arch: &DecArch, decdir: &str) -> Lv2Host {
+        let rd = |p: String| -> Vec<u16> {
+            std::fs::read(p)
+                .unwrap_or_else(|e| panic!("lv2: {e}"))
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect()
+        };
+        let layers = arch.layers;
+        let cache_seq = 1024usize;
+        let n = Lv2Host {
+            norms: rd(format!("{decdir}/norms.bin")),
+            qknorms: rd(format!("{decdir}/qknorms.bin")),
+            x0: rd(format!("{decdir}/x0.bin")),
+            kcache: rd(format!("{decdir}/kcache.bin")),
+            vcache: rd(format!("{decdir}/vcache.bin")),
+        };
+        assert_eq!(n.norms.len(), (2 * layers + 1) * 2048);
+        assert_eq!(n.qknorms.len(), layers * 256);
+        assert_eq!(n.x0.len(), 2048);
+        assert_eq!(n.kcache.len(), layers * arch.kv * cache_seq * 128);
+        assert_eq!(n.vcache.len(), layers * arch.kv * cache_seq * 128);
+        n
+    }
+}
+
+
+
 /// machinery); rope, rms-norm, swiglu and the residuals run in Rust (f32
 /// math, bf16 boundaries — exactly what tools/decode_export.py's reference
 /// computes), so the final hidden must reproduce golden_hidden.bin to
