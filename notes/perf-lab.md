@@ -1697,3 +1697,58 @@ axcache 单因素，把 FLM 0-SYNC_BO 机制定位到 BD 的 64-bit 地址字段
 9. **遗留核对**：ctrl-code BO 自身一致性另算（P20b 首 exec 竞态）；
    B2 的 gateup 2-row stale 提示输出 BO 生命周期里确有 CPU 缓存
    残留（上轮 golden 读过的行），与冷行理论自洽。
+
+## P26（2026-09-28⑥）FLM 对标全量量化：差距主因 = 量化密度 0.349 vs 0.5625 B/param，设备带宽我方已反超
+
+P24 之后的自然问题：46.6 vs 26.7 tok/s 的差距到底在 DMA 效率还是别处。
+用 `tools/stream_bytes.py`（BD len × iter × push-repeat 聚合，沿 P23 校准
+的 per-op 尺寸规则）把 FLM 层 blob 的真实流量算干净，再对齐我方 P17/P18
+实测，得到完整归因。
+
+1. **FLM 每层真实流量**：MM2S 16.82MB = 4 算力列 ×（76 push × 55296B
+   线性 BD）；S2MM 仅 9.2KB。每 BD 55296B = 3072 组 × 18B = 98304 参数
+   （标准 g32 Q4 排列——单条 BD 格式与我们相同）。同 (col,bd) 槽被反复
+   重填：静态 BLOCKWRITE 复位 → DDR_PATCH 换地址（列内步进）→ push →
+   TCT 等待，四拍循环 76 遍/列。iter/repeat 全零——放大项不来自 BD 参数，
+   来自重填循环本身。
+2. **聚合成像**：32 层 × 16.82MB = **538MB/token**，20.8ms/token →
+   **25.9GB/s 聚合**；每列 76 × 8.55µs = 650µs/层 串行 → **每列 6.4GB/s**
+   （TCT 串行是它们的带宽调节器：4 列并发 × 6.4）。token 拓扑 = 1 常量
+   单 op + 链 A(24 sub) + 链 B(9 sub) = **1 ioctl/token**。
+3. **文件侧验证量化密度**：model.q4nx 1.503GB = embed fp32 0.990GB
+   （120818×2048×4）+ 权重 ~0.51GB → **0.34-0.35 B/param ≈ 2.8 bit**，
+   与流测 16.82MB/48.23M 参数 = 0.3487 精确吻合。"w4nx" 实为 ~W3 级密度
+   （每 BD 内部排列仍是 g32-Q4 形状，密度靠更粗的码本/混合位宽达成，
+   具体方案未逆向）。embed 存 fp32 + lm_head 疑似不占设备流（单 op
+   hash 恒定）。
+4. **我方对齐数字**（全部已有实测）：hy fused 63 exec，链上 pair A/B
+   = 472/369µs → 设备 GEMV 26.5ms/token；权重 868MB（48.23M×0.5625×32，
+   与我们 w4 文件 1.115GB/42 层 MiniCPM5 也吻合）→ **设备聚合 32.8GB/s**
+   （8 列，每列 ~4.1GB/s）。E2E 37.55ms = 26.5 设备 + 6.2 cpu-attention
+   + 2.7 swiglu + ~2 杂项（sync ioctl/翻转税/gap）。口径 caveat：66 op
+   计数含 lm_head，我方 embed 流量未计入 868MB。
+5. **归因**（同模型同芯片）：tok/s 差 1.81× = **量化密度 1.61×（主）**
+   + 非流开销 11ms vs ~0（次）。设备带宽 32.8 vs 25.9，**我方反超
+   1.27×**——DMA 效率不是差距来源，反而是我们的强项。
+6. **杠杆表（量化排序）**：
+   - **L1 量化密度** 0.5625→0.53（g64 共享 scale）/0.44（g64+双重量化）
+     /0.41（W3 g64）→ 设备时间 26.5→25.1/20.7/19.1ms。收益 ×1.06/1.28/
+     1.39，代价 = importer + IRON kernel 位宽/编解码改动，golden 门不变。
+   - **L2 host 侧 8.9ms 清零**：swiglu 并进 pair B 入口胶水（gateup 出
+     →swiglu→down 入，2.7ms）；attention 元素化或 flowkv strided 重排
+     （npu 口径 118ms 的病根，cpu 口径 6.2ms）。
+   - **L3 exec 链化** 63→1-3：P23 已解码的 ERT_CMD_CHAIN 机制直接可用，
+     省 ~63×33µs sync/提交 ≈ 2ms，且为层间流水铺路。
+   - **L4 P25 SVM 零 flush**：每对 4KB 残差 ToDevice + C BO 44KB
+     FromDevice ioctl（~30µs 平价）全免。
+   - **L5 CU 翻转税**：每 token 2 次 ~500µs fw PDI 重载（P18 补记），
+     单 CU/同 PDI 布局可免。
+   - **L6 设备带宽 32.8→40+？**：我方每列 4.1GB/s vs FLM 6.4GB/s——
+     差在喂法（8 列细分 vs 4 列 54KB 大块串行）。聚合已占优，优先级最低，
+     天花板待 perf-calibrate 补测。
+   - **合计上限**：W3 + L2-L5 ≈ 19-20ms ≈ **50-53 tok/s > FLM 46.6**；
+     仅 g64+L2-L5 ≈ 21.7ms ≈ 46 tok/s 与 FLM 平手。
+7. **教科书要点**：tok/s ≈ 有效带宽 ÷ 每 token 权重字节——量化密度是
+   LLM 推理的第一性杠杆，DMA/调度优化是二阶。FLM 的全部"快"来自把
+   每 token 字节压到 538MB；其 25.9GB/s 聚合反而低于我们的 32.8。另：
+   fp32 embed 0.99GB 换 tied-lm_head 精度的存储取舍值得写。
