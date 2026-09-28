@@ -4647,6 +4647,98 @@ fn qk_rms_bf16(x: &[u16], w: &[u16], out: &mut [u16]) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// P27-1: host-segment profiler for the decode hot loop. The AVX-512
+// attention rewrite only bought 0.5ms of the ~10.5ms of non-device time
+// per token — P15's "6.2ms attention" had bundled rope/qk-norm/KV-append
+// staging with the core, so before cutting further we MEASURE where the
+// fused-loop host time actually goes. Enable with XNPU_HOSTPROF=1; the
+// accumulators reset at the timed loop and print per-token µs after the
+// steady line. `wait` segments cover submit->syncobj-wait (device-
+// dominated); everything else is pure host glue.
+// ---------------------------------------------------------------------------
+#[derive(Clone, Copy)]
+enum HSeg {
+    Rope,
+    QkNorm,
+    KvApp,
+    Attn,
+    Swiglu,
+    QuantA,
+    ResA,
+    WaitA,
+    ReadA,
+    QuantB,
+    ResB,
+    WaitB,
+    ReadB,
+    FinalNorm,
+    Lm,
+}
+const HSEG_NAMES: [&str; 15] = [
+    "rope", "qknorm", "kvapp", "attn", "swiglu", "A:quant", "A:res", "A:wait", "A:read",
+    "B:quant", "B:res", "B:wait", "B:read", "finalnorm", "lm",
+];
+
+thread_local! {
+    static HOSTPROF: std::cell::RefCell<Option<Box<[u64; 15]>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn hp_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XNPU_HOSTPROF").is_ok())
+}
+
+fn hp_add(seg: HSeg, ns: u64) {
+    HOSTPROF.with(|h| {
+        if let Some(a) = h.borrow_mut().as_mut() {
+            a[seg as usize] += ns;
+        }
+    });
+}
+
+fn hp_reset() {
+    if hp_enabled() {
+        HOSTPROF.with(|h| *h.borrow_mut() = Some(Box::new([0u64; 15])));
+    }
+}
+
+fn hp_print(iters: u32) {
+    if !hp_enabled() {
+        return;
+    }
+    HOSTPROF.with(|h| {
+        let binding = h.borrow();
+        let Some(a) = binding.as_ref() else { return };
+        let mut tot = 0u128;
+        println!("hostprof (µs/token, {iters} timed iters):");
+        for (i, v) in a.iter().enumerate() {
+            if *v == 0 {
+                continue;
+            }
+            tot += *v as u128;
+            println!("  {:>10} {:8.1}", HSEG_NAMES[i], *v as f64 / 1000.0 / iters as f64);
+        }
+        println!("  {:>10} {:8.1}  (sum of segments)", "SUM", tot as f64 / 1000.0 / iters as f64);
+    });
+}
+
+/// Time a block into an HSeg bucket. Disabled (env unset) costs one
+/// hp_enabled() atomic-free lazy bool check per site.
+macro_rules! hp {
+    ($seg:expr, $body:block) => {
+        if hp_enabled() {
+            let t__ = std::time::Instant::now();
+            let r__ = $body;
+            hp_add($seg, t__.elapsed().as_nanos() as u64);
+            r__
+        } else {
+            $body
+        }
+    };
+}
+
 /// GQA decode attention: q (heads, roped) against a (kv, CACHE_SEQ, 128)
 /// cache; q head h reads kv head h/(heads/kv). Scores/softmax/PV in f32,
 /// one bf16 rounding at the output.
@@ -4656,6 +4748,9 @@ fn qk_rms_bf16(x: &[u16], w: &[u16], out: &mut [u16]) {
 /// bf16 element on every multiply (~8x the conversions, and the PV walk
 /// strided the V cache per output dim). Accumulation ORDER per output is
 /// unchanged (t ascending), so results are bit-identical.
+/// P27-1: dispatch to the AVX-512 kernel when the CPU has it (Zen5 here
+/// does, full-width native). Semantics identical to the scalar body below;
+/// see attention_avx512 for the numerics note.
 fn attention_bf16(
     q: &[u16],
     kc: &[u16],
@@ -4666,6 +4761,13 @@ fn attention_bf16(
     heads: usize,
     nkv: usize,
 ) {
+    if pos + 1 >= 16
+        && std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+    {
+        unsafe { attention_avx512(q, kc, vc, pos, cache_seq, out, heads, nkv) };
+        return;
+    }
     let s = pos + 1;
     let group = heads / nkv;
     let mut kf = vec![0f32; s * 128];
@@ -4708,6 +4810,152 @@ fn attention_bf16(
                 out[qo + j] = f32_to_bf16(acc[j] / sum);
             }
         }
+    }
+}
+
+/// P27-1: AVX-512 attention, same math as the scalar version (per kv-head:
+/// K/V rows converted to f32 once, the GQA group of q-heads reuses them).
+/// The scalar body was chain-bound: `d += kf*qf` is a 128-long serial FMA
+/// chain (4-cycle latency each) and PV the same, plus ~52k libc expf calls
+/// per token — that was the 6.2ms. Here the three hot loops go 16-wide.
+///
+/// Numerics: bf16→f32 is exact (bit shift); dots/sums reorder float adds
+/// (lane-tree, ~1e-7 rel drift — far under the bf16 input noise); exp is a
+/// 6-term 2^f poly on f∈[-0.5,0.5] (~1e-7 rel). The output epilogue keeps
+/// the scalar f32_to_bf16 path bit-identical to before. Golden double-gate
+/// (hidden rms + argmax/top-8) arbitrates.
+#[target_feature(enable = "avx512f,avx512bw")]
+unsafe fn attention_avx512(
+    q: &[u16],
+    kc: &[u16],
+    vc: &[u16],
+    pos: usize,
+    cache_seq: usize,
+    out: &mut [u16],
+    heads: usize,
+    nkv: usize,
+) {
+    use std::arch::x86_64::*;
+    unsafe {
+    let s = pos + 1;
+    let group = heads / nkv;
+    let scale = 1f32 / (128f32).sqrt();
+    let mut kf = vec![0f32; s * 128];
+    let mut vf = vec![0f32; s * 128];
+    let mut sc = vec![0f32; s];
+    let mut acc = [0f32; 128];
+    for kv in 0..nkv {
+        let base = kv * cache_seq * 128;
+        // bf16 bits << 16 == f32 bits; 16 elems per round, exact.
+        let conv = |src: &[u16], dst: &mut [f32]| {
+            let n = dst.len();
+            let mut i = 0;
+            while i + 16 <= n {
+                let w = _mm256_loadu_si256(src.as_ptr().add(i) as *const __m256i);
+                let f = _mm512_castsi512_ps(_mm512_slli_epi32(
+                    _mm512_cvtepu16_epi32(w),
+                    16,
+                ));
+                _mm512_storeu_ps(dst.as_mut_ptr().add(i), f);
+                i += 16;
+            }
+            while i < n {
+                dst[i] = bf16_to_f32(src[i]);
+                i += 1;
+            }
+        };
+        conv(&kc[base..][..s * 128], &mut kf);
+        conv(&vc[base..][..s * 128], &mut vf);
+        for h in kv * group..(kv + 1) * group {
+            let qo = h * 128;
+            let qf: [f32; 128] = std::array::from_fn(|j| bf16_to_f32(q[qo + j]));
+            // QK dots: 8x fma + lane-tree reduce per row (vs the 128-long
+            // serial chain before). Exact max, same as scalar .max().
+            let mut mx = f32::NEG_INFINITY;
+            for t in 0..s {
+                let mut d = _mm512_setzero_ps();
+                for k in 0..8 {
+                    d = _mm512_fmadd_ps(
+                        _mm512_loadu_ps(kf.as_ptr().add(t * 128 + k * 16)),
+                        _mm512_loadu_ps(qf.as_ptr().add(k * 16)),
+                        d,
+                    );
+                }
+                let v = _mm512_reduce_add_ps(d) * scale;
+                sc[t] = v;
+                if v > mx {
+                    mx = v;
+                }
+            }
+            // exp(sc - mx) 16-wide: n = rne(z), f = z - n ∈ [-0.5, 0.5],
+            // 2^f by 6-term ln2-series poly, 2^n by exponent-bit add.
+            // x clamped to ≥ -80 so the exponent field stays normal.
+            let log2e = 1.4426950408889634f32;
+            let c1 = 0.6931471805599453f32;
+            let c2 = 0.2402265069591007f32;
+            let c3 = 0.0555041086648216f32;
+            let c4 = 0.009618129107628477f32;
+            let c5 = 0.0013333558146428443f32;
+            let c6 = 0.0001540353039338167f32;
+            let mut vsum = _mm512_setzero_ps();
+            let mut sum_tail = 0f32;
+            let mut i = 0;
+            while i + 16 <= s {
+                let x = _mm512_max_ps(
+                    _mm512_sub_ps(
+                        _mm512_loadu_ps(sc.as_ptr().add(i)),
+                        _mm512_set1_ps(mx),
+                    ),
+                    _mm512_set1_ps(-80f32),
+                );
+                let z = _mm512_mul_ps(x, _mm512_set1_ps(log2e));
+                let n = _mm512_roundscale_ps(z, 0x00); // RNE
+                let f = _mm512_sub_ps(z, n);
+                let p = _mm512_fmadd_ps(
+                    _mm512_set1_ps(c6),
+                    f,
+                    _mm512_set1_ps(c5),
+                );
+                let p = _mm512_fmadd_ps(p, f, _mm512_set1_ps(c4));
+                let p = _mm512_fmadd_ps(p, f, _mm512_set1_ps(c3));
+                let p = _mm512_fmadd_ps(p, f, _mm512_set1_ps(c2));
+                let p = _mm512_fmadd_ps(p, f, _mm512_set1_ps(c1));
+                let p = _mm512_fmadd_ps(p, f, _mm512_set1_ps(1f32));
+                let e = _mm512_castsi512_ps(_mm512_add_epi32(
+                    _mm512_castps_si512(p),
+                    _mm512_slli_epi32(_mm512_cvtps_epi32(n), 23),
+                ));
+                _mm512_storeu_ps(sc.as_mut_ptr().add(i), e);
+                vsum = _mm512_add_ps(vsum, e);
+                i += 16;
+            }
+            while i < s {
+                sc[i] = (sc[i] - mx).exp();
+                sum_tail += sc[i];
+                i += 1;
+            }
+            let sum = _mm512_reduce_add_ps(vsum) + sum_tail;
+            // PV: acc[128] lives in 8 zmm regs; w broadcast per t.
+            let mut avec: [__m512; 8] = std::array::from_fn(|_| _mm512_setzero_ps());
+            for t in 0..s {
+                let w = _mm512_set1_ps(sc[t]);
+                for k in 0..8 {
+                    avec[k] = _mm512_fmadd_ps(
+                        w,
+                        _mm512_loadu_ps(vf.as_ptr().add(t * 128 + k * 16)),
+                        avec[k],
+                    );
+                }
+            }
+            for k in 0..8 {
+                _mm512_storeu_ps(acc.as_mut_ptr().add(k * 16), avec[k]);
+            }
+            // scalar epilogue: identical rounding to the scalar version.
+            for j in 0..128 {
+                out[qo + j] = f32_to_bf16(acc[j] / sum);
+            }
+        }
+    }
     }
 }
 
@@ -6093,7 +6341,13 @@ fn cmd_run_decode(
             }
         };
         let vi = if k1 == 6144 { 1 } else { 0 };
-        {
+        // P27-1: pair A vs pair B land in separate prof buckets.
+        let (sq, sr, swt, scr) = if pi == 0 {
+            (HSeg::QuantA, HSeg::ResA, HSeg::WaitA, HSeg::ReadA)
+        } else {
+            (HSeg::QuantB, HSeg::ResB, HSeg::WaitB, HSeg::ReadB)
+        };
+        hp!(sq, {
             let (q, d) = w4u_quantize_x(act, k1);
             let xe = w4u_build_x_elem(&q, &d, k1);
             {
@@ -6102,8 +6356,8 @@ fn cmd_run_decode(
             }
             let (bo, map) = &live[vi];
             sync_to_device(bo, map, 0, W4U_ELEM);
-        }
-        {
+        });
+        hp!(sr, {
             let r0 = c_rows1 * 2;
             {
                 let (_, map) = &mut live_fused[ci];
@@ -6115,42 +6369,46 @@ fn cmd_run_decode(
             }
             let (bo, map) = &live_fused[ci];
             sync_to_device(bo, map, r0, 4096);
-        }
+        });
         let ts = std::time::Instant::now();
-        let fs = fst.as_mut().unwrap();
-        let op = &mut fs.ops[oi];
-        let seq = match op.pkt.submit(&dev, &ctx, &fs.handles[oi]) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("fused submit (L{n} p{pi}, op {oi}): {e}");
+        hp!(swt, {
+            let fs = fst.as_mut().unwrap();
+            let op = &mut fs.ops[oi];
+            let seq = match op.pkt.submit(&dev, &ctx, &fs.handles[oi]) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("fused submit (L{n} p{pi}, op {oi}): {e}");
+                    return false;
+                }
+            };
+            if let Err(e) = syncobj_timeline_wait(&dev, ctx.syncobj_handle, seq, 10_000_000_000) {
+                eprintln!("fused wait (L{n} p{pi}, seq {seq}): {e}");
                 return false;
             }
-        };
-        if let Err(e) = syncobj_timeline_wait(&dev, ctx.syncobj_handle, seq, 10_000_000_000) {
-            eprintln!("fused wait (L{n} p{pi}, seq {seq}): {e}");
-            return false;
-        }
-        if it > 0 {
-            rec.solo(&metas_fused[pi], it, ts, *rec_seq);
-            *rec_seq += 1;
-        }
-        let (c_bo, c_map) = &live_fused[ci];
-        let _ = c_bo.sync(SyncDirection::FromDevice, 0, c_bo.size() as u64);
-        let cs = c_map.as_slice();
-        // op1 sections are the PLAIN v5 C layout — same read the split
-        // path does (K=6144 sums the 3 chunk partials in f32).
-        let o1 = w4u_read_c(cs, k1, 2048);
-        add_bf16(res, &o1, out1);
-        // op2 sections: past the window, per column section2 rows, data
-        // after the 2 dummy 16-row glue elements.
-        let rpc2 = m2 / 8;
-        for col in 0..8 {
-            let base = (W4UF_WINDOW_ROWS + col * section2 + 2 * W4U_TILE_ROWS) * 2;
-            for r in 0..rpc2 {
-                let off = base + r * 2;
-                out2[col * rpc2 + r] = u16::from_le_bytes([cs[off], cs[off + 1]]);
+            if it > 0 {
+                rec.solo(&metas_fused[pi], it, ts, *rec_seq);
+                *rec_seq += 1;
             }
-        }
+        });
+        hp!(scr, {
+            let (c_bo, c_map) = &live_fused[ci];
+            let _ = c_bo.sync(SyncDirection::FromDevice, 0, c_bo.size() as u64);
+            let cs = c_map.as_slice();
+            // op1 sections are the PLAIN v5 C layout — same read the split
+            // path does (K=6144 sums the 3 chunk partials in f32).
+            let o1 = w4u_read_c(cs, k1, 2048);
+            add_bf16(res, &o1, out1);
+            // op2 sections: past the window, per column section2 rows, data
+            // after the 2 dummy 16-row glue elements.
+            let rpc2 = m2 / 8;
+            for col in 0..8 {
+                let base = (W4UF_WINDOW_ROWS + col * section2 + 2 * W4U_TILE_ROWS) * 2;
+                for r in 0..rpc2 {
+                    let off = base + r * 2;
+                    out2[col * rpc2 + r] = u16::from_le_bytes([cs[off], cs[off + 1]]);
+                }
+            }
+        });
         true
     };
 
@@ -6357,24 +6615,30 @@ fn cmd_run_decode(
                 scq.as_slice()
             };
             let kdim = arch.kv * 128;
-            rope_apply(&qkv[..2048], &rc, &rs, arch.heads, qr);
-            rope_apply(&qkv[2048..2048 + kdim], &rc, &rs, arch.kv, kr);
+            hp!(HSeg::Rope, {
+                rope_apply(&qkv[..2048], &rc, &rs, arch.heads, qr);
+                rope_apply(&qkv[2048..2048 + kdim], &rc, &rs, arch.kv, kr);
+            });
             if arch.qk_norm {
                 // hy: per-head rms AFTER rope. qk_rms can't alias x and out,
                 // so bounce through attn as scratch (kr is only kv·128 long).
-                let qlen = qr.len();
-                qk_rms_bf16(qr, &qknorms[n * 256..][..128], attn);
-                qr.copy_from_slice(&attn[..qlen]);
-                qk_rms_bf16(kr, &qknorms[n * 256 + 128..][..128], &mut attn[..kdim]);
-                kr.copy_from_slice(&attn[..kdim]);
+                hp!(HSeg::QkNorm, {
+                    let qlen = qr.len();
+                    qk_rms_bf16(qr, &qknorms[n * 256..][..128], attn);
+                    qr.copy_from_slice(&attn[..qlen]);
+                    qk_rms_bf16(kr, &qknorms[n * 256 + 128..][..128], &mut attn[..kdim]);
+                    kr.copy_from_slice(&attn[..kdim]);
+                });
             }
-            for kv in 0..arch.kv {
-                let off = (n * arch.kv + kv) * cache_seq * 128 + pos * 128;
-                kcache[off..off + 128].copy_from_slice(&kr[kv * 128..(kv + 1) * 128]);
-                vcache[off..off + 128].copy_from_slice(
-                    &qkv[2048 + kdim + kv * 128..2048 + kdim + (kv + 1) * 128],
-                );
-            }
+            hp!(HSeg::KvApp, {
+                for kv in 0..arch.kv {
+                    let off = (n * arch.kv + kv) * cache_seq * 128 + pos * 128;
+                    kcache[off..off + 128].copy_from_slice(&kr[kv * 128..(kv + 1) * 128]);
+                    vcache[off..off + 128].copy_from_slice(
+                        &qkv[2048 + kdim + kv * 128..2048 + kdim + (kv + 1) * 128],
+                    );
+                }
+            });
             match fk.as_mut() {
                 Some(fk) => {
                     // Append this step's rotated K row + raw V row into the
@@ -6449,16 +6713,18 @@ fn cmd_run_decode(
                 }
                 None => {
                     let klo = n * arch.kv * cache_seq * 128;
-                    attention_bf16(
-                        qr,
-                        &kcache[klo..],
-                        &vcache[klo..],
-                        pos,
-                        cache_seq,
-                        attn,
-                        arch.heads,
-                        arch.kv,
-                    );
+                    hp!(HSeg::Attn, {
+                        attention_bf16(
+                            qr,
+                            &kcache[klo..],
+                            &vcache[klo..],
+                            pos,
+                            cache_seq,
+                            attn,
+                            arch.heads,
+                            arch.kv,
+                        );
+                    });
                 }
             }
             if quad {
@@ -6509,7 +6775,7 @@ fn cmd_run_decode(
                     return false;
                 }
                 std::mem::swap(x, xn); // x = x + o
-                swiglu_bf16(gu, sw);
+                hp!(HSeg::Swiglu, { swiglu_bf16(gu, sw); });
                 if n + 1 < layers {
                     // P18 pair B: down(n) -> ln1_{n+1} rms -> qkv(n+1),
                     // left in Scratch.qkv for the next layer iteration.
@@ -6728,6 +6994,7 @@ fn cmd_run_decode(
     }
 
     // Timed iterations (steady state; caches are idempotent at fixed pos).
+    hp_reset();
     t0 = std::time::Instant::now();
     for it in 1..=iters as u32 {
         let tb = std::time::Instant::now();
@@ -6742,9 +7009,11 @@ fn cmd_run_decode(
             return ExitCode::FAILURE;
         }
         // M8: 每 token 的 final norm + lm_head（logits 也在 NPU 上）。
-        rms_norm_bf16(&x, &norms[2 * layers * 2048..][..2048], &mut sc.xn);
+        hp!(HSeg::FinalNorm, {
+            rms_norm_bf16(&x, &norms[2 * layers * 2048..][..2048], &mut sc.xn);
+        });
         if lm.is_some()
-            && lm_run(&mut lm, &sc.xn, it, &mut rec, &mut rec_seq).is_none()
+            && hp!(HSeg::Lm, { lm_run(&mut lm, &sc.xn, it, &mut rec, &mut rec_seq) }).is_none()
         {
             eprintln!("timed lm_head failed");
             return ExitCode::FAILURE;
@@ -6773,6 +7042,7 @@ fn cmd_run_decode(
         per,
         1e3 / per.as_secs_f64() / 1e3
     );
+    hp_print(iters as u32);
     println!(
         "  (CPU: rope+{}+norms+swiglu{}{}; NPU: {} w4gemvu{})",
         if npu_attn {
