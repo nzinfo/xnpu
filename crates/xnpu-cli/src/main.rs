@@ -6078,7 +6078,21 @@ fn cmd_run_decode_lv2(
     let golden_hidden = rd_u16file(format!("{lv2dir}/golden_hidden.bin"));
     let golden_logits = rd_u16file(format!("{lv2dir}/golden_logits.bin"));
     if golden_execs.len() != execs || golden_hidden.is_none() || golden_logits.is_none() {
-        println!("lv2 goldens absent — running UNGATED (perf only)");
+        // P28-10 (weed #4): accurate split — a partial golden set is NOT
+        // "ungated": missing per-exec goldens only skip the drain
+        // comparison, while missing hidden/logits refuses the run below
+        // unless XNPU_SKIP_GATES is set.
+        if golden_execs.len() != execs {
+            println!(
+                "lv2 per-exec goldens incomplete ({}/{execs}) — drain comparison skipped",
+                golden_execs.len()
+            );
+        }
+        if golden_hidden.is_none() || golden_logits.is_none() {
+            println!(
+                "lv2 final goldens absent — run refuses unless XNPU_SKIP_GATES is set"
+            );
+        }
     }
 
     let mut rec = Recorder::new();
@@ -6272,6 +6286,25 @@ fn cmd_run_decode_lv2(
                         return false;
                     }
                 });
+                // P28-10 (weed #1): the fence signals on EVERY response
+                // path — COMPLETED, ERROR, ABORT, TIMEOUT alike — so the
+                // wait returning is NOT evidence the exec ran. Read the
+                // state word (main.rs lv2loop note; 6f-7 law).
+                let st = ops[e - 1].pkt.state();
+                if st != 4 {
+                    eprintln!("lv2 exec {e}: state={st} after wait (ghost completion)");
+                    return false;
+                }
+            } else if e >= 2 {
+                // Piped: exec e is still in its tail here, but execs
+                // 1..e-1 are fully complete (in-order ERT) — check the
+                // previous exec's state word with one-exec lag. The final
+                // exec goes through the serialized branch above.
+                let st = ops[e - 2].pkt.state();
+                if st != 4 {
+                    eprintln!("lv2 exec {}: state={st} (ghost, lagged piped check)", e - 1);
+                    return false;
+                }
             }
             if it > 0 {
                 rec.solo(&lv2_meta, it, ts, *rec_seq);
@@ -6290,9 +6323,20 @@ fn cmd_run_decode_lv2(
                         drain[i] = u16::from_le_bytes([cs[i * 2], cs[i * 2 + 1]]);
                     }
                 } else {
-                    let _ = live[2]
-                        .0
-                        .sync(SyncDirection::FromDevice, 0, live[2].0.size() as u64);
+                    // P28-10 (weed #2): the fence error is SURFACED, not
+                    // swallowed — but downgraded to a warning: this ioctl
+                    // has returned EINVAL on the final exec since P28-5
+                    // (previously invisible behind `let _ =`), while gates
+                    // kept passing — with the syncobj wait AND the
+                    // state==4 check above as completion proof, the
+                    // second fence is redundant here.
+                    if let Err(err) =
+                        live[2].0.sync(SyncDirection::FromDevice, 0, live[2].0.size() as u64)
+                    {
+                        eprintln!(
+                            "lv2 drain FromDevice fence (exec {e}): {err} (warning; completion proven by wait+state)"
+                        );
+                    }
                     let cs = live[2].1.as_slice();
                     for i in 0..8 * DRAIN_ROWS {
                         drain[i] = u16::from_le_bytes([cs[i * 2], cs[i * 2 + 1]]);
@@ -6426,11 +6470,22 @@ fn cmd_run_decode_lv2(
             eprintln!("lm wait: {e}");
             return None;
         }
+        // P28-10 (weed #1): lm completion needs the state word too.
+        let st = lm_op.pkt.state();
+        if st != 4 {
+            eprintln!("lm: state={st} after wait (ghost completion)");
+            return None;
+        }
         if it > 0 {
             rec.solo(&lm_meta, it, ts, *rec_seq);
             *rec_seq += 1;
         }
-        let _ = live_lm[1].0.sync(SyncDirection::FromDevice, 0, live_lm[1].0.size() as u64);
+        if let Err(e) = live_lm[1].0.sync(SyncDirection::FromDevice, 0, live_lm[1].0.size() as u64)
+        {
+            // Same P28-10 downgrade: warn, don't fail — wait+state above
+            // already prove completion (the EINVAL twin of the drain path).
+            eprintln!("lm C FromDevice fence: {e} (warning)");
+        }
         Some(w4u_read_c(live_lm[1].1.as_slice(), 2048, LM_M))
     };
     let logits = match lm_run(&xn, 0, &mut rec, &mut rec_seq) {
