@@ -3109,3 +3109,15 @@ pack，零 496MB 落盘））：
 32 次/exec 间）+ 激活量化（X 元素 g32 ×32 + lm 前 final rms/quant）+
 编排（submit/哨兵轮询/clflush）+ argmax + prefill（全程 CPU，~1s/
 token）+ tokenizer。NPU：全部权重 GEMV + rms/swiglu/量化内核。
+
+### P28-9 补遗：EOS 隐形伪影 + FLM 对等复现
+
+用户抓到 "2. 请帮我写一段…" 不该出现——实锤：**120020 =
+<｜hy_place▁holder▁no▁2｜> = eos_token**（tokenizer_config），且它
+decode 成**空字符串**，吞掉后文本完全隐形；模型在"我是混元，由腾讯
+开发的大模型。"后已发停止信号，贪心环未停才续出模板漂移。修复 =
+ask 环认 {120020, 120001} 停止。**FLM 对等复现**（同机同 NPU 同
+model.q4nx，prefill 同 6 tokens）：FLM 答"我是混元，是腾讯开发的
+大模型。"并干净停止——两实现数值等效、同点停止；"2. …"确系伪影。
+另留痕：两轮贪心在 step 9 分叉（5788 vs 6293，同义分词）——板况级
+数值漂移（P7 定律范围内），语义与停止点不受影响。
