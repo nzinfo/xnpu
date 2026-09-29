@@ -26,3 +26,9 @@ Disassembler note: system objdump says "architecture UNKNOWN" and
 llvm-objdump-18/21 "can't find target" — the working tool is
 /home/nzinfo/.venvs/npu314/lib/python3.14/site-packages/llvm-aie/bin/llvm-objdump
 (the mlir_aie/peano toolchain install).
+
+## p28-6f/（2026-09-29 追加）
+- lv2_forensic.py：6f-6 取证仪器（AIELv2Probe 独立驱动，C 哨兵 0xAAAA
+  + 2ms 轮询 drain 掩码）——发现 pyxrt 提交路径爬行双峰。
+- lv2_dump_exec01-33.tgz：E2E LV2_DUMP_ALL 调试期的 33 exec C dump
+  （10KB each，root 属主原样打包）。

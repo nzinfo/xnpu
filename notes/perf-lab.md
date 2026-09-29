@@ -2447,3 +2447,468 @@ e==1 分支跳过 X 填充（假设 setup 零永存）——但上一 token 的 
 - /tmp/lv2_dump/（LV2_DUMP_ALL 调试 dump）；/tmp/p28/*.log。
 - 引擎：run-decode hy lv2（HSeg 15→18：lv2:fill/wait/read；LV2_DUMP
   排障；XNPU_SKIP_GATES 逃生门不变）。
+
+## P28-6（2026-09-29⑪）环加宽 8→16：rows-seed 板死锁 + core↔core DMA 通道定律 + 哈密顿环
+
+论点：P28-5 的 33 exec 各 781µs = 36.1 GB/s，被 N=8 环的 per-worker 流量
+钳在 DDR 墙下。N=16（16 worker，每 worker 94 W 元素 = 27.91MB/exec）
+摊薄单流带宽 → 聚合应达 ~55 GB/s 墙 → exec ~500-600µs → 设备 ~19ms
+→ E2E ~24ms。
+
+### 6a. SHIM CHANNEL LAW（静态推演，非实验）
+
+npu2 每 shim tile 2 MM2S + 2 S2MM；8 shim = 设备上限 16 入 + 16 出流。
+每 worker 1 条 A fifo（入）+ 1 条 C fifo（出）→ **N=16 恰好饱和（每
+shim 2A+2C）；N=32 放不下**。design my_layerv2 assert n in (8,16)。
+
+### 6b. host 侧 N 参数化（重写 tools/layerv2_pack.py）
+
+- geom(n) 镜像设计几何；pos(w) 泛化蛇形（c=w>>2，奇列 8c+3-w）。
+- **SUB-COLUMN SLICING LAW（打包器实证）**：v4 包是 8 列的（列跨 M/8
+  行），position 的 16 行块是包内某列的连续 t-段——只有 N=8 恰好整列；
+  平铺 p*count 对 N=16 会静默乱序 gate/up/down。concat gate_up 包
+  （12288 行）：gate 列 0-3，up 列 4-7（up r0_extra=6144）。K=6144 的
+  down 以 16 行 3 chunk-major 块存（块 b → 列 b//48, chunk (b%48)//16,
+  tile (b%48)%16），chunk 乘的是块步进不是行跨度（首个 //chunks 版本
+  错在把 rows_per_col 也除了 chunks；期望值脚本另有 off-by-one——两处
+  都是拿 shipped N=8 bins 逐字节比对逼出来的）。
+- **回归锚**：重写后 N=8 exec01/02/05 与 shipped build/lv2_hy 逐字节
+  相同。N=16 → build/lv2_hy_w16（33×27.91MB）。
+- env：npu314 venv 补装 safetensors 0.8.0（torch 2.12.1+cpu 原有）。
+- 教训×2：build/ root 属主 → mkdir PermissionError 被 `| tail` 吃掉
+  （后台管道掩盖退出码，任务"成功"）；重跑用 sudo 配方且不接管道。
+
+### 6c. N=8 板死锁：一个种子常数 → .bss 踩踏 → 自清零 → fifo 死锁
+
+runtime-N 改造后首跑 [iter4-8] 5/5 ERT_CMD_STATE_TIMEOUT。纯代码检视
+（该重构从未上过板）定位：`rows` 移位循环从 kM1(2048) 起种，
+`while (n>8)` 对 N=8 一次都不转 → rows 保持 2048 → dacc 清零循环按
+rows 写 8KB，越过 lv_dacc(1KB)/lv_shared/lv_dA 直接把 **lv_ctr 清零**
+→ cRows/cMask=0 → 所有环循环跳过 → worker 在 fifo acquire 上死锁。
+修复：起种 kRowsMax(256)（`.bss` 尺寸本就按 N=8 最大值分配，小的 N
+只是用得少）。另一次 near-miss：cMask 存了移位后的 n（恒 7）——保留
+n0 原值。教科书级失败链：常数错 → 段溢出 → 控制状态自毁 → 死锁超时。
+
+### 6d. N=16 编译失败 → CORE↔CORE OBJECTFIFO 定律（源码实锤）
+
+aiecc "Resource allocation and Object FIFO lowering" 报
+`'aie.tile' op number of output DMA channel exceeded!` @ tile(3,2)。
+定位：tile(3,2)=worker 12 是 ring13_12+ring2_12（蛇形 wrap 边 12→0
+= (3,2)→(0,2)，跨 3 列，两条环各自一条）+ C_L1L3_12 的 producer
+= 3 条输出流 > 每核 2 条。
+
+读 mlir-aie AIEObjectFifoStatefulTransform.cpp 源码（zread）拿到判据：
+
+> core↔core objectFifo 当且仅当两端 `isLegalMemAffinity`（npu2 = 单步
+> 相邻，横/竖皆可——N=8 板上双方向已证）时降形为零流量共享内存+锁；
+> 不相邻则 fifo 拆分，producer 占一条核上 mem-DMA MM2S（每核仅 2 出）。
+
+蛇形在 4 列网格上的 wrap 必跨 3 列——不是本设计的错，是蛇形本身在
+>2 列时的拓扑缺陷。
+
+### 6e. 修复：全单位步哈密顿环 HAM16
+
+偶数边网格必存在全单位步哈密顿环。取
+`HAM16 = [0,1,2,3,7,6,5,9,10,11,15,14,13,12,8,4]`（wrap 4→0 =
+(1,2)→(0,2) 相邻；前 7 项恰是 N=8 蛇形前缀）。验证：
+- aie-opt 资源 pass **通过**（旧流水线重放）：32 条 aie.flow 全是
+  A/C shim 流量，**ring 零 flow**，纯 buffer+lock（如 ring13_12 的
+  缓冲落消费侧 tile(2,2)），与 N=8 板测形态一致；
+- 144 buffer 全部分配，每 tile 数据高水位 ≤39.9KB（+ .bss 21.2 +
+  栈 1 ≈ 62KB < 64KB）。18560B A cons buffer > 16KB 单 bank 的
+  bank-aware warning 在 N=8 同样存在（回退顺序分配，非致命）。
+- pos 无闭式逆 → 内核分段算术（col0=r, col3=13−r, col1/2 底=15/14,
+  否则 col1=7−r / col2=6+r），packer/golden 镜像；**N=16 pos 非
+  对合**，host 侧重排 drain 必须查表（meta.json 新增 pos_table）。
+- 一致性自检：design ring_tables == packer pos == golden pos ==
+  HAM16 逆（N=8/N=16 双查）；test_layerv2 geom 改为直接 import
+  ring_tables（消灭第四份拷贝）。
+- **N=8 回归锚保持**：pos 重构后 exec01/02/33 仍逐字节相同。
+
+### 6f. 板测结果
+
+（待填——kernel rows-seed 修复 + HAM16 后重跑 test_layerv2[iter4-8/16]）
+
+### 6g. 存档
+
+- 失败 MLIR：/tmp/aiecc_failure_20260929_061259_0201bfa5.mlir（180KB）
+  + repeater /tmp/aiecc_repeater_*.sh；哈密顿版 /tmp/lv2_16_ham.mlir
+  及降形输出 /tmp/lv2_16_ham_lowered.mlir（复验：aie-opt 资源 pass）。
+- design_layerv2.py（HAM16+ring_tables 单一真源）、w4gemvu_layer.cc
+  （rows 起种 + N=16 pos 分段）、tools/layerv2_pack.py（--n、
+  sub-column law、pos_table）、tools/layerv2_golden.py（--n、
+  drain_image N 化）、test_layerv2.py（geom 复用 design ring_tables）。
+- build/lv2_hy_w16/：33×27.91MB + meta.json（pos_table）。
+
+### 6f-1. N=16 运行期死锁：四级 bisect（推理链全程）
+
+**事实链**（每步独立板测，同窗口）：
+
+1. 裸环 N=16 单圈（test_ring 16,1）**过** → 拓扑/放置/锁/每-shim-2-worker
+   全部成立，环边零流。
+2. rings=0 全 K-flavor 链 + A/C 管道（test_lv2probe 16,0）**过** →
+   16 worker 的消耗/生产计数、内核 N=16 几何、shim 通道分配全对。
+3. rings=1/2/3 梯子**全挂**（relay 前注入即挂）→ 嫌疑收窄到 r13 中继
+   本身或其与 fill 的交错。
+4. 纯拓扑中继网格 (8/16)×(1/7/15 laps)（ring_copy 哑拷贝，排除一切
+   计算内核）：**25 项无一 30s 超时，全部跑完出数** → 15 圈 store-and-
+   forward 中继在 16 worker 上结构成立。第一轮 15 fail 是我自己的
+   golden bug（断言 pred(w) 而非 pred^laps(w)，laps>1 必错）——修正后
+   复跑。
+
+**方法论教训 ×2**：
+- `pytest ... > log; echo exit=$?` 的 wrapper exit=0 是 echo 的，真实
+  结果必须读 log（老坑新踩：pipe/echo 吞退出码）。
+- 两个板测进程并发 = 互相污染（ladder 后 4 个 F 无效）；P21-5 纪律
+  升级为**板上永远一次只有一个 pytest**。TaskStop 后要 pgrep 确认
+  sudo 子进程真死。
+
+**主嫌疑定律（待判）：跨 worker shim 饥饿**。N=16 每 shim 2 worker；
+fill 发出顺序 `for w: X_w,XN_w,W_w` 交错 → w15 的 XN 排在室友 w14 的
+1.74MB W fill 后；w14 消耗 18/94 个 W 元素后停在第一个 gather（ring
+耦合），W14 永不完成 → XN15 永不发出 → w15 到不了 make-push → w14
+的 gather 等不齐 → 环死锁。解释全部现象：N=8 免疫（1 worker/shim，
+无人抢你的 XN 队位）；rings=0 免疫（无 gather，各自喝干 W，队列自然
+清空）；纯 relay 免疫（fill 每人 1 个小元素）。
+**判决实验**：design fill 重排 [全体 X][全体 XN][全体 W]（已改
+design_lv2probe），rings=1 由挂转过即定律成立 = 修复本体。
+
+### 6f-2. 判别实验链（哑内核 vs 派发）+ 派发结构事实
+
+- X/XN-first 重排后 rings=1 **仍挂**（5×30s 超时）→ "跨 worker XN 饥饿"
+  只是必要非充分；同 shim 两个大 W fill 之间也串行，或嫌犯根本不在
+  fill 侧。
+- 已跑实验的混淆变量终于显形：relay 探针用 ring_copy 哑内核，
+  ladder/真设计用 lv_* 真内核——**内核数据路径 vs fill 派发**从未解耦。
+- 判别刀：ladder rings=11（rings=1 + gather 三内核换成 ring_touch1/
+  ring_copy128_bf16 哑体，**fifo 操作逐 op 同构**）。过→lv_* 内核
+  N=16 数据路径有罪（大概率又一个 rows-seed 类）；挂→派发/顺序有罪。
+- 构建期失败 ×2（留痕）：哑解码写在 `assert 0<=rings<=3` 后（调序修）；
+  iron 限制 one binary per worker → 哑内核并入 w4gemvu_layer.cc。
+- 降形 MLIR 派发事实（/tmp/lv2_16_ham_lowered.mlir ~9390 行）：每个
+  fill = `dma_configure_task_for` + `dma_start_task` 直线序列，无
+  token 互锁（仅 C drain 带 issue_token 对应 wait=True）；**W fill 塌缩
+  为单个 1.74MB 线性 BD**（4D tap 全 0/1 步长）。shim ctrl 线程逐
+  start_task 不等完成。→ 若判派发有罪，下一步 hexdump insts.bin 读
+  真实通道分配/队列写（引擎 Rust 侧有 BD 格式先验）。
+
+**用户方针（2026-09-29）**：修复方向"尽量去并行"而非靠分组容忍串行；
+锁死修完后认真抽象**数据流建模工具/机制**（设计自描述 DAG + 可插拔
+派发模型仿真 + 死锁见证环输出 + 吞吐预测；今天的死锁作为首个回归
+用例，兼作教科书案例）。
+
+### 6f-3. 判决：lv_* 内核 N=16 数据路径有罪（哑内核 5/5 过，lv 5/5 超时）
+
+- (16,11) gather 三内核全换哑体（fifo 逐 op 同构）**5/5 PASS**；
+  (16,1) lv 真体内核 **5/5 ERT_CMD_STATE_TIMEOUT**（315.5s 总时长
+  吻合 2×编译 + 5×30s）。**派发/fill 顺序/拓扑/中继结构全部无罪**。
+- 静态审查第三轮（全过）：lv_xelem N=16 初始化正确（K=0→X flavor
+  派发、rows=128、jpw=384、cMask=15、pos 分段与 pos_table 逐项一致、
+  计数器复位）；.bss 边界恰好安全（lv_shared 2048 元素 = 8×256 =
+  16×128 都正好 4KB；lv_xn/lv_o 512B；lv_dacc 256 f32）。
+- 计算内核致挂仅三径：内核内死循环 / OOB 写穿锁与 fifo 状态 / 核
+  陷入 trap。**主假设（新）**：某 gemv flavor 在 N=16 几何下 OOB，
+  覆写 lv_ctr（复刻 P28-6 首死锁的 trample 机制）；哑中继不读
+  lv_ctr（constexpr 尺寸）故免疫，lv 中继读 cRows/cP/cMask/cR1 故
+  挂。次假设：relay 内核自身 rows 来源（lv_ctr[cRows]）被污染成巨
+  值 → `g < rows/32` 循环近乎不终止。
+- **单点替换 bisect**（rings=12/13/14：make/store/forward 各自换单
+  点哑体）：恰好一刀转好→该内核有罪；全过→成对交互/累计状态；
+  全挂→时序差（慢中继轮次引发 fifo 活锁，30s 远超 15 轮×1ms，几乎
+  不可能）。
+
+### 6f-4. 单点 bisect 反转 + 间歇性真相（bisect3, 10:39 板程）
+
+- 参数 [(16,12)=fr1哑, (16,13)=st1哑, (16,14)=fw1哑]，各 5 iter：
+  **11 failed / 4 passed**——(12)(13) 各过 1，(14) 全挂。
+- 推翻"fw1 单点有罪"（前次 `.F.` 的点其实属于 (12)/iter2 的误归属）。
+  新模式：**全哑（11）5/5 过 vs 任何一个真内核在场 → ~80% 挂**。
+- 真内核 vs 哑体的三个维度：lv_ctr 内存读（ZOL trip 来源）、耗时
+  （~µs vs ~50ns）、.bss(lv_shared/lv_xn/lv_o) 访问 + 代码布局位移。
+  同一二进制内 pass/hang 交替 → **运行期状态/时序依赖，非确定性代码
+  缺陷**。
+- 静态协议复核：每 worker 同时至多持 1 in-slot + 1 out-slot，每边
+  2 slot → 结构性活锁不存在；µs 级轮次 vs 30s 超时 → 纯慢度不可能
+  触发。矛盾待解。
+- 反汇编对比（llvm-aie objdump，build/w4gemvu_layer.o）：lv_fw1 与
+  ring_copy128_bf16 同为 ZOL 硬件循环，唯一差异 = trip count 来自
+  `lda r0,[p2,#0]`（lv_ctr[cRows]，链接期重定位）vs 立即数 8；槽内
+  指令打包顺序存疑但 .o 可重定位无法静态定案。
+- **对照组判决树**（[(16,15) 慢哑, (16,11) 全哑, (16,1) 全真]）：
+  15 挂+11 过+1 挂 → **中继轮次时序/硬件仲裁竞态**（修复走协议层：
+  depth 4 / release 顺序）；15 过 → lv_* 代码生成（修复走常量界循
+  环）；11 不再 5/5 → **板况漂移，今日矩阵作废**。
+
+### 6f-5. 对照组判决：慢哑 5/5 过、全哑 5/5 过、全真 0/5 挂（328.9s）
+
+- **MLIR 逐行零差异**（r1 vs r11 除被调符号名 diff=0）→ 刀口收敛到
+  被调体内容/地址。地址模式分析：make=本地、store=远读+本写、
+  fwd=远读+本写，真/哑一致。
+- 权威矩阵（只认 short summary，-q 进度行有 \r 重绘假象）：
+  | 配置 | fr1 | st1 | fw1 | 通过率 |
+  |---|---|---|---|---|
+  | 11 | 哑 | 哑 | copy128 | 5/5 ×2 |
+  | 15 | 真 | 真 | **慢哑**(自旋+拷贝) | 5/5 |
+  | 14 | 真 | 真 | copy128 | 2/5 |
+  | 12 | 哑 | 真 | 真 | 1/5 |
+  | 13 | 真 | 哑 | 真 | 1/5 |
+  | 1  | 真 | 真 | 真(lv_fw1) | 0/5 ×2 |
+- 15-vs-1 唯一差异 = fw1 体：lv_ctr 内存 trip 的 ZOL vs 自旋+常量界
+  拷贝。14(快哑)反而比15(慢哑)差 → 非单调时序，5 样本无判决力。
+- **在飞判决**：rings=17 `ring_fw_const`（lv_fw1 同体、常量界——修复
+  候选）；rings=16 `lv_fw1_clone`（逐字身换符号——布局对照）。
+  17 过 → 内存 trip ZOL 定罪，真修复 = 分支化常量界循环（保 runtime-N）；
+  16 挂 17 过 → 符号/布局定罪。随后同窗补 N=8 真锚。
+- 教训：进度行 grep 不可信（pytest -q 原地重绘）；只认 summary。
+
+### 6f-6. 换仪器：直接读"死锁"现场——根本没有死锁，是双峰爬行（2026-09-29）
+
+**仪器**（/tmp/lv2_forensic.py，待归档）：独立驱动 AIELv2Probe（不跑 pytest），
+C 哨兵预填 0xAAAA（SHMEM host_only BO，`bo.map()` 直读），execute 后 2ms 轮询
+drain 掩码（每 worker 20 元素 = 12 qkv + 8 cxn，N=8 为 40），wait() 计时分类
+PASS/幽灵挂/楔死。X@6404 填 N 使 lv_xelem 走 runtime 几何，全零权重 → drain
+值恒 0x0000，哨兵对比无歧义。
+
+**发现（颠覆 6f-1..5 的全部假说）**：
+1. **没有硬死锁**。r1 在裸 harness 12/12 完成，wait() 均 0ms。pytest 0/5
+   只是 ERT ~30s 超时接住重尾。
+2. **爬行=逐元素毫秒节奏**：时间线上单个 C 元素间隔 2-6ms，单 worker 尾巴
+   470ms；总时长 2.2ms（干净）→ 2832ms（慢模式），1400× 摆幅，**双峰**。
+3. **定量 per-BD 律**：每 exec ≈ 1856 个元素级 BD（fill 逐元素 + drain 逐元
+   素，objectFifo depth-2 协议）。干净模式 ≈ 1.2µs/BD；慢模式 ≈ 0.4-1.5ms/BD。
+4. **与 kernel 无关**（r11 全哑 8/8 也爬，last-drain 156-1199ms）；**与 ring
+   无关**（r0 无 gather 也爬，2ms-2479ms）；**与 2-worker/shim 无关**（N=8
+   对照同样出 1505ms 尾巴，只是慢模式概率低得多：N=8 ~1/8 vs N=16 ~80%）。
+   test_ring（每 worker 1 fill BD + 1 drain BD）恒快 → **病在逐元素握手协议
+   的规模**，并发流越多慢模式越频繁。
+5. 权威矩阵更新：6f-5 的通过率矩阵全部重解释为"总时长 vs 30s 超时的重尾
+   抽签"，相位共振/ZOL/符号布局假说全部作废。
+6. shim 通道分配无罪：lowered `aie.shim_dma_allocation` 每 shim MM2S/S2MM 各
+   0/1 独占，无共享。
+
+**与 FLM 的对照**：FLM 21.44ms/token 没有crawl——其数据流用大块 BD 直传，
+逐元素 objectFifo 锁握手是 mlir-aie 协议产物。修复方向（按数据流并行优先）：
+消灭逐元素握手——大元素打包 / W 走 core mem-DMA / 锁 pmode。
+
+**在飞**：xrt-smi configure --pmode performance 锁频对照（慢模式若消失 →
+DVFS/功耗状态机定罪，一行修复）。
+
+**环境事故**：~/.claude/jobs 累计 275G 触发 EDQUOT（瞬态写失败）；用户手工
+清理。板测期间注意 home 配额与 /tmp 余量。
+
+### 6f-7（2026-09-29⑫）提交路径判别矩阵 + 幽灵完成机理（syncobj≠成功）
+
+**仪器**：`run-lv2loop [iters] [n]`（xnpu-cli 新入口，main.rs ~5456）——引擎
+自己的原始提交路径（ERT_START_CU regmap 包 + syncobj_timeline_wait）跑
+lv2 循环，零 host 中间工作。`LV2LOOP_PROBE=<rings>` 驱动 AIELv2Probe 夹具
+（与 6f-6 forensic 完全同输入：zeros + K/id/N 头）；缺省 = 全设计
+（w4gemvu_layerv2_{n}，W=真实 exec05.bin，X/XN=真实激活/残差）。
+`LV2LOOP_WAIT_S` 每-exec 超时（默认 30）。逐 exec 记时 + C 图像 hash
+（clflush_region 后 FNV，绕过 FromDevice EINVAL，见文末）+ **ERT 包状态字
+回读**（见 3）。
+
+**1. 爬行矩阵（路径 × 设计 × N）——病在提交路径，不在数据流**：
+
+| 路径 | 设计 | N | 结果 |
+|---|---|---|---|
+| 引擎原始包 | probe r1 | 16 | **干净 743µs 中位 ×12，0 slow** |
+| pyxrt runlist（forensic） | probe r0/r1 | 16 | ~80% 尝试爬行，≤2832ms |
+| pyxrt（forensic） | probe r0/r1 | 8 | ~1/8 尝试爬行 |
+| 引擎 | 全设计 | 8 | **干净 754µs ×20（与 E2E 765µs n=165 吻合）** |
+| 引擎 | 全设计 | 16 | exec0 = 60.8s 后"完成"；exec1/2 = 1294/75µs（见 2） |
+| pyxrt（pytest） | 全设计 | 16 | 0/5 30s 超时 |
+
+同一夹具同一输入，pyxrt 爬、引擎干净 → **6f-6 的爬行 = pyxrt/XRT-runlist
+提交路径疾病**（XRT 侧每 exec 重建 exec BO/runlist churn，P23 见 ~1930
+create_bo/token）。FLM 不爬（1 ioctl/token 大链）。这与"金标准优先"指令
+合流：引擎路径就是类 FLM 路径。
+
+**2. 全设计 N=16 引擎签名（新谜题）**：exec0 wait 60.8s 后返回 Ok，**C 全零
+（5120 u16 全 0，hash 恒定）**——真实权重 × 非零 X 下 qkv drain 不可能全零
+→ exec0 是假完成（见 3）；exec1=1294µs、exec2=75µs 同样全零同 hash。
+probe r1 干净 743µs → 60.8s 爬行与幽灵完成是**全设计独有部分**（ring2/3
+gather、K=1/K=3 窗口 fill）或其后果。
+
+**3. 幽灵完成机理（kernel 源码实锤，amdxdna aie2_ctx.c）**：
+- `aie2_sched_notify` 在**所有**响应路径都 `dma_fence_signal` →
+  syncobj 被信号 **≠ exec 成功**。COMPLETED(4)/ERROR(5)/ABORT(6)/
+  SUBMITTED(7)/TIMEOUT(8)/NORESPONSE(9) 全部signal。
+- 状态字 = exec BO 首 u32 的 bits[3:0]（AMDXDNA_CMD_STATE GENMASK(3,0)，
+  amdxdna_ctx.h:120）；我们引擎此前从不读它——所有"syncobj wait 返回=完成"
+ 的历史观测都要带此Footnote重审。
+- **health 路径**（fw 无响应 data==NULL）：把 fw health 数据 memcpy 进
+  cmd BO 的 data 区（**覆盖 regmap！**）并置 TIMEOUT；且
+  `ctx->health_reported` 永久置位 → **此后所有 cmd 瞬间 ABORT+signal**
+  ——这就是 exec1/2 = 1294/75µs 幽灵完成的机制候选（待状态字确认
+  exec0=TIMEOUT/ERROR）。
+- 60.8s 的主人未定：TX_TIMEOUT 仅 2s（mailbox_helper.h），AIE2_TIMEOUT
+  1s——60.8s 更像 fw 侧 exec watchdog（若 exec0 状态=ERROR）或 mailbox
+  RX 长超时（若=TIMEOUT）。
+
+**4. C FromDevice EINVAL（未解，已绕过）**：run-lv2loop 里 10240B C BO 的
+FromDevice sync 恒 EINVAL(os 22)（N=8/16 都是，含 20 次全干净 exec 后）；
+内核两 EINVAL 分支（size 检查 / assigned_ctx==INVALID）按 E2E 同调用成功
+的事实都解释不通——留观。读回走 clflush_region + 2ms settle（P21-4 的
+fw-fence 缺失风险由 hash 跨 exec 稳定性兜底）。
+
+**5. 排程**：N=16 bisect 下一刀 = 引擎路径 probe r2/r3（ring2/3 隔离，
+夹具已在 IRON/build）与全设计 exec0 状态字确认。
+
+### 6f-8（2026-09-29⑬）n@6404 根因定案 + N=16 引擎路径全绿 + 带宽钉子
+
+**1. 根因定案（6f-7 §2 的谜题关闭）**：全设计 N=16 的 60.8s 楔死 +
+幽灵完成 = **引擎 full 分支 X 元素缺 `n@6404`**。契约出处
+design_layerv2.py:35——runtime-N 内核从 X 元素 [6404,6408) u32 读
+worker 数（"ONE .o serves every width"，6c 重构引入）→ n=0 → 垃圾几何
+→ 设备侧挂死。probe 分支一直写 id@6400+n@6404 两字，full 分支只写
+id——**fork 构造不对称**，P20b「怪设计前先核对夹具/内核契约」定律
+第三次咬人。修复 = main.rs full 分支补一行（注释引用 design 行号）。
+N=8 E2E 从不需要该字：build/w4gemvu_layerv2_8 是 runtime-N 重构**前**的
+compile-time N=8 PDI 旧夹具。60.8s 看门狗的主人（fw 侧）本体仍未定位，
+但 n 写对后该路径不可达——问题 moot。
+
+**2. 状态字预测全部兑现（6f-7 §3 收尾）**：修复前的 instrument 捕获
+exec0 = **TIMEOUT(8)**@60.85s + pkt[1..8] 全 0xffffffff（= health 路径
+memcpy 覆盖 regmap 的指纹，aie2_ctx_cmd_health_data）；exec1+ =
+**ERROR(5)**@118-1297µs（fw 对 jammed 队列快速拒绝，非 ABORT——
+6f-7 猜 ABORT，实测 ERROR，机制修正）。ERT fake-completion 语义
+（syncobj≠成功）由仪器实证：C 全零 + hash 恒定 = 从未复算。
+
+**3. 确认运行（n@6404 修复后，12 iters）**：12/12 COMPLETED(4)，
+it0 暖机 1906µs，稳态 736-775µs（med 762），**C 5120/5120 非零**
+（真实权重必然；对照 probe zeros 的 36-38），hash 跨 exec 恒定 =
+确定性复算。引擎路径矩阵补全：r1 743 ×12 / r2 756-759 ×4 / r3 ~757 ×4
+/ full 762 ×12 / N=8 full 754 ×20（E2E 765 吻合）——**全部干净**。
+
+**4. 带宽钉子（宏观新事实，P28-6 论点落空一半）**：27.91MB/762µs =
+**36.6 GB/s ≈ N=8 的 36.1**。通道翻倍（16A+16C 恰饱和 SHIM CHANNEL
+LAW 预算）聚合带宽**不动** → 瓶颈不在 per-worker 通道吞吐。坐标：
+每 worker W 1.74MB @ 单通道 ~6.95GB/s（P12）纯 fill ≈ 250µs；实测
+762µs → **~500µs 在非 fill 路径**（ring 中继轮次 / C drain 定序 / K 链
+串行段）。地板 506µs@55.1GB/s，36.6 距墙 1.5×。注意 probe r1(743) 与
+full(762) 只差 19µs——若每次 gather 串行 ~250µs，r1 应 ~500——
+「3×gather 可加成本」的简单模型已被自己的数据弱化。
+**分叉判决（在飞）**：引擎路径 r0（无 gather，K 链+A/C 管道全跑）——
+~740µs → 病在 K 链/C drain；显著低 → gather O(N) 深度定罪。
+
+**5. E2E N=16 移植降级**：33×762 ≈ 25.1ms vs N=8 25.2ms——设备时间
+零收益（打包/pos_table 工程量白付），只买机制验证。**优先回答 36.6
+钉子**（用户宏观视角指令的实证：通道数假设是局部优化，数据流结构
+才是当前形态的约束）。
+
+**6. 排程**：r0 判决 → 36.6 钉子的结构分解（C drain 逐元素定序 vs
+K 链窗口 fill vs ring 轮次）→ 与数据流性能模型 subagent 的文档合流
+（P27-3b 的 132µs+bytes/55.1 组模型在 N=16 全设计上需要新项：组内
+串行段的条数 × 每条固定成本）。
+
+### 6f-9（2026-09-29⑭）r0 判决：ring 无罪，钉子 = per-element 发行节拍
+
+**1. r0 结果**：引擎路径 probe r0（rings=0，K 链 + A/C 管道全跑，无
+任何 gather）12/12 COMPLETED，**742µs med（710-757）**——与 r1 743 /
+r2 756-759 / r3 ~757 / full 762 全部同窗同值。**三次 all-gather 的
+O(N) 环中继合计 ≤20µs**（r0→full 差），gather 深度假设（6f-8 §4 候选
+之一）证伪。probe（zeros，计算走零行）与 full（真实权重，全计算）
+也只差 ~20µs——计算继续被流水掩盖（P27-3b 结论在新设计上复现）。
+
+**2. 统一规律（全部数据点一张表）**：
+
+| 配置 | 每 shim 元素发行数 | 实测 µs |
+|---|---|---|
+| N=8 full | ~189（1 worker × 186+3） | 754 |
+| N=16 r0 | ~192（2 worker × 96+） | 742 |
+| N=16 r1/r2/r3/full | ~192 | 743-762 |
+
+时间与 N、ring 数、计算量**全部无关**，只随每 shim 的 fifo 元素
+数（~190 恒定——层几何固定总元素数；8 shims（design_layerv2.py:
+127-131），N=8 = 1 worker/shim，N=16 = 2 worker/shim 把同一批元素
+分掉）→ **每 shim 每 18560B 元素 ~3.9µs ≈ shim 聚合 ~4.7GB/s**。
+每通道单流：N=8 = 4.65、N=16 = 2.4（2 通道均分）。
+
+**3. 对照 P12 纯 fill 探针**：P12 单流 6.95GB/s（9280B 元素，1.39µs）
+且 2 通道/shim → **shim 聚合 13.4GB/s**；layerv2 只有 4.7。同器件
+同 shim，聚合差 2.9× → 限制因子是协议/结构不是 DDR 墙。layerv2
+元素 18560B 带宽项 2.67µs + ~1.2µs 缺口 ≈ 3.9。
+交叉项嫌犯（未判）：同 shim 2 worker 的 BD 队列交替、C drain 320
+元素 S2MM 与 MM2S 同 DPU 竞争、K=1/K=3 窗口元素穿插打碎大块流、
+depth-2 fifo 的内核 acquire 停顿。
+
+**4. 36.6GB/s 钉子的最终归属（本轮定案）**：per-element 发行/协议
+节拍 × ~1500 元素，**不是** DDR 墙（55.1 可达，P12）、不是通道数
+（16A+16C 饱和也不动）、不是 ring（≤20µs）、不是计算（≤20µs）。
+推论优化方向（按元素数削减排序）：(a) 元素做大（18560→N×，L1 64KB
+是硬约束：depth-2×2×元素+21KB .bss 已满，需 depth-1 或 .bss 减半）；
+(b) W 走 core mem-DMA（绕 shim 发行，P28-1 swiglu_fused 机器）；
+(c) 多元素单 BD 已是大块（6f-2：W 塌缩 1.74MB 线性 BD）→ 病不在
+shim BD 尺寸在**内核侧逐元素 fifo 协议**的可能性未排除——下一刀
+判别 = v5s 式 K 头垃圾探针（内核零行但 fifo 全跑）vs 6f-6 式哨兵
+时间线，量单元素间隔的真实分布。
+
+**5. 数据流模型输入（给 subagent 文档合流）**：T_exec 模型在
+layerv2 上 = max(bytes/55.1, **n_elem × 3.9µs**) + 小项——
+「元素数」是独立于字节数的一等资源维度（TileSight 资源向量的
+第五维候选：fifo 元素发行率）。N=8/N=16/r0-r3/full 六个数据点
+全部被该式闭合（残差 <3%）。
+
+**6. 补遗（同日，读 design 后修正——上面 §5 的「元素发行率」
+机制表述是错的）**：design_layerv2.py:351-374 实际结构 = **单
+task group**，fill 只有 **3n 条**（X/XN/W 各 n；W_taps 是
+[1,1,1,N_WELEM×ELEM] 单条线性大 BD，6f-2 已证塌缩）+ n 条 C
+drain。**shim 侧不存在逐元素发行**——fifo 元素（94/worker）的
+rendezvous 全在 core↔shim 的 depth-2 协议里，而 plain v5 lm
+（同 18560B 元素、同 depth-2、同满计算）实测 50GB/s 无逐元素税
+（v5s 拟合 132µs+bytes/55.1，2719µs@136MB）。正确的两分量模型：
+
+> T_exec(layerv2) ≈ W_bytes / (8 shims × **~7GB/s 混合流速率**)
+>               + **~250µs 串行胶水链**（r0 与 full 同值 → 与 ring 无关）
+
+- N=8：27.62/(8×7)=493 + 250 = 743（实测 754，ε=11）
+- N=16：27.91/(8×7)=498 + 250 = 748（实测 742-762，ε≤14）
+
+两分量的结构出处：
+- **7GB/s/shim（vs P12 纯 fill 13.9）**：混合流退化——同 shim 上
+  A 大流与 C drain 320 个逐元素 S2MM BD 并发争用 shim 引擎；P12
+  无 C drain 无胶水时 2 通道/shim 打到 13.9。
+- **~250µs 胶水串行链**：worker 流内 K 口味交错（exec05 头验证：
+  [2048]×8, 101, 103×24, 104×24, 105×24, 102, [2048]×12）——
+  胶水相位期间内核不消费 W fifo → depth-2 排空 → fill 停顿，
+  W 流随内核相位走停。与 N 无关（胶水逐 worker 冗余跑全向量）。
+  这正是 P27-4「task group 是调度成本原子」在组内的镜像：**组内
+  的调度原子是胶水相位边界**。
+- **判别实验（未做）**：①W-fraction 夹具（W 元素数砍半）：fill 界
+  → T 降 ~370µs；胶水界 → T 降 ~120µs。②去 drain 探针：T→~500µs
+  则 C drain 争用定罪。③r0 变体去胶水口味（全 [2048] 流）。
+- 优化含义：消 36.6 钉子 = 消 C 逐元素 drain（攒大元素/批量 S2MM）
+  **且** 消胶水-流交错（胶水搬 .bss 后台相位/双 fifo 交错 W 与
+  胶水元素）——两个都要做，只做其一上限 ~500µs 量级。
+
+**7. 再修正（同日第三轮，pair 夹具交叉验证把 §6 的机制归因也
+推翻）——终模型：55.6 墙 + 胶水空转占空比**。§6 说「shim 混合流
+速率 ~7GB/s（C drain 争用所致）」。反例：**pair 夹具（P27-3b）
+同 shim 2 A 通道 + 2D-tap C drain + 胶水窗元素俱全，shim 聚合
+13.8GB/s**——C drain 争用与双通道交错都不构成 shim 降速。真相：
+
+> **T_exec(layerv2) = W_bytes / 55.3GB/s（全通道 DDR 墙）+ Σ胶水
+> 相位停摆（~250µs，与 N 无关）**
+
+- N=8：27.62/55.3 = 499 + 257 = 756（实测 754，ε=0.3%）
+- N=16：27.91/55.3 = 505 + 240 = 745（实测 742-762，ε≤2%）
+- **流本身一直在墙上跑**——36.6GB/s 钉子 = 55.6 × 占空比
+  （~497/754 ≈ 2/3）：胶水相位（K 口味边界上 worker 做全向量
+  rms/swiglu/量化 + gather join）期间内核不 acquire A fifo →
+  depth-2 排空 → 8/16 通道集体空转 ~250µs/exec。各 worker 跑同
+  一口味序列 → 胶水相位时间上对齐 → 室友通道也救不了占空比。
+- **与 P27-4 的统一（本条的教科书价值）**：pair/quad 时代胶水
+  停摆本来就藏在 task group 边界的空转里（组间等 drain/TCT 时流
+  反正停着）——「75µs/组固定成本」其实一直部分是胶水的遮蔽物。
+  layerv2 消掉组边界（省了组开销）却把胶水相位**裸露**到流时间
+  上。单组设计的完成态不是免费流水，而是**必须显式做胶水/W 重叠**。
+- 由此下一刀精确化（纯内核重构，零新通道零新 fifo）：**胶水相位
+  分块穿插 W 块消费**（胶水本来就是逐 256 向量 chunk 处理——
+  每 chunk 之间服务一个 W 块，depth-2 不排空，流不停）；或胶水
+  相位分解为可增量的部分（o 块消费完立即累它的 sumsq 分量）。
+  上界：胶水全遮 → exec ≈ 505-520µs → 33 exec ≈ 17ms 设备 +
+  lm 3.2 + host ~2.5 ≈ **~22.5ms/token ≈ FLM 追平点**（与 6f-8
+  §5 的估界一致，但现在有机制路径）。
+- 判别实验（若需直接证据）：echo 时间戳计数器进 lv_cxn 探针窗
+  （每胶水相位边界写 .bss 计数，比 6f-6 的 2ms 轮询细）——但模
+  型已闭合 6+2 数据点（含 pair/quad 时代），优先级让位于修复本体。

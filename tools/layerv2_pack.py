@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""P28-5 layerv2 offline weight packer (hy-mt2 1.8b -> 33 exec W tensors).
+"""P28-5/P28-6 layerv2 offline weight packer (hy-mt2 1.8b -> 33 exec W tensors).
 
-The layerv2 design (IRON design_layerv2.py) computes, per exec on 8 ring
-workers, HALF A LAYER SHIFTED: o_proj+MLP of layer mlp plus qkv of layer
-qkv_l, chained by the residual the previous exec drained. The dependency
-qkv_L -> host attention -> next exec's X element forces that shift; the
-head/tail execs pad the pipeline with exact-zero weight packs:
+The layerv2 design (IRON design_layerv2.py) computes, per exec on N ring
+workers (N = 8/16; the kernel reads N from the X element, P28-6), HALF A
+LAYER SHIFTED: o_proj+MLP of layer mlp plus qkv of layer qkv_l, chained by
+the residual the previous exec drained. The dependency qkv_L -> host
+attention -> next exec's X element forces that shift; the head/tail execs
+pad the pipeline with exact-zero weight packs:
 
   exec 1    : mlp=None (o/gate/up/down/w2 all zeros; X element q=0 makes
               o=0 regardless, and w2=0 zeroes q2 -> gate/up=0 -> sw=0 ->
@@ -15,21 +16,32 @@ head/tail execs pad the pipeline with exact-zero weight packs:
   exec 33   : mlp = 31, qkv_l=None (zero qkv pack + zero w1: rms1 sees
               w1=0 -> q4=0 -> C's qkv section is exact zeros, ignored).
   exec 33's xn1 drain = the FINAL hidden (after model.norm on host it
-  feeds lm_head).
+              feeds lm_head).
 
 Every bit is RE-SLICED from the engine's verified w4u_hy v4 packs -- no
-requantization anywhere. The concat gate_up pack (12288 rows) spreads
-positions across columns: position p's gate rows live in concat column
-p//2 (blocks (p%2)*48..+48) and up in column 4+p//2 -- verified bit-equal
-against separately-packed gate/up (tools/p28 archive, P28-5 note).
+requantization anywhere.
 
-Per exec bin = the test_layerv2 `weights` tensor: worker w's 186-element
-run in fill order [o x16 | w2(K=101) | gate x48(K=103) | up x48(K=104) |
-down x48(K=105) | w1(K=102) | qkv x24], sliced by RING POSITION p(w) =
-(w<4) ? w : 11-w -- COLUMN w carries position p(w) blocks (the mirror of
-the naive p->p packing scrambles the ring gathers; see build_exec).
+SUB-COLUMN SLICING LAW (P28-6, empirically pinned against the packer):
+the v4 packs are 8-column (a column spans M/8 rows), so a ring position's
+blocks are the contiguous t-run of ONE pack column -- only N=8 coincides
+with whole columns, and a flat p*count run silently scrambles gate/up/down
+for N=16. The concat gate_up pack (12288 rows) carries gate in columns
+0-3 and up in columns 4-7; position p's gate rows start at concat row
+p*jpw (up: 6144 + p*jpw). Down (K=6144) tiles are stored 3 chunk-major
+blocks per 16 rows (block b -> col b//48, chunk (b%48)//16, tile
+(b%48)%16), so a column spans 256 rows regardless and chunks multiply the
+block stride, never the row span.
 
-Run: npu314 python tools/layerv2_pack.py            # all 33 execs (~913MB)
+Per exec bin = the test_layerv2 `weights` tensor: worker w's N_WELEM-element
+run in fill order [o xN_O | w2(K=101) | gate xN_GATE(K=103) | up
+xN_GATE(K=104) | down 3*N_O(K=105) | w1(K=102) | qkv xN_QKV], sliced by
+RING POSITION pos(w) (N=8 serpentine / N=16 Hamiltonian -- see pos());
+COLUMN w carries position pos(w) blocks. Packing column p with position p
+mirrors the odd columns of the N=8 serpentine (pos is an involution there)
+and scrambles the ring2 all-gather (board-caught P28-5, N=8 case).
+
+Run: npu314 python tools/layerv2_pack.py                 # N=8 -> build/lv2_hy
+     npu314 python tools/layerv2_pack.py --n 16          # -> build/lv2_hy_w16
      npu314 python tools/layerv2_pack.py --execs 1 33
 """
 
@@ -43,37 +55,82 @@ import torch
 from safetensors import safe_open
 
 ELEM = 18560
-COLS = 8
-N_O, N_GATE, N_UP, N_DOWN, N_QKV = 16, 48, 48, 48, 24
-N_WELEM = N_O + 1 + N_GATE + N_UP + N_DOWN + 1 + N_QKV  # 186
+HIDDEN, INTER, QKV_M = 2048, 6144, 3072
 LAYERS = 32
 
 SRC = Path("/home/nzinfo/qwen/xnpu/build/w4u_hy")
 OUT = Path("/home/nzinfo/qwen/xnpu/build/lv2_hy")
 
 
+def geom(n):
+    """Per-N geometry mirror of design_layerv2.my_layerv2 / test_layerv2.geom."""
+    rows = HIDDEN // n
+    N_O = rows // 16
+    N_GATE = (INTER // n) // 16
+    return {
+        "n": n, "rows": rows, "jpw": INTER // n,
+        "N_O": N_O, "N_GATE": N_GATE, "N_UP": N_GATE,
+        "N_DOWN": 3 * N_O, "N_QKV": (QKV_M // n) // 16, "N_CXN": N_O,
+        "N_WELEM": N_O + 2 * N_GATE + 3 * N_O + (QKV_M // n) // 16 + 2,
+        "drain_rows": QKV_M // n + rows,
+    }
+
+
+def pos(w, n=8):
+    """Worker id -> ring position (matches the kernel's lv_xelem and the
+    design's ring_tables). N=8: the two-column serpentine (an involution).
+    N=16: the all-adjacent Hamiltonian cycle order 0,1,2,3,7,6,5,9,10,11,
+    15,14,13,12,8,4 (CORE<->CORE OBJECTFIFO LAW -- non-adjacent edges
+    split into core mem-DMA channels, 2 per npu2 core; the serpentine
+    wrap needed 3 on worker 12). The cycle's inverse is piecewise: col 0
+    = r, col 3 = 13-r, col 1/2 bottom worker = 15/14, else col 1 = 7-r,
+    col 2 = 6+r. NOT an involution at N=16."""
+    if n != 16:
+        c = w >> 2
+        return w if c % 2 == 0 else 8 * c + 3 - w
+    c, r = w >> 2, w & 3
+    if c == 0:
+        return r
+    if c == 3:
+        return 13 - r
+    if r == 0:
+        return 15 if c == 1 else 14
+    return 7 - r if c == 1 else 6 + r
+
+
+HAM16 = [0, 1, 2, 3, 7, 6, 5, 9, 10, 11, 15, 14, 13, 12, 8, 4]
+
+
 def u32(x):
     return np.frombuffer(struct.pack("<I", x), dtype=np.uint8)
 
 
-def pos(w):
-    """Worker column -> ring position (serpentine SUCC, an involution)."""
-    return w if w < 4 else 11 - w
+def sub_blocks(mm, M, p, rows_per_pos, chunks=1, chunk=0, r0_extra=0):
+    """SUB-COLUMN SLICING LAW: position p's contiguous 16-row-block run of
+    pack column col (the 8-column pack; rows_per_col = M/8 regardless of
+    K-chunking). r0_extra shifts into e.g. the up half of the concat pack."""
+    rows_per_col = M // 8
+    r0 = r0_extra + p * rows_per_pos
+    col, t0 = r0 // rows_per_col, (r0 % rows_per_col) // 16
+    T = rows_per_col // 16
+    base = (col * chunks + chunk) * T + t0
+    cnt = rows_per_pos // 16
+    return mm[base * ELEM : (base + cnt) * ELEM]
 
 
 class LayerBins:
     """Per-layer packed blocks + norm weights, loaded once, sliced by
     ring position. All arrays are read-only views into the big mmap."""
 
-    def __init__(self, src: Path):
-        self.o = {}      # pos -> (offset_blocks, buf) layer packs
-        self.dn = {}
-        self.qkv = {}
-        self.gu = {}     # concat gate_up packs
+    def __init__(self, src: Path, g):
+        self.g = g
+        self.o = {}      # layer -> mmap of the (2048, 2048) pack
+        self.dn = {}     # (2048, 6144) pack (chunk-major blocks)
+        self.qkv = {}    # (3072, 2048) pack
+        self.gu = {}     # concat gate_up (12288, 2048) pack
         self.ln_in = {}  # input_layernorm bf16 (2048,)
         self.ln_post = {}
         with safe_open(str(src / "bf16.safetensors"), framework="pt") as f:
-            keys = set(f.keys())
             for n in range(LAYERS):
                 for shape, store in (("o", self.o), ("gateup", self.gu),
                                      ("down", self.dn), ("qkv", self.qkv)):
@@ -84,34 +141,34 @@ class LayerBins:
                 self.ln_post[n] = f.get_tensor(
                     f"model.layers.{n}.post_attention_layernorm.weight").to(torch.bfloat16)
 
-    # -- per-position block views (16B-granular slices of the mmap) --
+    # -- per-position block runs (sub-column law; zeros for padded execs) --
     def o_blocks(self, layer, p):
         if layer is None:
-            return zeros_blocks(N_O)
-        return self.o[layer][p * N_O * ELEM : (p + 1) * N_O * ELEM]
+            return zeros_blocks(self.g["N_O"])
+        return sub_blocks(self.o[layer], 2048, p, self.g["rows"])
 
     def qkv_blocks(self, layer, p):
         if layer is None:
-            return zeros_blocks(N_QKV)
-        return self.qkv[layer][p * N_QKV * ELEM : (p + 1) * N_QKV * ELEM]
+            return zeros_blocks(self.g["N_QKV"])
+        return sub_blocks(self.qkv[layer], 3072, p, QKV_M // self.g["n"])
 
-    def down_blocks(self, layer, p):
+    def down_blocks(self, layer, p, c):
+        """Chunk c's blocks for position p (the fixture lays them out
+        c-major: chunk c's N_O blocks in a row)."""
         if layer is None:
-            return zeros_blocks(N_DOWN)
-        return self.dn[layer][p * N_DOWN * ELEM : (p + 1) * N_DOWN * ELEM]
+            return zeros_blocks(self.g["N_O"])
+        return sub_blocks(self.dn[layer], 2048, p, self.g["rows"],
+                          chunks=3, chunk=c)
 
     def gate_blocks(self, layer, p):
-        # concat column p//2, second half of its 96 blocks when p is odd
-        return self._gu_slice(layer, p // 2, (p % 2) * N_GATE)
+        if layer is None:
+            return zeros_blocks(self.g["N_GATE"])
+        return sub_blocks(self.gu[layer], 12288, p, self.g["jpw"])
 
     def up_blocks(self, layer, p):
-        return self._gu_slice(layer, 4 + p // 2, (p % 2) * N_UP)
-
-    def _gu_slice(self, layer, col, off):
         if layer is None:
-            return zeros_blocks(N_GATE)
-        base = (col * 96 + off) * ELEM
-        return self.gu[layer][base : base + N_GATE * ELEM]
+            return zeros_blocks(self.g["N_GATE"])
+        return sub_blocks(self.gu[layer], 12288, p, self.g["jpw"], r0_extra=6144)
 
 
 _ZERO_CACHE = {}
@@ -153,33 +210,37 @@ def zero_norm_element(k):
 
 
 def build_exec(lb: LayerBins, mlp, qkv_l):
-    """One exec's W tensor: cols x 186 x ELEM. COLUMN w carries RING
-    POSITION pos(w) = (w<4) ? w : 11-w blocks (test_layerv2's
-    build_worker_weights(pos(w)) contract — the kernel derives its ring
-    position from the worker id and stages sw slices / xn chunks by it;
-    pos is an involution, so packing column p with position p mirrors
-    columns 4-7 and the ring2 all-gather assembles sw as
-    [s0,s1,s2,s3,s7,s6,s5,s4] -> every down partial consumes mirrored
-    K-chunks. Board-caught P28-5: exec01 workers 0-3 exact, 4-7 carried
-    position 11-w's qkv)."""
-    w = np.zeros(COLS * N_WELEM * ELEM, dtype=np.uint8)
+    """One exec's W tensor: N x N_WELEM x ELEM. COLUMN w carries RING
+    POSITION pos(w) blocks (test_layerv2's build_worker_weights(pos(w))
+    contract -- the kernel derives its ring position from the worker id
+    and stages sw slices / xn chunks by it; pos is an involution, so
+    packing column p with position p mirrors the odd columns and the
+    ring2 all-gather assembles a scrambled sw -> every down partial
+    consumes wrong K-chunks. Board-caught P28-5 (N=8 mirror case)."""
+    g = lb.g
+    n, N_O, N_GATE = g["n"], g["N_O"], g["N_GATE"]
+    N_DOWN, N_QKV, N_WELEM = g["N_DOWN"], g["N_QKV"], g["N_WELEM"]
+    w = np.zeros(n * N_WELEM * ELEM, dtype=np.uint8)
     blk = ELEM
     w2 = lb.ln_post[mlp] if mlp is not None else None
     w1 = lb.ln_in[qkv_l] if qkv_l is not None else None
-    for col in range(COLS):
-        p = pos(col)
+    for col in range(n):
+        p = pos(col, n)
         base = col * N_WELEM * blk
         g0 = base + (N_O + 1) * blk
         u0 = g0 + N_GATE * blk
-        d0 = u0 + N_UP * blk
+        d0 = u0 + N_GATE * blk
         w10 = d0 + N_DOWN * blk
         q0 = w10 + blk
         w[base : base + N_O * blk] = lb.o_blocks(mlp, p)
         w[base + N_O * blk : g0] = (
             norm_element(w2, 101) if w2 is not None else zero_norm_element(101))
         w[g0 : g0 + N_GATE * blk] = patch_k(lb.gate_blocks(mlp, p), 103, N_GATE)
-        w[u0 : u0 + N_UP * blk] = patch_k(lb.up_blocks(mlp, p), 104, N_UP)
-        w[d0 : d0 + N_DOWN * blk] = patch_k(lb.down_blocks(mlp, p), 105, N_DOWN)
+        w[u0 : u0 + N_GATE * blk] = patch_k(lb.up_blocks(mlp, p), 104, N_GATE)
+        # down: c-major chunk blocks, each chunk's run sliced by the law
+        for c in range(3):
+            dc = d0 + c * N_O * blk
+            w[dc : dc + N_O * blk] = patch_k(lb.down_blocks(mlp, p, c), 105, N_O)
         w[w10 : w10 + blk] = (
             norm_element(w1, 102) if w1 is not None else zero_norm_element(102))
         w[q0 : q0 + N_QKV * blk] = lb.qkv_blocks(qkv_l, p)
@@ -188,14 +249,21 @@ def build_exec(lb: LayerBins, mlp, qkv_l):
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--n", type=int, default=8, choices=(8, 16),
+                    help="worker count (16 = P28-6 widened ring; 32 is past "
+                         "the npu2 shim channel budget)")
     ap.add_argument("--src", default=str(SRC))
-    ap.add_argument("--out", default=str(OUT))
+    ap.add_argument("--out", default=None,
+                    help="default: build/lv2_hy (n=8) / build/lv2_hy_w16 (n=16)")
     ap.add_argument("--execs", type=int, nargs="+", default=None,
                     help="exec ids 1..33 (default: all)")
     args = ap.parse_args()
-    src, out = Path(args.src), Path(args.out)
+    g = geom(args.n)
+    src = Path(args.src)
+    out = Path(args.out) if args.out else (
+        OUT if args.n == 8 else OUT.with_name(f"lv2_hy_w{args.n}"))
     out.mkdir(parents=True, exist_ok=True)
-    lb = LayerBins(src)
+    lb = LayerBins(src, g)
     ids = args.execs if args.execs else list(range(1, LAYERS + 2))
     manifest = []
     for e in ids:
@@ -207,19 +275,25 @@ def main():
         manifest.append({"exec": e, "file": f.name, "mlp": mlp, "qkv": qkv_l})
         print(f"exec {e:2d}: mlp={mlp} qkv={qkv_l} -> {f} "
               f"({len(w) / 1e6:.2f} MB)", flush=True)
+    order = list(HAM16) if args.n == 16 else [
+        w for c in range(args.n // 4)
+        for w in (([c * 4 + r for r in range(4)] if c % 2 == 0
+                   else [c * 4 + r for r in reversed(range(4))]))]
     meta = {
-        "arch": "hy-mt2-1.8b", "elem": ELEM, "cols": COLS,
-        "n_welem": N_WELEM, "layers": LAYERS,
-        "order": "[o x16 | w2(101) | gate x48(103) | up x48(104) | "
-                 "down x48(105) | w1(102) | qkv x24]",
-        "succ": {"0": 1, "1": 2, "2": 3, "3": 7, "7": 6, "6": 5, "5": 4, "4": 0},
-        "pos": "p = (w < 4) ? w : 11 - w",
-        "drain_rows_per_worker": 640,  # [qkv 384 | xn1 256] bf16
+        "arch": "hy-mt2-1.8b", "elem": ELEM, "n": args.n,
+        "n_welem": g["N_WELEM"], "layers": LAYERS,
+        "geometry": {k: g[k] for k in
+                     ("rows", "jpw", "N_O", "N_GATE", "N_DOWN", "N_QKV",
+                      "N_CXN", "drain_rows")},
+        "order": order,
+        "pos_table": [pos(w, args.n) for w in range(args.n)],  # w -> ring pos
+        "drain_rows_per_worker": g["drain_rows"],  # [qkv 3072/n | xn1 2048/n]
         "execs": manifest,
     }
     with open(out / "meta.json", "w") as fp:
         json.dump(meta, fp, indent=1)
-    print(f"done -> {out} ({len(ids)} execs)")
+    print(f"done -> {out} ({len(ids)} execs, N={args.n}, "
+          f"{g['N_WELEM']} elem/worker, drain {g['drain_rows']} rows/worker)")
 
 
 if __name__ == "__main__":

@@ -16,12 +16,15 @@ attention) -- over the ENGINE'S OWN v4 packs:
               qkv_{e-1} via rms1(xn1, ln_in[e-1])
   exec 33   : mlp of layer 31 only; qkv section exact zeros (ignored)
 
-Per exec the golden C image is the full drain BO: worker w's 640 bf16
-rows = [qkv pos(w)*384..+384 | xn1 pos(w)*256..+256]. Final hidden =
-exec 33's xn1; logits = bf16(lm_deq32 @ deq(quantize(rms(x, final_w)))).
+Per exec the golden C image is the full drain BO: worker w's
+(3072/N + 2048/N) bf16 rows = [qkv pos(w)*3072/N.. | xn1 pos(w)*2048/N..]
+(N = ring width, P28-6; the chain math itself is N-independent -- the
+workers split identical full vectors). Final hidden = exec 33's xn1;
+logits = bf16(lm_deq32 @ deq(quantize(rms(x, final_w)))).
 
-Run: ironenv/bin/python tools/layerv2_golden.py            # all 33
-     ironenv/bin/python tools/layerv2_golden.py --execs 1 2 --skip-lm
+Run: python tools/layerv2_golden.py                 # N=8 -> build/lv2_hy
+     python tools/layerv2_golden.py --n 16          # -> build/lv2_hy_w16
+     python tools/layerv2_golden.py --execs 1 2 --skip-lm
 """
 
 import argparse
@@ -36,11 +39,9 @@ import torch
 from safetensors import safe_open
 
 ELEM = 18560
-COLS = 8
-N_O, N_GATE, N_UP, N_DOWN, N_QKV = 16, 48, 48, 48, 24
-N_WELEM = 186
 LAYERS = 32
 HIDDEN, HEAD_DIM, HEADS, KV = 2048, 128, 16, 4
+QKV_M = 3072
 EPS = 1e-5
 ROPE_BASE = 10000.0 * 1000.0 ** (128.0 / 126.0)
 
@@ -54,8 +55,21 @@ _w4 = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_w4)
 
 
-def pos(w):
-    return w if w < 4 else 11 - w
+def pos(w, n=8):
+    """Ring position (mirrors the kernel's lv_xelem + design ring_tables):
+    N=8 serpentine; N=16 the all-adjacent Hamiltonian cycle (see
+    tools/layerv2_pack.pos -- NOT an involution at N=16)."""
+    if n != 16:
+        c = w >> 2
+        return w if c % 2 == 0 else 8 * c + 3 - w
+    c, r = w >> 2, w & 3
+    if c == 0:
+        return r
+    if c == 3:
+        return 13 - r
+    if r == 0:
+        return 15 if c == 1 else 14
+    return 7 - r if c == 1 else 6 + r
 
 
 # ---- kernel-chain helpers (test_layerv2 forms, verbatim) ----
@@ -204,10 +218,15 @@ def unpack_deq32(packed_path, M, K):
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--n", type=int, default=8, choices=(8, 16),
+                    help="ring width (P28-6; drain geometry only)")
     ap.add_argument("--execs", type=int, nargs="+", default=None)
     ap.add_argument("--skip-lm", action="store_true")
     args = ap.parse_args()
-    out = OUT
+    n = args.n
+    qkv_rows, res_rows = QKV_M // n, HIDDEN // n  # drain rows per worker
+    out_rows = qkv_rows + res_rows
+    out = OUT if n == 8 else OUT.with_name(f"lv2_hy_w{n}")
     out.mkdir(parents=True, exist_ok=True)
 
     meta = json.loads((DEC / "meta.json").read_text())
@@ -293,11 +312,13 @@ def main():
 
     def drain_image(qkv_bits, xn1_bits):
         """Full C BO image: worker w = [qkv pos(w) slice | xn1 pos(w) chunk]."""
-        img = np.zeros(COLS * 640, dtype=np.uint16)
-        for w in range(COLS):
-            pp = pos(w)
-            img[w * 640 : w * 640 + 384] = qkv_bits[pp * 384 : (pp + 1) * 384]
-            img[w * 640 + 384 : (w + 1) * 640] = xn1_bits[pp * 256 : (pp + 1) * 256]
+        img = np.zeros(n * out_rows, dtype=np.uint16)
+        for w in range(n):
+            pp = pos(w, n)
+            img[w * out_rows : w * out_rows + qkv_rows] = \
+                qkv_bits[pp * qkv_rows : (pp + 1) * qkv_rows]
+            img[w * out_rows + qkv_rows : (w + 1) * out_rows] = \
+                xn1_bits[pp * res_rows : (pp + 1) * res_rows]
         return img
 
     ids = args.execs if args.execs else list(range(1, LAYERS + 2))
@@ -349,7 +370,7 @@ def main():
         print(f"final: hidden + logits written; argmax {int(np.argmax(lf))} "
               f"top3 {np.argsort(lf)[-3:][::-1].tolist()}")
     meta_out = {"pos": p, "cache_seq": S, "bands": {"qkv": [0.08, 0.8],
-               "xn1": [0.08, 200.0]}, "drain_rows": 640}
+               "xn1": [0.08, 200.0]}, "n": n, "drain_rows": out_rows}
     with open(out / "golden_meta.json", "w") as fp:
         json.dump(meta_out, fp, indent=1)
 
