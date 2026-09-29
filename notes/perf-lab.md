@@ -3256,3 +3256,24 @@ finalize 尾行，是后续 bring-up 的抓手。
 每步 e=0（l 恒 0）、finalize 处 l 爆 −1.15e12（≈−2⁴⁰）——
 attn_exp 的返回链（store_v 后 temp[0] 读回 / exp2 输出位序）嫌
 疑最大。下会话十分钟级。
+
+### P28-12 终局（⑳终）：**device-side attention 板上 10/10 PASS —— 推理计算全上 NPU 的数值闭环完成**
+
+l 初始化 bug 破案：`for(i<4) ml[i]=-1e30` 把 **l 也初始化成 −inf**
+（只该 m 是）——(−1e30)×alpha 污染全程（trace 表第 0 步直接可见：
+s/m/alpha/e 四列全对、l=−5.19e12 ≈ (−1e30)·exp(−40)）。修 =
+ml[0..1]=−1e30（m）、ml[2..3]=0（l）。修后 997→47 错，**47 个全是
+仪器行**（l/J/cos/q 读回写在正式输出区）——删除后 **10/10 PASS**
+（S=48/96 × 5 iter，4e-2 容差 vs 两遍 golden）。
+
+**至此 layer-v3 的全部内核数值件板上验证**：rope、qk-norm、KV 流
+式、GQA online-softmax、finalize。工具链三定律本战役再添两条：
+- **仪器必须放输出区外**（trace 表 lv_shared+512 起，finalize 只写
+  [0,512)）；在输出区内写的仪器读回全是 finalize 覆盖后的假数据
+  （本轮 TRAJ 假数据误导了两轮调试）。
+- **同秒 mtime 构建缓存陷阱**（P28-4 律第 N 次复发）：python 快速
+  改文件 + 立即 pytest，源/产物 mtime 秒级相同 → 缓存判定新鲜 →
+  跑的是旧内核。修 = touch 或直接 rm build 产物。
+
+剩余（layer-v3 集成，非数值）：KV tensor 常驻 + X/XN 合并腾槽 +
+整层流设计 + host 改造（施工图见 P28-11 §3）。
