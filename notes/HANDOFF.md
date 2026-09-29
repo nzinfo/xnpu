@@ -96,6 +96,90 @@
   用法：`LV2LOOP_W=/tmp/lv2_floor_exec05.bin xnpu-cli run-lv2loop 12 8`
   （pack 先由工具生成）。
 
+
+## 4b. layer-v3 集成施工手册（下会话主任务：性能优化的下一刀）
+
+目标：attention 全家上板 → 33 exec→32、host attention 链全消、X 量化消失。
+预期 26.3 → ~23.6ms（v1）→ ~22.5ms（v2 bucket）≈ FLM 21.44 追平点。
+**全部数值件已板上验证（P28-12 10/10），本刀是纯集成工程。**
+
+### 施工阶梯（每步都有板上可验的门，按序做）
+
+1. **design_layerv3.py**（复制 design_layerv2.py 起步）：
+   - 流改为 [X0/xn | w1(rms1→qkv arena) | qkv 块 | **attn 段** | o 块 |
+     w2 | gate/up | down | drain]，一 exec = 一整层，共 32 exec。
+   - qkv 相位不再 drain 到 C：phase QKV 的 lv_k2048 写 lv_shared（qkv
+     全像已在 ring/gather 里），attn 口味直接消费。
+   - attn 段复用已验证口味（K=210/211/212 的 lv_attn* 函数族），
+     K=212 的输出不再走 C，而是 g32 量化→arena（照 lv_rms_elem 的
+     quant 路径，amax→d→q→x 五件套）喂 o 块。
+   - X/XN 合并为单 tensor（同几何 8×ELEM×2），腾出第 5 tensor 槽给
+     KV（4 tensor + ctrl = 5-BO regmap 上限内，P19b 律）。
+2. **KV 常驻 BO**：67MB（32 层 × 2MB 页：k 1MB + v 1MB @ S_max=1024）。
+   v1 = 静态 fill 全页（fill 机器已证 55.3 墙；+1.2ms/token），内核
+   runtime-S 只消费 pos 个元素（**runtime-S 照 runtime-N 的 X 元素
+   [6404,6408) 旧约——新约放 X 元素另一偏移**，注意 lv_ctr 是字节数组，
+   u32 要拆字段存，P28-12 律）。写回 = attn 口味把当前 k/v S2MM 到
+   KV tensor 当前位置偏移（drain 几何照 C_taps 模式）。
+   v2 = bucket xclbin（S≤128/256/512/1024 四档 + CU-flip 650µs 税
+   摊销，对标 FLM 的 decode_slot_t 机器）——v1 验证后做。
+3. **host 改造**（cmd_run_decode_lv2）：去掉 attention_bf16/rope/qknorm
+   调用链；XN tensor 消失（残差链全设备内）；ask 模式（LV2_ASK）改走
+   layer-v3（w4u_row_bf16 的 embedding 行直填 X0）。
+4. **验证阶梯**：
+   - `pytest iron/operators/w4gemvu/test_layerv3.py`（新建，golden =
+     layerv2_golden 的整层镜像 + attention_bits 替换为 kernel online
+     形态，4e-2 容差起步）
+   - E2E：gates 双门 + steady ms/token；对标表：26.3 基线、FLM 21.44
+   - ask 模式抽检："你是谁？" 回答仍为 "我是混元…"（EOS 120020）
+5. **收尾快赢**（独立可做）：lm_head 43.5→55.3 GB/s（−0.66ms）——
+   solo 3227µs @ 140MB 流，查它的 fill/胶水占空比（P28-7 的地板判别
+   法：lv2_floor_pack 思路做 lm 版）。
+
+### 关键文件索引
+
+| 件 | 位置 |
+|---|---|
+| attention 内核（已验证） | `IRON/aie_kernels/aie2p/w4gemvu_layer.cc` 的 lv_attninit/attnhist/attnout + attn_rope/attn_qknorm/attn_dot/attn_acc_update/attn_step/attn_exp + w4gemvu_attn_a/_bf16 微入口 |
+| 数值测试车（已 10/10） | `IRON/iron/operators/w4gemvu/{design_lv2attn.py,test_lv2attn.py}` |
+| layerv2 基线（抄结构） | `design_layerv2.py` + `test_layerv2.py` + `w4gemvu_layer.cc` 的 K 口味 dispatcher |
+| golden 链 | `tools/layerv2_golden.py`（N 化版）+ `tools/lv2_ask.py`（ask prefill） |
+| host E2E | `xnpu/crates/xnpu-cli/src/main.rs` 的 cmd_run_decode_lv2（token_step 已参数化 x0/posn/rope） |
+| FLM 形态参照 | `docs/flm-so-analysis.md` F8（gen_layer_seq：_send_rope_rms_weights / _receive_kv_cache / slot 机器） |
+
+### 板测命令速查
+
+```
+# E2E 主线（gates + steady）
+sudo -n env PATH="/home/nzinfo/.venvs/npu314/bin:$PATH" HOME=/home/nzinfo \
+  prlimit --memlock=unlimited:unlimited -- \
+  xnpu/xnpu/target/release/xnpu-cli run-decode hy-mt2 lv2 \
+  /home/nzinfo/qwen/xnpu/build/dec_hy /home/nzinfo/qwen/xnpu/build/w4u_hy 5
+
+# attention 数值车（10/10 基线，改内核后先跑这个）
+sudo -n env PATH=... prlimit ... -- pytest iron/operators/w4gemvu/test_lv2attn.py -q
+
+# ask 冒烟（真问题 + EOS 停止）
+sudo -n env PATH=... HOME=/home/nzinfo LV2_ASK=/home/nzinfo/qwen/xnpu/build/dec_ask,24 \
+  prlimit ... -- xnpu-cli run-decode hy-mt2 lv2 .../dec_hy .../w4u_hy 1
+
+# 地板判别 / pace
+LV2LOOP_W=/tmp/lv2_floor_exec05.bin ... run-lv2loop 12 8   # floor
+LV2LOOP_PIPE=2 ... run-lv2loop 12 8                          # piped pace
+```
+
+### 内核改动硬律（P28-12 战役总结，违者重蹈）
+
+1. 每次改内核 → `llvm-objdump -d xxx.o | grep paddxm`：单帧 ≤0x400、
+   最深调用链求和不超；向量重载助手拆 noinline。
+2. 向量代数先 numpy 证明再上板（P28-7 教训：直觉公式 max(b,−b) 错）。
+3. 仪器/轨迹表放 finalize 写区之外（输出区内的读回是覆盖后的假数据）。
+4. 快改快跑前 `touch` 源文件或 `sudo rm -rf IRON/build/<fixture>*`
+   （同秒 mtime 缓存陷阱跑旧内核）。
+5. lv_ctr 是 uint8_t[]——u32 状态拆字段；元素 ABI 偏移两端（内核读/
+   test 打包）逐一对表（sin 表偏移错位读了表间零填充）。
+6. exp2 参数 clamp ≥ −40；scalar f32 mul 禁用（软浮点回链 PMEM）。
+
 ## 5. 进行中 / 悬而未决
 
 - ~~在飞 subagent~~ **已完成并提交**：`docs/perf/02-dataflow-perf-model.md`
@@ -113,7 +197,7 @@
 
 | 文件 | 内容 |
 |---|---|
-| `notes/perf-lab.md` | **编号实验台账 P1..P28-6f-9**（一切机制的 provenance） |
+| `notes/perf-lab.md` | **编号实验台账 P1..P28-12**（一切机制的 provenance） |
 | `docs/perf/02-dataflow-perf-model.md` | 数据流定量性能模型（占空比终模型）+ xnpu-dfsim 工具设计 |
 | `docs/perf/04-queueing-abstraction.md` | 排队论再形式化：休假/窗口流控/汇结/闭网络映射 + 可证伪预言 |
 | `docs/flm-so-analysis.md` | FLM 27 个 .so 静态逆向（F1-F21）；`FLM_DUMP_TXN` 官方后门 |
