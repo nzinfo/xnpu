@@ -56,22 +56,38 @@
   FromDevice → 保留 ioctl（fw fence 正确性必需）。
 - 完成语义（6f-7）：syncobj 信号 ≠ 成功；必须读 exec BO 状态字 bits[3:0]==4。
 
-## 4. 当前进度快照（截至本文件时刻）
+## 4. 当前进度快照（2026-09-29 深夜，P28-12 终局）
 
-- **E2E 现状**：lv2 路径 33 exec/token，**27.75ms/token（36.0 tok/s）**，双门 PASS；
-  对标 FLM 21.44ms（差距 6.3ms）。P28-7（perf-lab ⑮）已落地：quant 路径
-  向量化 762→707µs/exec + K=2049 地板判别（floor 632µs = 499+132+1，
-  6f-9 模型直接闭合；胶水暴露 131→75µs）。四条新定律见 perf-lab P28-7
-  （向量代数先证后编 / acc 域加法双面 / 对齐律 store 侧 / 证明算子类组合法）。
+- **E2E 现状**：lv2 路径 33 exec/token，**26.3ms/token（38.0 tok/s）**，双门 PASS；
+  对标 FLM 21.44ms（差距 ~4.9ms）。P28-7 quant 向量化（762→707µs）+
+  P28-8 流水化（哨兵轮询+提前 submit，28.5→26.2）+ P28-10 幽灵完成守卫
+  （状态字全模式检查，weed A 含 exec32 补查）全部落地。
+- **P28-9 ask 模式**：引擎可回答真实问题（prefill 参考链 + NPU 生成环，
+  EOS 停止律 {120020, 120001}——120020 解码为空串的"隐形 EOS"曾致续写
+  漂移；FLM 对等复现已做）。
+- **P28-12（本日终局）：device-side attention 数值链板上 10/10 PASS**
+  （design_lv2attn/test_lv2attn + w4gemvu_attn_* 微入口）：rope + qk-norm +
+  KV 流式 + GQA 16/4 online-softmax + finalize，4e-2 容差。**layer-v3 全部
+  内核数值件就绪，剩余为纯集成**（施工图 perf-lab P28-11 §3：KV tensor
+  常驻 + X/XN 合并腾 regmap 槽 + 整层流 + host 改造；预期 E2E ≈23.6→22.5ms）。
+- 调试战役五定律（P28-12 系列）：栈律复发 0x580（每加向量子程序必查
+  paddxm）/ 探针极性（默认必须=禁用路径）/ exp2 输入域 clamp −40 /
+  **仪器必须放输出区外**（写进输出区的仪器读回全是 finalize 覆盖后的
+  假数据，误导两轮）/ **同秒 mtime 构建缓存陷阱**（快改快跑跑旧内核，
+  touch 或 rm build）。另有：lv_ctr 字节数组存 u32 会截断（逐字段宽度
+  核对）、sin 表偏移错位读到表间零填充。
 - **瓶颈已定案**（perf-lab 6f-9 §7 终模型，两级自我否证后）：
   `T_exec = W_bytes/55.3GB/s + Σ胶水相位停摆(~250µs)`；36.6GB/s = 55.6×占空比 2/3；
   FLM 同墙 duty≈0.9+。差距本质 = 占空比，不是带宽/通道/计算/ring。
 - **已处决的方向**（别再花板时）：通道加宽（N=16 零收益）、元素做大
   （L1 放不下且只省 ~13µs）、同深度 mem-DMA W（零收益）、ring 优化（≤20µs）。
-- **下一刀（已批准方向）**：内核侧胶水分块穿插 W 块消费 ——
-  `IRON/iron/operators/w4gemvu/w4gemvu_layer.cc`（K 口味 dispatcher 结构）、
-  `design_layerv2.py`（fill 拓扑）。目标 exec 505-520µs → E2E ~22.5ms ≈ FLM。
-  配套增量分解：o 块消费完立即累 sumsq 分量；quant 与 gather 分段流水。
+- **下一刀（layer-v3 集成，数值件全部就绪）**：按 perf-lab P28-11 §3
+  施工——X/XN 合并腾第 5 tensor 槽 → KV 常驻 BO（67MB，v1 = S_max=1024
+  静态 fill + runtime-S 消费，+1.2ms/token；v2 = bucket xclbin 对标 FLM
+  slot 机器 ~0.6ms）→ design_layerv3（整层流 [X0/xn|w1|qkv|attn|o|w2|
+  gate/up|down|drain]）→ host 改造。**预期 26.3 → ~23.6（v1）→ ~22.5ms
+  （v2）= FLM 追平点**。attention 内核口味（K=210/211/212）已板上验证，
+  集成时照搬 + 把 qkv 输出从 C drain 改为内核内直通。
 - 关键契约：runtime-N 内核从 X 元素 [6404,6408) u32 读 worker 数
   （`design_layerv2.py:35`）；K-header 口味表（2048/101/102/103/104/105）；
   IRON 内核符号必须 `extern "C"`。
@@ -88,6 +104,10 @@
 - 未解（低优先，都留档在 perf-lab）：60.8s 看门狗 fw 侧本体（moot，路径不可达）；
   C FromDevice EINVAL（clflush_region+2ms 绕过中）；pyxrt 爬行机理（引擎路径免疫）。
 - `notes/.diag` / `notes/.shelltest`：磁盘配额勘查残片，垃圾，勿提交。
+- allium 待办：规约 B/C/D 同步（ReassembleAndAttend 双路径析取、
+  sentinel_poll 字段声明、开放问题与契约对齐）+ E（ask 模式入规约——
+  dynamic pos/embedding 胶水/EOS 律/关闭两条已答开放问题）。代码侧
+  weed A 已修（最终 exec 补查前驱状态字）。
 
 ## 6. 文档地图
 
