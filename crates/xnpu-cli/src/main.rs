@@ -6295,6 +6295,16 @@ fn cmd_run_decode_lv2(
                     eprintln!("lv2 exec {e}: state={st} after wait (ghost completion)");
                     return false;
                 }
+                // Weed A: the final serialized exec must also cover its
+                // piped predecessor (exec execs-1) — the lagged check
+                // never reads it on an all-sentinel run.
+                if e == execs && execs >= 2 {
+                    let ps = ops[e - 2].pkt.state();
+                    if ps != 4 {
+                        eprintln!("lv2 exec {}: state={ps} (ghost, final-exec lagged check)", e - 1);
+                        return false;
+                    }
+                }
             } else if e >= 2 {
                 // Piped: exec e is still in its tail here, but execs
                 // 1..e-1 are fully complete (in-order ERT) — check the
