@@ -3148,3 +3148,51 @@ allium 比对报告（specs/engine-lv2.allium ↔ 实现）裁决与动作：
   真兜底是 room() 的 4096B 上限）。
 - 板回归：gates PASS、steady 26.13ms/token（38.3 tok/s）、ask EOS
   停止正常——零性能损失。
+
+## P28-11（2026-09-29⑲）attention 上板前哨：GQA d=128 板上成立，padding 路径穿底，layer-v3 施工图
+
+目标（用户指令）：所有推理计算入 NPU，如同 FLM。R2b 复查：d=128
+fused MHA **已 5/5 PASS**（mha-d128 日志定案——σ 数据损坏早已修复）。
+
+### 1. GQA d=128 补测（hy 几何的缺口）
+
+R2b 只测过 MHA（KV=16）。补 GQA 16Q/4KV d=128：
+
+- **S=1024：5/5 PASS**——hy decode 几何的 attention 数学在板上成立。
+- S=128/256：**大面积全毁**（525k/787k 错）→ 根因：B×pipelines=512
+  padding 粒度，pad 进的 K 列**无掩码进 softmax**（零向量得 e⁰=1
+  权重，归一化全歪）。上游全部既有形状恰好整除 512——这条路从未
+  被踩过，一测就穿。已标 xfail 留证（test.py 注释含机制）。
+- **推论：上游算子形态不可用于 decode**（S_kv=pos+1 永远变长）——
+  layer-v3 自写内核必须带 **runtime-S**（照 P28-6 runtime-N 的 X
+  元素方案：内核消费 pos 个元素、丢弃 fill 余量）。
+
+### 2. FLM 对标（flm-so-analysis F5/F8 实锤）
+
+FLM 的 decode 整层一个 TXN（gen_layer_seq）：`_send_x` →
+`_send_rms_weights` → **`_send_rope_rms_weights`（rope+qk-norm 权重
+下发 = 在 NPU 算）** → **`_receive_kv_cache`（KV cache 在 ctrl 流里
+就是"又一种权重"）** → 三组 `_move_weights`。变长上下文用 **slot
+机器**（decode_slot_t 预生成 + set_context_length 选择）。
+
+### 3. layer-v3 施工图（下会话施工）
+
+- **结构**：整层一 exec ×32（半层移位消失），流
+  [X0/xn | w1 | qkv | **attn** | o | w2 | gate/up | down | drain]。
+- **regmap 预算**：X/XN 合并为单 tensor（同几何），腾出第 5 tensor
+  槽给 KV（4 tensor + ctrl = 5-BO 上限内）。
+- **KV cache**：设备常驻 BO（67MB = 32 层 × 2MB 页）；v1 方案
+  fill 静态几何 S_max=1024（全页流 +1.2ms/token，内核按 runtime-S
+  消费 pos 个 + 丢弃余量）；v2 = bucket xclbin（128/256/512/1024，
+  CU-flip 650µs 税摊销，FLM slot 对标）→ 均摊 ~0.6ms。append =
+  S2MM drain 到 KV tensor 当前位置偏移。
+- **新内核口味**（w4gemvu_layer.cc）：rope（host 只发 cos/sin 表
+  128×f32——FLM 同语义，表是位置常数非计算）；qk-norm（内核 rms
+  机器 + 每层 256B q/k-norm 权重元素）；GQA attention（f32 分数/
+  softmax/PV 镜像 attention_bits；runtime-S 掩码；16Q/4KV 组播）；
+  输出直接量化→arena（X 元素消失）。K/V 当前值的 all-gather 走
+  现有 ring（128 rows/worker 小元素）。
+- **预期账本**：26.13 − host attention(~3ms) − exec33(0.6) +
+  KV 流 v1(1.2) + 内核(~0.1) ≈ **23.6ms**；v2 bucket ≈ 22.5 ≈
+  FLM 追平点。剩余 = lm_head 43.5→55.3（−0.66）+ 胶水残余 75µs。
+- prefill 上板是独立后续（mha 算子 S=2048 形态现成）。
