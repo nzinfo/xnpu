@@ -3231,3 +3231,28 @@ FLM 的 decode 整层一个 TXN（gen_layer_seq）：`_send_x` →
    规避 = clamp −40（数学等价）。CR 状态假说被否定（set_rounding
    不解），但 clamp 也不解（真凶是栈帧，见 1——exp2 内联撑爆的
    正是它）。clamp 保留为防御。
+
+### P28-12 续（⑳补，q 行破案）：两个真 bug + init 链板上 PASS
+
+上节遗留的"q 行数值错"破案——**两个叠加 bug 与一个读回假象**：
+
+1. **sin 表偏移错位（真 bug）**：attn_rope 读 sin 在 cs+128（float
+   偏移），test 打包在字节 7168 —— 内核读的是两表之间的零填充
+   间隙。修 = 表连续布局（cos64+sin64 f32）+ 内核读 cs+64。
+2. **lv_ctr 字节截断（真 bug，debug 位从未生效的根因）**：
+   lv_ctr 是 uint8_t[24]，`lv_ctr[cAttnS] = *(u32*)(a_in+8704)` 截
+   成低 8 位——S 的 bit31（debug 读点切换）永远丢失。修 = debug
+   位单独存字节 cAttnDbg。**教训：状态数组逐字段核对元素宽度**。
+3. **读回假象**：lv_attn_cs 与 lv_attn_out 同址（都 overlay
+   lv_shared）——"换读点"是空操作；CSTAB 仪器读到的是 finalize
+   覆盖后的 out。修 = debug 读 lv_attn_q（lv_sw，finalize 不碰）。
+
+**修复后**：bypass 拷贝版（raw q 直拷）0/2048 **PASS**；恢复
+rope+qknorm 完整 init 链再 0/2048 **PASS**——**rope + qk-norm 的
+设备侧数值正式板上验证**。在线仪器（l/J/轨迹/cos/q 行读回）常驻
+finalize 尾行，是后续 bring-up 的抓手。
+
+**剩余唯一 bug（已收敛到 attn_step 的 alpha/e）**：轨迹显示 hist
+每步 e=0（l 恒 0）、finalize 处 l 爆 −1.15e12（≈−2⁴⁰）——
+attn_exp 的返回链（store_v 后 temp[0] 读回 / exp2 输出位序）嫌
+疑最大。下会话十分钟级。
