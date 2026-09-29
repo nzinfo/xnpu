@@ -6536,7 +6536,18 @@ fn cmd_run_decode_lv2(
         print!("[ask] ids: {cur}");
         use std::io::Write;
         let _ = std::io::stdout().flush();
+        // hy-mt2 stop tokens: the chat template's eos <｜hy_place▁holder▁no▁2｜>
+        // (120020 — decodes to the EMPTY string, so a swallowed eos is
+        // invisible in the text and the model drifts into template-ish
+        // continuation like "2. 请帮我...") and the plain end-of-sentence
+        // variant 120001. Caught live: the model emitted 120020 right after
+        // "我是混元，由腾讯开发的大模型。" and the loop kept decoding.
+        const HY_EOS: [usize; 2] = [120020, 120001];
         for s in 0..steps {
+            if HY_EOS.contains(&cur) {
+                println!("  <-- stop token {cur} at step {s}");
+                break;
+            }
             let posn = pos0 + s;
             let (rc_s, rs_s) = rope_table(posn, arch.rope_base);
             let x0 = w4u_row_bf16(&lm_pack, LM_M, 2048, cur);
