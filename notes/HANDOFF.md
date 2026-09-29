@@ -80,8 +80,9 @@
 
 ## 5. 进行中 / 悬而未决
 
-- **在飞 subagent**：数据流模型文档 `docs/perf/02-dataflow-perf-model.md`
-  正在做 §7 合并修订（元素节拍 β → 占空比）。它只改这个文件，别动它。
+- ~~在飞 subagent~~ **已完成并提交**：`docs/perf/02-dataflow-perf-model.md`
+  §7 合并修订落地（元素节拍 β → 占空比终模型，§4.2 三维包络+第五维停摆段，
+  验证表 16 检查点）。后续排队论抽象见 `docs/perf/04-queueing-abstraction.md`。
 - 未解（低优先，都留档在 perf-lab）：60.8s 看门狗 fw 侧本体（moot，路径不可达）；
   C FromDevice EINVAL（clflush_region+2ms 绕过中）；pyxrt 爬行机理（引擎路径免疫）。
 - `notes/.diag` / `notes/.shelltest`：磁盘配额勘查残片，垃圾，勿提交。
@@ -91,7 +92,8 @@
 | 文件 | 内容 |
 |---|---|
 | `notes/perf-lab.md` | **编号实验台账 P1..P28-6f-9**（一切机制的 provenance） |
-| `docs/perf/02-dataflow-perf-model.md` | 五维资源包络模型 + xnpu-dfsim 工具设计（修订中） |
+| `docs/perf/02-dataflow-perf-model.md` | 数据流定量性能模型（占空比终模型）+ xnpu-dfsim 工具设计 |
+| `docs/perf/04-queueing-abstraction.md` | 排队论再形式化：休假/窗口流控/汇结/闭网络映射 + 可证伪预言 |
 | `docs/flm-so-analysis.md` | FLM 27 个 .so 静态逆向（F1-F21）；`FLM_DUMP_TXN` 官方后门 |
 | `docs/perf/03-tilelang-deep-dive.md` | TileLang/TileSight 借鉴 |
 | `tools/` | 全部研究脚本（xdump2、ctrl_decode、hoist_probe、layerv2_pack/golden、p28*/ 存档） |
