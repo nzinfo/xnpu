@@ -1,0 +1,464 @@
+-- allium: 3
+-- xnpu engine, layer-v2 decode path — distilled specification
+
+-- Scope: the lv2 E2E token loop, its ERT submission/completion path, and the
+--        host numeric glue it depends on.
+-- Includes:
+--   - xnpu-hal: bo.rs / ert.rs / hwctx / ioctl encoding (submission semantics)
+--   - main.rs cmd_run_decode_lv2 (lv2 E2E) and run-lv2loop entry points
+--   - host numeric glue: int8 quant, rope, qk-norm, swiglu, attention, KV append
+--   - golden gates (per-exec and final)
+-- Excludes:
+--   - xnpu-perf (reporting infrastructure, no domain behavior)
+--   - xnpu-ftrace (LD_PRELOAD tooling)
+--   - legacy decode modes (cpu / npu flowkv / fused / quad) — superseded by lv2
+--   - offline packer/importer tooling (tools/*.py) — own contracts
+-- Distilled non-interactively: unconfirmed judgements are parked as open
+-- questions at the end, not silently resolved.
+
+------------------------------------------------------------
+-- Given
+------------------------------------------------------------
+
+given {
+    npu: Npu2Partition
+}
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+external entity Npu2Partition {
+    -- npu2 partition: compute tile array + shim DMA row.
+    -- 8 shim columns x 4 compute rows; per shim 2 MM2S + 2 S2MM channels.
+    -- SHIM CHANNEL LAW: device-wide <= 16 input + 16 output streams, so at most
+    -- 16 workers under the one-A-fifo-plus-one-C-fifo-per-worker protocol.
+}
+
+external entity Firmware {
+    -- ERT scheduler instance bound to the hardware context.
+    -- Completion semantics: dma fence is signaled on EVERY response path
+    -- (COMPLETED / ERROR / ABORT / TIMEOUT / NORESPONSE / health), and the
+    -- health path memcpy's diagnostics over the command's regmap before
+    -- permanently poisoning the context (health_reported).
+    health_reported: Boolean
+}
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+contract DeviceSubmission {
+    submit: (cmd: ErtCommand) -> Integer
+    wait: (seq: Integer, timeout_s: Integer) -> Boolean
+    @invariant SignaledFenceIsNotSuccess
+        -- a signaled fence is not success: only state word 4 (COMPLETED) means
+        -- the op actually ran; every other response path also signals
+    @invariant UserVaNeedsBackingArgHandle
+        -- every user VA placed in a DPU regmap must be backed by an argument
+        -- BO handle, otherwise the driver never pins that memory
+    @invariant NinstrCountsWordsNotBytes
+        -- ninstr counts 32-bit words (ctrl_code_bytes / 4), never bytes — a
+        -- byte count makes firmware pull 4x the ctrl code past its end
+    @invariant RawTxnNeedsStartCuOpcode
+        -- raw transactions must carry opcode 0 (START_CU) and type 3 (CU);
+        -- opcode 20 silently no-ops on raw transactions
+    @invariant DeviceConfiguredExactlyOnce
+        -- devices may not be reconfigured: a context is configured exactly
+        -- once with CONFIG_HWCTX
+}
+
+contract NumericGlue {
+    @invariant QuantRoundsThenClamps
+        -- int8 group quantization rounds then clamps, in that order;
+        -- amax == 0 yields q = 0, d = 0
+    @invariant QuantPathsAgreeOnFiniteInputs
+        -- the scalar and AVX-512 quantization paths are bit-identical on
+        -- finite inputs; NaN inputs diverge (scalar emits q = 0, vector
+        -- emits -127: max(NaN, -127) returns the comparand)  [weed fix 6]
+    @invariant SwigluSigmoidSinglePathPerCall
+        -- swiglu sigmoid: scalar libc expf vs AVX-512 6-term polynomial
+        -- drift ~1e-7, absorbed by bf16 rounding; the vector form carries a
+        -- scalar tail loop, so one call MAY mix both paths when half % 16
+        -- != 0 (lv2 shapes are always divisible — never triggers)  [weed fix 7]
+    @invariant AttentionDispatchCliffAtSixteen
+        -- attention has a dispatch cliff at 16 attended positions (code:
+        -- pos + 1 >= 16; 15 attended still runs scalar): below it scalar
+        -- libc expf + divide by sqrt(128), at or above it vector polynomial
+        -- + reciprocal multiply — not bit-identical across the boundary;
+        -- the vector path additionally needs avx512bw (not just avx512f)
+        -- alongside the swiglu/quant kernels  [weed fix 5]
+    @invariant RopeRotatesQAndKNeverV
+        -- rope uses hardcoded theta 11158840.0; q and k are rotated,
+        -- v is never rotated
+    @invariant ResidualSingleFinalRounding
+        -- residual update order: x_next = bf16(f32(bf16(x + o)) + sum over
+        -- c of f32(partial_c)), single bf16 rounding at the end
+    @invariant KColumnReadsFixedChunkOrder
+        -- K = 6144 column reads sum three chunk partials in f32 in fixed
+        -- order c = 0, 1, 2 with one final bf16 rounding; chunks = 1 reads
+        -- are a bit-identical u16 memcpy
+}
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+entity HwContext {
+    pdi_reads_runtime_n: Boolean
+    cu_config_count: Integer
+    -- qos max_opc 2048; pdi bos must stay alive for the context lifetime
+}
+
+entity BufferObject {
+    kind: shmem | dev_heap | dev | cmd
+    size_bytes: Integer
+    -- SHMEM tensors enter the regmap by user VA; DEV ctrl code by xdna addr.
+    -- dev_heap carve: <= 64 MB per BO, 64 MB-aligned user VA (MAP_FIXED),
+    -- and the heap must be carved BEFORE the context is created.
+}
+
+entity ErtCommand {
+    cu_index: Integer
+    cu_mask: Integer
+    opcode: Integer
+    cmd_type: Integer
+    regmap: List<Integer>
+    arg_count: Integer
+    ctrl_code_bytes: Integer
+    -- header bitfields: state 4b | stat_en 1b | count 11b | opcode 5b | type 4b
+    -- count field counts u32 words INCLUDING the cu-mask word; the 11-bit
+    -- field is truncating in make_header — the real bound is room() keeping
+    -- the whole regmap inside the 4096-byte exec BO (count <= 1024)  [weed fix 8]
+}
+
+entity WorkerElement {
+    exec: Lv2Exec
+    worker: Integer
+    id_word_written: Boolean
+    n_word_written: Boolean
+    payload_written: Boolean
+    -- device ABI inside one 18560 B fifo element (offsets are bytes):
+    --   q int8 payload at 0, bf16 group scales at x_off_d (6144),
+    --   u32 worker id at x_off_id (6400), u32 runtime worker count at
+    --   x_off_n (6404), u32 K-header at x_off_kheader (18552).
+    -- the id / n / K-header words are static per pack and must survive
+    -- element reuse across execs untouched
+}
+
+entity Lv2Exec {
+    status: packed | xn_filled | x_filled | c_flushed | submitted | checked | completed | gated | attended | ghost_completed
+    seq: Integer
+    run: DecodeRun
+    cmd: ErtCommand
+    state_word: Integer
+    signaled: Boolean
+    c_hash: Integer
+    drain_read_via_ioctl: Boolean
+    prev: Lv2Exec?
+    welems: WorkerElement with exec = this
+
+    transitions status {
+        packed -> xn_filled
+        xn_filled -> x_filled
+        x_filled -> c_flushed
+        c_flushed -> submitted
+        submitted -> checked
+        checked -> completed
+        checked -> ghost_completed
+        completed -> gated
+        gated -> attended
+        terminal: attended, ghost_completed
+    }
+}
+
+entity DecodeRun {
+    status: bootstrapping | configured | running | lm_done | passed | failed
+    iters: Integer
+    gates_enabled: Boolean
+    ctx: HwContext
+
+    transitions status {
+        bootstrapping -> configured
+        configured -> running
+        running -> lm_done
+        running -> failed
+        lm_done -> passed
+        lm_done -> failed
+        terminal: passed, failed
+    }
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    worker_count: Integer = 8            -- n in (8, 16); 16 saturates SHIM CHANNEL LAW
+    execs_per_token: Integer = 33        -- L + 1 half-layer-offset execs
+    elem_bytes: Integer = 18560          -- one fifo element, device ABI
+    welem_per_worker: Integer = 186      -- W elements per worker per exec
+    drain_rows_per_worker: Integer = 640 -- 384 qkv rows + 256 xn1 rows
+    drain_qkv_rows: Integer = 384
+    x_off_id: Integer = 6400             -- u32 worker id (device ABI)
+    x_off_n: Integer = 6404              -- u32 runtime worker count (device ABI)
+    x_off_d: Integer = 6144              -- 64 bf16 group scales
+    x_off_kheader: Integer = 18552       -- u32 K-header word
+    pdi_reads_runtime_n: Boolean = false -- current E2E uses compile-time N = 8 PDI
+    fw_state_completed: Integer = 4      -- exec BO state word bits[3:0]
+    regmap_preamble_words: Integer = 5   -- opcode u64 + instr u64 + ninstr u32
+    opcode_start_cu: Integer = 0
+    cmd_type_cu: Integer = 3
+    max_cu_index: Integer = 32
+    max_wait_s: Integer = 60
+    decode_pos: Integer = 100            -- fixed replay position
+    cache_seq: Integer = 1024
+    qkv_m: Integer = 3072                -- 2048 q + 512 k + 512 v
+    lm_m: Integer = 121088               -- vocab padded to 32-row ABI
+    readback_settle_ms: Integer = 2      -- probe settle before hash (workaround)
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- ev: main.rs dispatch (cmd_run_decode_lv2 preempts run-decode routing)
+
+rule StartDecodeRun {
+    when: RunLv2Requested(gates, iters)
+    requires: gates implies golden_files_present()
+    ensures:
+        DecodeRun.created(status: bootstrapping, iters: iters, gates_enabled: gates)
+        HwContext.created(pdi_reads_runtime_n: config.pdi_reads_runtime_n, cu_config_count: 1)
+    -- golden files are loaded all-or-nothing: any missing artifact silently
+    -- disables every gate (parked as open question)
+}
+
+rule ConfigureContext {
+    when: run: DecodeRun.status becomes bootstrapping
+    ensures: run.status = configured
+    -- heap carve precedes context creation (BufferObject comment);
+    -- cu_func must be 0: the second configure_cus element is a DPU function
+    -- index, not a CU slot — func != 0 means the op never runs
+}
+
+rule LoadWeightPacks {
+    when: run: DecodeRun.status transitions_to configured
+    requires: pack_size_ok(run) = true
+    ensures: run.status = running
+    -- ev: pack validation currently checks LENGTH only; content binding to
+    -- the expected layer slice is a domain expectation, not enforced
+}
+
+rule FillResidualElement {
+    when: e: Lv2Exec.status becomes packed
+    requires: e.seq = 1 or e.prev.status = completed
+    ensures: e.status = xn_filled
+    -- ev: XN fill copies the SAME worker index slice [384, 640) of the
+    -- previous exec's drain image — no transpose; exec 1 seeds from x0
+}
+
+rule FillActivation {
+    when: e: Lv2Exec.status transitions_to xn_filled
+    ensures:
+        e.status = x_filled
+        e.cmd.regmap.count >= 4
+        for we in e.welems: we.payload_written = true
+    -- ev: exec 1 must explicitly zero q/d every token (the previous token's
+    -- exec 33 left real values in the slots); exec > 1 quantizes the attended
+    -- activation and replicates it into all worker slots, syncing only the
+    -- live region; static id / n / K-header words are never rewritten
+}
+
+rule FlushCImage {
+    when: e: Lv2Exec.status transitions_to x_filled
+    ensures: e.status = c_flushed
+    -- ToDevice direction is user-space CLFLUSHOPT over the C image
+}
+
+rule SubmitExec {
+    when: e: Lv2Exec.status transitions_to c_flushed
+    requires: e.cmd.opcode = config.opcode_start_cu
+    requires: e.cmd.cmd_type = config.cmd_type_cu
+    requires: e.cmd.cu_index >= 0 and e.cmd.cu_index < config.max_cu_index
+    requires: e.cmd.regmap.count = config.regmap_preamble_words + 2 * e.cmd.arg_count
+    requires: args_cover_regmap_vas(e.cmd) = true
+    ensures:
+        e.status = submitted
+        Firmware.health_reported = Firmware.health_reported
+    -- regmap preamble: [u64 opcode 3, u64 instr_addr, u32 ninstr, u64 tensor
+    -- VAs...]; tensor VAs are SHMEM user VAs; args carry one BO handle per
+    -- regmap VA or the driver will not pin that memory
+}
+
+rule WaitAndReadState {
+    when: e: Lv2Exec.status transitions_to submitted
+    requires: wait_timeout_s(e) <= config.max_wait_s
+    ensures:
+        e.signaled = true
+        e.state_word = firmware_state_word(e.cmd)
+        e.status = checked
+    -- the fence signals on every firmware response path; reading the state
+    -- word is a separate, mandatory step
+}
+
+rule ExecCompleted {
+    when: e: Lv2Exec.status transitions_to checked
+    requires: e.state_word = config.fw_state_completed
+    ensures: e.status = completed
+}
+
+rule ExecGhostCompleted {
+    when: e: Lv2Exec.status transitions_to checked
+    requires: e.state_word != config.fw_state_completed
+    ensures:
+        e.status = ghost_completed
+        e.c_hash = stale_hash(e)
+    -- drain was never recomputed: hash equals the previous exec's; the health
+    -- variant also memcpy'd diagnostics over the regmap and poisoned the
+    -- context so every later command aborts fast
+}
+
+rule GhostFailsTheRun {
+    when: e: Lv2Exec.status transitions_to ghost_completed
+    ensures: e.run.status = failed
+}
+
+rule GateDrain {
+    when: e: Lv2Exec.status transitions_to completed
+    requires: e.run.gates_enabled = false or per_exec_golden_ok(e) = true
+    ensures: e.status = gated
+    -- tolerances are hand-tuned per segment (qkv rel .08 / abs .8,
+    -- xn1 rel .08 / abs 200); > 16 bad rows of 5120 fails
+}
+
+rule ReassembleAndAttend {
+    when: e: Lv2Exec.status transitions_to gated
+    requires: e.drain_read_via_ioctl = true
+    ensures: e.status = attended
+    -- qkv rows are placed by pos-table lookup, NOT by column == position;
+    -- host attention runs at fixed decode_pos: rope -> qk rms norm ->
+    -- KV append (v source offset 2048 + kdim + kvh * 128) -> GQA
+}
+
+rule SpawnNextExec {
+    when: e: Lv2Exec.status transitions_to attended
+    requires: e.seq < config.execs_per_token
+    ensures: Lv2Exec.created(status: packed, seq: e.seq + 1, prev: e, run: e.run)
+}
+
+rule RunLmHead {
+    when: e: Lv2Exec.status transitions_to attended
+    requires: e.seq = config.execs_per_token
+    ensures: e.run.status = lm_done
+    -- final hidden = exec 33 xn1 drain; lm_head runs on CU 1 — the one
+    -- remaining per-token cu_mask flip (firmware PDI reload ~500-650 us)
+    -- (checker note: 'running -> lm_done' is witnessed through e.run
+    -- navigation; the liveness analysis cannot attribute cross-binding
+    -- assignments, so it reports a spurious noExit warning)
+}
+
+rule FinalGates {
+    when: run: DecodeRun.status transitions_to lm_done
+    requires: run.gates_enabled = false or final_golden_ok(run) = true
+    ensures: run.status = passed
+    -- THREE gate conditions (weed fix 3): hidden rel_rms < 0.05 AND logits
+    -- argmax = golden's AND logits rel_rms < 0.05; the printed top-8
+    -- agreement is NOT part of the pass condition. XNPU_SKIP_GATES is the
+    -- PERF-ONLY escape hatch (gate failure downgraded to a logged error);
+    -- absent final goldens + no SKIP_GATES => the run refuses to start
+}
+
+rule FinalGateFails {
+    when: run: DecodeRun.status transitions_to lm_done
+    requires: run.gates_enabled = true and final_golden_ok(run) = false
+    ensures: run.status = failed
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant CompletionMeansStateWordFour {
+    for e in Lv2Execs:
+        e.status = completed implies e.state_word = config.fw_state_completed
+}
+
+invariant SignalIsNotSuccess {
+    for e in Lv2Execs:
+        e.signaled = true implies e.status != packed and e.status != xn_filled and e.status != x_filled and e.status != c_flushed
+}
+
+invariant ContextConfiguredOnce {
+    for ctx in HwContexts:
+        ctx.cu_config_count <= 1
+}
+
+invariant XElemNWordContract {
+    for we in WorkerElements:
+        config.pdi_reads_runtime_n = true implies we.n_word_written = true
+}
+
+invariant FromDeviceKeepsFirmwareFence {
+    -- P28-8 dual path (weed fixes 1+2): the DEFAULT is the piped
+    -- data-ready path — the host releases at DATA-READY, not completion:
+    -- it spins (<= 5 ms, syncobj fallback) until every worker's LAST C
+    -- element (final cxn drain) differs from the previous exec image,
+    -- then reads clflush + mmap with NO ioctl. Correctness rests on the
+    -- S2MM FIFO-ORDER DEVICE LAW: each worker's single S2MM channel
+    -- delivers C elements in fifo order (qkv then cxn), so the last
+    -- element landing proves that worker's whole image is already in
+    -- memory. Exec 33 (and LV2_PIPE=0) keeps the serialized form:
+    -- syncobj wait + state word + the FromDevice ioctl (which may return
+    -- EINVAL benignly — logged, not fatal; completion is already proven
+    -- by wait + state).
+    for e in Lv2Execs:
+        e.status = attended implies (e.drain_read_via_ioctl = true or e.drain_read_via_sentinel_poll = true)
+}
+
+invariant StateWordCheckedEveryExec {
+    -- the fence signals on EVERY firmware response path (ghost
+    -- completions signal too): serialized execs read their state word
+    -- right after the wait; piped execs read the PREVIOUS exec's state
+    -- word with one-exec lag (in-order ERT means 1..e-1 are complete
+    -- when e is data-ready); the final exec and lm are checked directly.
+    -- A state != COMPLETED fails the run in every mode, timed iters
+    -- included.
+    for e in Lv2Execs:
+        e.status = attended implies e.state_word = config.fw_state_completed
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface HostCli {
+    provides:
+        RunLv2Requested(gates, iters)
+
+    contracts:
+        demands DeviceSubmission
+        fulfils NumericGlue
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "GhostRunsStillReturnSuccess: the lv2loop entry returns ExitCode::SUCCESS unconditionally and swallows final FromDevice errors; the spec above makes a ghost completion fail the run — is silent success intended (probe ergonomics) or accidental?"
+
+open question "E2eReliesOnCompileTimeNPdi: the E2E path writes only the id word into X elements; safety rests entirely on the loaded PDI being the compile-time N = 8 variant. Nothing pins the PDI flavor — should the driver assert n_word_written when the PDI reads the runtime worker count?"
+
+open question "PerExecReadbackBypassesFirmwareFence: per-exec drain readback uses CLFLUSHOPT plus a settle delay instead of the FromDevice ioctl (which returns EINVAL on this path); the firmware fence the ioctl provides is a correctness requirement — is the hash-stability workaround acceptable long term?"
+
+open question "Top8PrintedButNotGated: top-8 agreement is printed for every run but is not part of any pass condition — informative or should it gate?"
+
+open question "GoldenLoadAllOrNothing: a single missing golden artifact silently disables all gates; should a partial absence hard-fail instead?"
+
+open question "AttentionDispatchCliff: attention switches numeric kernels at exactly 15 attended positions and falls back wholesale on non-AVX-512 CPUs — acceptable for a fixed-pos replay harness, but is the boundary intended behavior?"
+
+open question "QuantNaNPathDivergence: scalar and vector quantization disagree on NaN inputs (q = 0 vs q = -128); no runtime assertion ties the two paths together — which behavior is the contract?"
+
+open question "PadRowsInLogitsRms: the logits rms gate includes 270 zero-padded vocab rows in its norm — harmless for agreement metrics, but is the denominator intended?"
+
+open question "TimedIterReusesCheckedKvCache: the timed loop reuses the KV cache built during the checked iteration; idempotent only because decode_pos is fixed — benchmark-only shortcut or a trap when positions become dynamic?"

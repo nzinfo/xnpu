@@ -3121,3 +3121,30 @@ model.q4nx，prefill 同 6 tokens）：FLM 答"我是混元，是腾讯开发的
 大模型。"并干净停止——两实现数值等效、同点停止；"2. …"确系伪影。
 另留痕：两轮贪心在 step 9 分叉（5788 vs 6293，同义分词）——板况级
 数值漂移（P7 定律范围内），语义与停止点不受影响。
+
+## P28-10（2026-09-29⑱）Weed 收口：完成语义层的债清偿
+
+allium 比对报告（specs/engine-lv2.allium ↔ 实现）裁决与动作：
+
+- **#1 状态字（高，code bug）**：E2E 从不读 pkt.state()——fence 在
+  ERROR/ABORT/TIMEOUT 全路径都信号化，timed 循环 check=false 门全
+  跳过，幽灵完成结构性不可见。修：serialized 路径 wait 后即查、
+  piped 路径滞后一位查（in-order ERT 保证 1..e-1 已完成）、末 exec
+  与 lm 直查，任何模式 state≠4 即 fail run。
+- **#2 FromDevice fence（高，spec 落后）**：**决策 = piped 保持默认**
+  （P28-8 验证过 gates 位级同、−2.28ms/token，回退白送性能）。配套：
+  S2MM FIFO-ORDER 设备定律入规约（单通道 fifo 序 ⇒ 末元素落地 =
+  全像已落地——此前是承重但未记载的启发式）；ioctl 错误从 `let _ =`
+  吞掉改为显式警告。**板验证副产物**：exec 33 与 lm 的 FromDevice
+  ioctl 自 P28-5 起一直返回 EINVAL（此前隐形）——在 wait+state 双
+  完成证明下该二次 fence 冗余且良性，降级为警告非致命。
+- **#4 golden 缺失消息（中）**："running UNGATED" 误导（实际会拒跑）
+  ——改为按缺失件精确报告（per-exec 缺 ⇒ 跳 drain 比较；final 缺 ⇒
+  拒跑除非 XNPU_SKIP_GATES）。
+- **spec 事实修正（低）**：#3 终局门实为三条件（+logits rel_rms）
+  +逃生阀入规约；#5 attention 悬崖 15→16（pos+1>=16）+ avx512bw
+  特征；#6 NaN 分歧值 −128→−127；#7 swiglu 单调用混路径放宽（尾部
+  循环，lv2 形状永不触发）；#8 count 溢出机制改正（截断掩码，
+  真兜底是 room() 的 4096B 上限）。
+- 板回归：gates PASS、steady 26.13ms/token（38.3 tok/s）、ask EOS
+  停止正常——零性能损失。
