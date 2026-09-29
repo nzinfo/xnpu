@@ -31,7 +31,7 @@
 |---|---|---|---|
 | **引擎（Rust，禁 C++）** | `~/qwen/xnpu/xnpu` | master → origin/master | 允许（github.com/nzinfo/xnpu.git） |
 | **笔记/文档/tools** | `~/qwen/xnpu`（外层，嵌套上面那个仓） | master → origin/**tutorial**（push 要显式 `git push origin master:tutorial`，push.default=simple 会拒） | 允许 |
-| **IRON（内核 C++，豁免区）** | `~/qwen/xnpu/IRON` | decode-fusion-llama | **永不 push**（origin = amd/IRON） |
+| **IRON（内核 C++，豁免区）** | `~/qwen/xnpu/IRON` | decode-fusion-llama → fork/decode-fusion-llama | **只推 fork**（`fork` = git@github.com:nzinfo/IRON.git，2026-09-29 起可用；origin = amd/IRON 永不推） |
 
 - commit 仅在用户明说时做；消息末尾 `Co-Authored-By: Claude Code <noreply@anthropic.com>`。
 - `~/qwen` 本身不是 git 仓。
