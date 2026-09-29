@@ -3094,8 +3094,37 @@ fn w4u_read_c(cs: &[u8], k: usize, m: usize) -> Vec<u16> {
 /// section = (blocks+2) 16-row elements; skip the 16 leading zero rows
 /// (the activation element's), the block partials follow chunk-major;
 /// K=6144 sums its 3 chunk partials in f32 (the reference host sum).
-fn w4u_c_at(cs: &[u8], row: usize, k: usize, m: usize) -> u16 {
-    let rpc = m / 8; // real rows per column
+/// P28-9: dequant ONE row of a v4 w4 pack to bf16 bits (embedding
+/// lookup — tie_word_embeddings makes lm_head rows the token embedding).
+/// Mirrors unpack_deq32's layout exactly: 8 logical cols x (M/8/16)
+/// tiles x 16 rows per block; nibble byte g*256 + k*8 + r/2 packs rows
+/// 2j(lo)|2j+1(hi); bf16 scales at 16384 + (g*16 + r)*2; W = q * sf.
+fn w4u_row_bf16(pack: &[u8], m: usize, k: usize, row: usize) -> Vec<u16> {
+    let cols = 8usize;
+    let tr = 16usize;
+    let chunks = k / 2048;
+    let t_num = m / cols / tr;
+    let col = row / (m / cols);
+    let within = row % (m / cols);
+    let t = within / tr;
+    let r = within % tr;
+    let off = (col * t_num * chunks + t) * W4U_ELEM;
+    let groups = 64usize;
+    let mut out = vec![0u16; k];
+    for g in 0..groups {
+        let sb = off + 16384 + (g * 16 + r) * 2;
+        let sf = f32::from_bits((u16::from_le_bytes([pack[sb], pack[sb + 1]]) as u32) << 16);
+        for kk in 0..32usize {
+            let b = pack[off + g * 256 + kk * 8 + r / 2];
+            let nib = if r % 2 == 0 { b & 0x0F } else { b >> 4 };
+            let q = ((nib as i8) << 4) >> 4;
+            out[g * 32 + kk] = f32_to_bf16(q as f32 * sf);
+        }
+    }
+    out
+}
+
+fn w4u_c_at(cs: &[u8], row: usize, k: usize, m: usize) -> u16 {    let rpc = m / 8; // real rows per column
     let (col, w) = (row / rpc, row % rpc);
     let section = (w4u_blocks(m, k) + 2) * W4U_TILE_ROWS;
     let base = col * section + W4U_TILE_ROWS + w;
@@ -6087,18 +6116,23 @@ fn cmd_run_decode_lv2(
     let cache_seq = 1024usize;
     let pos = 100usize;
     let (rc, rs) = rope_table(pos, arch.rope_base);
-    let posn = pos; // silence borrow lengthener below
+    // posn/rc/rs are now token_step parameters (P28-9 ask loop).
 
     // ONE token step. `check` gates the per-exec drain comparison (the
     // checked step only; timed steps skip the read entirely when goldens
-    // are absent).
+    // are absent). P28-9: x0/posn/rope are PARAMETERS (the ask loop
+    // advances position and re-seeds x0 from the embedding each step).
     let mut token_step = |kcache: &mut Vec<u16>,
                           vcache: &mut Vec<u16>,
                           hidden: &mut [u16],
                           it: u32,
                           check: bool,
                           rec: &mut Recorder,
-                          rec_seq: &mut u64|
+                          rec_seq: &mut u64,
+                          x0: &[u16],
+                          posn: usize,
+                          rc: &[f32; 64],
+                          rs: &[f32; 64]|
      -> bool {
         for e in 1..=execs {
             // (a) fill XN(e): exec 1 <- x0 by ring position, else the
@@ -6110,7 +6144,7 @@ fn cmd_run_decode_lv2(
                     for w in 0..8usize {
                         let off = w * W4U_ELEM;
                         let src: &[u16] = if e == 1 {
-                            &host.x0[pos_of(w) * 256..][..256]
+                            &x0[pos_of(w) * 256..][..256]
                         } else {
                             &drain[w * DRAIN_ROWS + 384..][..256]
                         };
@@ -6364,7 +6398,7 @@ fn cmd_run_decode_lv2(
     let mut vcache = host.vcache.clone();
     let mut hidden = vec![0u16; 2048];
     let t0 = std::time::Instant::now();
-    if !token_step(&mut kcache, &mut vcache, &mut hidden, 0, true, &mut rec, &mut rec_seq) {
+    if !token_step(&mut kcache, &mut vcache, &mut hidden, 0, true, &mut rec, &mut rec_seq, &host.x0, pos, &rc, &rs) {
         return ExitCode::FAILURE;
     }
     let mut xn = vec![0u16; 2048];
@@ -6458,12 +6492,100 @@ fn cmd_run_decode_lv2(
         return ExitCode::FAILURE;
     }
 
+    // ---- P28-9 ask mode: real-prompt greedy generation ----
+    // LV2_ASK=<dir>,<steps>: <dir> carries tools/lv2_ask.py's REAL-prompt
+    // prefill (kcache/vcache + ask.txt "pos first"). Per step: x0 = the
+    // bf16 embedding row of the last sampled token (tie_word_embeddings:
+    // the lm_head w4 pack dequantized row-by-row), position advances,
+    // caches grow — every decode step is the full NPU chain (33 execs +
+    // lm on CU1) with host attention between execs, exactly the engine's
+    // architecture. Prints greedy token ids for the caller to decode.
+    if let Ok(spec) = std::env::var("LV2_ASK") {
+        let (adir, steps_s) = match spec.rsplit_once(',') {
+            Some((d, s)) => (d.to_string(), s.to_string()),
+            None => (spec.clone(), "24".to_string()),
+        };
+        let steps: usize = steps_s.trim().parse().unwrap_or(24);
+        let ask_meta = match std::fs::read_to_string(format!("{adir}/ask.txt")) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("ask: read {adir}/ask.txt: {e} (tools/lv2_ask.py)");
+                return ExitCode::FAILURE;
+            }
+        };
+        let mut it = ask_meta.split_whitespace();
+        let pos0: usize = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let mut cur: usize = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let rd_cache = |name: &str| -> Vec<u16> {
+            std::fs::read(format!("{adir}/{name}"))
+                .expect("ask cache read")
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect()
+        };
+        let mut kcache = rd_cache("kcache.bin");
+        let mut vcache = rd_cache("vcache.bin");
+        let lm_pack = match std::fs::read(format!("{w4dir}/lmhead.bin")) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("ask: read lmhead.bin: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        println!("[ask] pos0 {pos0} first {cur}, {steps} steps:");
+        print!("[ask] ids: {cur}");
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        for s in 0..steps {
+            let posn = pos0 + s;
+            let (rc_s, rs_s) = rope_table(posn, arch.rope_base);
+            let x0 = w4u_row_bf16(&lm_pack, LM_M, 2048, cur);
+            if !token_step(
+                &mut kcache,
+                &mut vcache,
+                &mut hidden,
+                0,
+                false,
+                &mut rec,
+                &mut rec_seq,
+                &x0,
+                posn,
+                &rc_s,
+                &rs_s,
+            ) {
+                eprintln!("ask: token_step {s} failed");
+                return ExitCode::FAILURE;
+            }
+            rms_norm_bf16(&hidden, &host.norms[2 * layers * 2048..][..2048], &mut xn);
+            let logits = match lm_run(&xn, 0, &mut rec, &mut rec_seq) {
+                Some(l) => l,
+                None => {
+                    eprintln!("ask: lm failed at step {s}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let mut best = 0usize;
+            let mut bv = bf16_to_f32(logits[0]);
+            for (i, b) in logits.iter().enumerate() {
+                let v = bf16_to_f32(*b);
+                if v > bv {
+                    bv = v;
+                    best = i;
+                }
+            }
+            cur = best;
+            print!(" {cur}");
+            let _ = std::io::stdout().flush();
+        }
+        println!();
+    }
+
     // ---- timed iterations (caches idempotent at fixed pos) ----
     hp_reset();
     let t1 = std::time::Instant::now();
     for it in 1..=iters as u32 {
         let tb = std::time::Instant::now();
-        if !token_step(&mut kcache, &mut vcache, &mut hidden, it, false, &mut rec, &mut rec_seq) {
+        if !token_step(&mut kcache, &mut vcache, &mut hidden, it, false, &mut rec, &mut rec_seq, &host.x0, pos, &rc, &rs) {
             eprintln!("timed lv2 step failed");
             return ExitCode::FAILURE;
         }
