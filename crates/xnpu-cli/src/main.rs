@@ -5533,16 +5533,20 @@ fn cmd_run_lv2loop(iters: usize, n: usize) -> ExitCode {
         }
         None => {
             // One real exec pack as the static W stream: a mid-chain exec
-            // has the full element mix with real K headers.
+            // has the full element mix with real K headers. LV2LOOP_W
+            // overrides the pack path (P28-7: tools/lv2_floor_pack.py
+            // builds the all-K=2049 glue-floor discriminator).
             let lv2dir = if n == 16 {
                 format!("{build}/lv2_hy_w16")
             } else {
                 format!("{build}/lv2_hy")
             };
-            let wd = match std::fs::read(format!("{lv2dir}/exec05.bin")) {
+            let wpath =
+                std::env::var("LV2LOOP_W").unwrap_or_else(|_| format!("{lv2dir}/exec05.bin"));
+            let wd = match std::fs::read(&wpath) {
                 Ok(d) => d,
                 Err(e) => {
-                    eprintln!("read {lv2dir}/exec05.bin: {e} (tools/layerv2_pack.py --n {n})");
+                    eprintln!("read {wpath}: {e} (tools/layerv2_pack.py --n {n})");
                     return ExitCode::FAILURE;
                 }
             };
