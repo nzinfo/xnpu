@@ -3196,3 +3196,38 @@ FLM 的 decode 整层一个 TXN（gen_layer_seq）：`_send_x` →
   KV 流 v1(1.2) + 内核(~0.1) ≈ **23.6ms**；v2 bucket ≈ 22.5 ≈
   FLM 追平点。剩余 = lm_head 43.5→55.3（−0.66）+ 胶水残余 75µs。
 - prefill 上板是独立后续（mha 算子 S=2048 形态现成）。
+
+## P28-12（2026-09-29⑳）layer-v3 数值内核上车：attention 车辆（中期报告）
+
+目标：所有推理计算入 NPU。本会话把 layer-v3 的**数值内核**做成
+最小板上测试车（design_lv2attn + test_lv2attn + w4gemvu_attn_* 微
+入口）：
+
+- **内核**：K=210 init（rope+qk-norm+staging）/ K=211 kvhist（流式
+  online-softmax，无 K 历史存储）/ K=212 out；worker p 算 Q 头
+  2p,2p+1 对 KV 头 p/2（GQA 16/4 d=128）。全部状态 overlay 死区
+  （q/acc/ml → lv_sw；cos/sin/qn/kn/out → lv_shared）零 .bss 增长。
+  微入口 dispatcher（PMEM 隔离，gc-sections 把无关口味挡在 16KB 外）。
+- **算法离线验证**：online softmax + clamp + bf16 exp2 精度模型的
+  numpy 复算 vs golden **max diff 0.002（bf16 最低位级）**——算法
+  与精度模型板上目标达成在望。
+- **板上状态**：不挂（~280µs/exec）、C 通道可控（常量模式验证
+  store 路径活）、管道完整。**唯一未解：rope/qknorm 链的板上 q 行
+  数值错**（下一会话从 q 行读回继续，嫌疑：attn_rope 的
+  accum→bf16 store 形态 / qn 拷贝偏移）。
+
+### 本会话三条新定律（又是教科书级）
+
+1. **STACK LAW 复发（0x580 > 0x400）**：attn_step 内联 attn_exp 后
+   帧 1408B 越栈窗，覆写 A-fifo → 首 exec 死锁——P17 M6 病的
+   attention 版。修 = noinline 拆帧（attn_dot/attn_acc_update/
+   attn_exp 三件套，全部 ≤0x300）。**每加一个向量子程序必须查
+   paddxm**。
+2. **探针极性事故（方法论）**：volatile 探针变量 .bss 零初始化，
+   我写成 "==0 跳过"——**no-op 从未生效**，浪费三轮板测。探针
+   语义必须默认=禁用路径（==1 才启用）。
+3. **exp2 输入域**：巨负参数（−1e30，online-softmax 首步）喂
+   aie::exp2 会挂核——shipped 调用点（sigmoid）从未见过此域。
+   规避 = clamp −40（数学等价）。CR 状态假说被否定（set_rounding
+   不解），但 clamp 也不解（真凶是栈帧，见 1——exp2 内联撑爆的
+   正是它）。clamp 保留为防御。
