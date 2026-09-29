@@ -269,6 +269,20 @@ fn main() -> ExitCode {
                 .unwrap_or("plain");
             cmd_run_quadloop(iters, mode)
         }
+        Some("run-lv2loop") => {
+            // P28-6 6f-7: engine-path lv2 crawl discriminator (see
+            // cmd_run_lv2loop) — the same fixture the pyxrt forensic
+            // drove, submitted through OUR ERT packet + syncobj wait
+            // instead of an XRT runlist.
+            let nums: Vec<usize> = args
+                .iter()
+                .skip(1)
+                .filter_map(|s| s.parse::<usize>().ok())
+                .collect();
+            let iters = nums.first().copied().unwrap_or(40);
+            let n = nums.get(1).copied().unwrap_or(16);
+            cmd_run_lv2loop(iters, n)
+        }
         Some("run-lmhead") => {
             // M8/P8: hy lm_head on NPU — isolated probe (correctness + perf).
             let iters = args
@@ -5420,6 +5434,311 @@ fn cmd_run_quadloop(iters: usize, mode: &str) -> ExitCode {
             if sync_full { "whole-BO" } else { "148KB" },
             prof[2] / prof_n as f64
         );
+    }
+    ExitCode::SUCCESS
+}
+
+/// P28-6 6f-7: engine-path lv2 loop — the missing cell of the crawl matrix.
+///
+/// 6f-6 (pyxrt forensic) re-characterized the N=16 "deadlock" as a bimodal
+/// crawl of the per-element fill/drain handshake (clean ~1.2µs/BD vs crawl
+/// 0.4-1.5ms/BD). The engine path at N=8 (P28-5: 165 solo samples, 765µs
+/// median, fills incl. the whole 27.6MB W stream replayed EVERY exec) never
+/// showed it, while the pyxrt forensic crawls even at N=8 (~1/8 attempts).
+/// The one untested combination is engine @ N=16: this loop replays one
+/// exec's ctrl through OUR ERT_START_CU packet + syncobj wait (no XRT
+/// runlist, no per-attempt host BO syncs) and times every exec, so the
+/// bimodality is directly visible in the wait-duration distribution.
+/// Verdict table: clean here + crawl in pyxrt => the disease is the
+/// submission/runtime path, and the engine N=16 port can proceed; crawl
+/// here too => the dataflow protocol itself must be fixed (per-element
+/// handshake elimination), regardless of path.
+fn cmd_run_lv2loop(iters: usize, n: usize) -> ExitCode {
+    let build = "/home/nzinfo/qwen/xnpu/build";
+    if !matches!(n, 8 | 16) {
+        eprintln!("n must be 8 or 16 (design_layerv2 assert)");
+        return ExitCode::FAILURE;
+    }
+    // LV2LOOP_PROBE=<rings>: drive the AIELv2Probe fixture (design_lv2probe)
+    // instead of the full layerv2 design — the exact cells the 6f-6 pyxrt
+    // forensic measured, now through the engine submission path. W/X/XN
+    // mirror the forensic instrument (zeros + K/id/N headers).
+    let probe = std::env::var("LV2LOOP_PROBE").ok().and_then(|s| s.parse::<usize>().ok());
+    // LV2LOOP_WAIT_S: per-exec syncobj timeout (default 30s; the N=16
+    // full design stalls past it, so allow longer windows to distinguish
+    // a heavy-tailed crawl from a true wedge).
+    let wait_s: u64 = std::env::var("LV2LOOP_WAIT_S")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30);
+    let (welem, drain_rows) = if n == 16 { (94usize, 320usize) } else { (186, 640) };
+    let fixture = match probe {
+        Some(r) => format!("/home/nzinfo/qwen/xnpu/IRON/build/lv2probe{n}_r{r}.mlir.prj"),
+        None => format!("{build}/w4gemvu_layerv2_{n}.mlir.prj"),
+    };
+    let (pdi, instr, _) = match load_fixture(&fixture) {
+        Some(f) => f,
+        None => {
+            eprintln!("load fixture {fixture} failed");
+            return ExitCode::FAILURE;
+        }
+    };
+    let c_bytes = n * drain_rows * 2;
+    let le = |v: u32| v.to_le_bytes();
+    let (wdata, xdata, xndata): (Vec<u8>, Vec<u8>, Vec<u8>);
+    match probe {
+        Some(r) => {
+            // probe geometry (test_lv2probe.geom): mirrors the forensic
+            // instrument's build_inputs — zeros everywhere except the
+            // header words that drive flavor dispatch.
+            let rows = 2048 / n;
+            let n_o = rows / 16;
+            let n_gate = (6144 / n) / 16;
+            let n_qkv = (3072 / n) / 16;
+            let mut ks: Vec<u32> = Vec::new();
+            ks.extend(std::iter::repeat(2048).take(n_o));
+            ks.push(101);
+            ks.extend(std::iter::repeat(103).take(n_gate));
+            ks.extend(std::iter::repeat(104).take(n_gate));
+            ks.extend(std::iter::repeat(105).take(3 * n_o));
+            ks.push(102);
+            ks.extend(std::iter::repeat(2048).take(n_qkv));
+            let we = ks.len();
+            if (n == 16 && we != 94) || (n == 8 && we != 162) {
+                eprintln!("probe geom mismatch: {we} elements (r{r} n{n})");
+                return ExitCode::FAILURE;
+            }
+            let mut w = vec![0u8; n * we * W4U_ELEM];
+            for c in 0..n {
+                let base = c * we * W4U_ELEM;
+                for (i, k) in ks.iter().enumerate() {
+                    let off = base + i * W4U_ELEM;
+                    w[off + W4U_ELEM - 8..off + W4U_ELEM - 4].copy_from_slice(&le(*k));
+                }
+            }
+            wdata = w;
+            let mut x = vec![0u8; n * W4U_ELEM];
+            for w in 0..n {
+                let off = w * W4U_ELEM;
+                x[off + 6400..off + 6404].copy_from_slice(&le(w as u32));
+                x[off + 6404..off + 6408].copy_from_slice(&le(n as u32));
+            }
+            xdata = x;
+            let mut xn = vec![0u8; n * W4U_ELEM];
+            for w in 0..n {
+                let off = w * W4U_ELEM;
+                xn[off + W4U_ELEM - 8..off + W4U_ELEM - 4].copy_from_slice(&le(100));
+            }
+            xndata = xn;
+        }
+        None => {
+            // One real exec pack as the static W stream: a mid-chain exec
+            // has the full element mix with real K headers.
+            let lv2dir = if n == 16 {
+                format!("{build}/lv2_hy_w16")
+            } else {
+                format!("{build}/lv2_hy")
+            };
+            let wd = match std::fs::read(format!("{lv2dir}/exec05.bin")) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("read {lv2dir}/exec05.bin: {e} (tools/layerv2_pack.py --n {n})");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let w_bytes = n * welem * W4U_ELEM;
+            if wd.len() != w_bytes {
+                eprintln!("exec05.bin: {} B != {w_bytes} (stale pack)", wd.len());
+                return ExitCode::FAILURE;
+            }
+            wdata = wd;
+            let x_bits: Vec<u16> = (0..2048).map(|i| 0x3f80u16 | ((i as u16) & 0x7f)).collect();
+            let (q, d) = w4u_quantize_x(&x_bits, 2048);
+            let xe = w4u_build_x_elem(&q, &d, 2048);
+            let mut x = vec![0u8; n * W4U_ELEM];
+            for w in 0..n {
+                let off = w * W4U_ELEM;
+                x[off..off + W4U_ELEM].copy_from_slice(&xe);
+                x[off + 6400..off + 6404].copy_from_slice(&le(w as u32));
+                // design_layerv2.py:35 — the runtime-N kernel reads the
+                // worker count from X[6404,6408); omitting it feeds N=0
+                // geometry (the 60.8s wedge, 6f-7 §6). The N=8 E2E predates
+                // the runtime-N refactor (compile-time N=8 PDI) so it never
+                // needed this word.
+                x[off + 6404..off + 6408].copy_from_slice(&le(n as u32));
+            }
+            xdata = x;
+            let mut xn = vec![0u8; n * W4U_ELEM];
+            for w in 0..n {
+                let off = w * W4U_ELEM;
+                for j in 0..256usize {
+                    xn[off + j * 2..off + j * 2 + 2]
+                        .copy_from_slice(&x_bits[(w * 13 + j) & 0x7ff].to_le_bytes());
+                }
+                xn[off + W4U_ELEM - 8..off + W4U_ELEM - 4].copy_from_slice(&le(100));
+            }
+            xndata = xn;
+        }
+    }
+
+    let dev = match Device::open_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("open amdxdna device: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let md = match dev.aie_metadata() {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("AIE metadata: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut ctx = match HwContext::create(&dev, 8 * md.core.row_count as u32) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("create hwctx: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(e) = ctx.configure_cus(&[(pdi.as_slice(), 0)]) {
+        eprintln!("configure_cus: {e}");
+        return ExitCode::FAILURE;
+    }
+
+    let mut live: Vec<(BufferObject, Mapping)> = Vec::new();
+    let vas = [
+        chain_tensor(&dev, &mut live, "lv2loop.W", &wdata),
+        chain_tensor(&dev, &mut live, "lv2loop.X", &xdata),
+        chain_tensor(&dev, &mut live, "lv2loop.XN", &xndata),
+        chain_tensor(&dev, &mut live, "lv2loop.C", &vec![0u8; c_bytes]),
+    ];
+    if vas.iter().any(|v| v.is_none()) {
+        eprintln!("lv2loop tensor BO failed");
+        return ExitCode::FAILURE;
+    }
+    let vas: Vec<u64> = vas.into_iter().map(|v| v.unwrap()).collect();
+    // rt.sequence(W, X, XN, C) — mirror cmd_run_decode_lv2.
+    let mut op = match chain_op(&dev, "lv2loop", &instr, 0, &vas) {
+        Some(o) => o,
+        None => return ExitCode::FAILURE,
+    };
+    let handles = {
+        let mut h = vec![op.ctrl_bo.handle()];
+        h.extend(live.iter().map(|(bo, _)| bo.handle()));
+        h
+    };
+
+    // Static inputs, zero host work between execs: the ONLY variable is
+    // the device-side execution. Long wait so crawl execs complete and
+    // land in the distribution instead of aborting.
+    //
+    // Per-exec C instrumentation: after each wait, invalidate the host
+    // view (P21 clflush_region) and hash the drain image. A 20µs exec
+    // that leaves C bit-identical to the previous exec = drains replayed
+    // stale L1 slots without any recompute (the P19b starved-S2MM
+    // mechanism) — the wait "completing" is not evidence of work.
+    let mut times: Vec<f64> = Vec::with_capacity(iters);
+    let mut slow: Vec<(usize, f64)> = Vec::new();
+    let mut prev_hash: Option<u64> = None;
+    for it in 0..iters {
+        let seq = match op.pkt.submit(&dev, &ctx, &handles) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("lv2loop submit (it {it}): {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let t0 = std::time::Instant::now();
+        if let Err(e) =
+            syncobj_timeline_wait(&dev, ctx.syncobj_handle, seq, wait_s * 1_000_000_000)
+        {
+            eprintln!("lv2loop wait (it {it}, seq {seq}): {e}");
+            return ExitCode::FAILURE;
+        }
+        let us = t0.elapsed().as_secs_f64() * 1e6;
+        times.push(us);
+        if us > 5_000.0 {
+            slow.push((it, us));
+        }
+        // ERT cmd state (header bits[3:0]): the driver signals the syncobj
+        // fence on EVERY response path — COMPLETED(4), ERROR(5), ABORT(6),
+        // SUBMITTED(7), TIMEOUT(8), NORESPONSE(9) — so a returned wait is
+        // NOT evidence the exec ran (aie2_sched_notify → dma_fence_signal
+        // unconditionally; aie2_ctx.c). The health path additionally
+        // memcpys firmware health data over the packet's regmap (offset 4+)
+        // and permanently poisons the ctx (every later cmd = instant ABORT).
+        let st = op.pkt.state();
+        const ST: [&str; 10] = [
+            "INVALID",
+            "NEW",
+            "QUEUED",
+            "RUNNING",
+            "COMPLETED",
+            "ERROR",
+            "ABORT",
+            "SUBMITTED",
+            "TIMEOUT",
+            "NORESPONSE",
+        ];
+        let pkt_first = op.pkt.pkt_header_words();
+        let st_str = ST.get(st as usize).copied().unwrap_or("?");
+        let fake = if st == 4 { "" } else { "  <-- FAKE COMPLETION" };
+        // settle 2ms (S2MM tail in NoC), then invalidate + hash
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let (_, c_map) = &live[3];
+        c_map.clflush_region(0, c_bytes);
+        let cs = c_map.as_slice();
+        let nonzero = cs.chunks_exact(2).filter(|c| c[0] != 0 || c[1] != 0).count();
+        let mut h: u64 = 0xcbf29ce484222325;
+        for b in &cs[..c_bytes] {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        let same = prev_hash == Some(h);
+        prev_hash = Some(h);
+        println!(
+            "  it {it}: wait {us:.0}us, state={st_str}({st}){fake}, C nonzero {nonzero}/{}, hash 0x{h:016x}{}",
+            c_bytes / 2,
+            if same { " (SAME as prev — no recompute)" } else { "" }
+        );
+        println!("    pkt[0..8] = {:08x?}", pkt_first);
+    }
+    let mut sorted = times.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    println!(
+        "lv2loop: n={n} {iters} execs: min {:.0}us med {:.0}us max {:.0}us, {} slow(>5ms)",
+        sorted[0],
+        sorted[sorted.len() / 2],
+        sorted[sorted.len() - 1],
+        slow.len(),
+    );
+    // Read C back once: real packs + nonzero X => the drains must have
+    // left nonzero rows (sanity that the execs actually computed).
+    let (c_bo, c_map) = &live[3];
+    let mut nonzero = 0usize;
+    match c_bo.sync(SyncDirection::FromDevice, 0, c_bo.size() as u64) {
+        Ok(()) => {
+            nonzero = c_map
+                .as_slice()
+                .chunks_exact(2)
+                .filter(|c| c[0] != 0 || c[1] != 0)
+                .count();
+            println!("C nonzero u16 {}/{}", nonzero, c_bytes / 2);
+        }
+        Err(e) => eprintln!("C FromDevice failed (non-fatal): {e}"),
+    }
+    println!(
+        "per-exec us: {}",
+        times
+            .iter()
+            .map(|t| format!("{:.0}", t))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    for (it, us) in &slow {
+        println!("  SLOW it {it}: {us:.0}us");
     }
     ExitCode::SUCCESS
 }

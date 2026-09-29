@@ -150,6 +150,19 @@ impl StartNpuCmd {
         u32::from_le_bytes(w) & 0xf
     }
 
+    /// Snapshot of the packet's leading words (header + cu mask + start of
+    /// the regmap), to detect the kernel health path overwriting the regmap
+    /// with firmware health data (aie2_ctx_cmd_health_data memcpys into
+    /// cmd->data, i.e. offset 4 onward).
+    pub fn pkt_header_words(&self) -> [u32; 8] {
+        let mut out = [0u32; 8];
+        for (i, w) in out.iter_mut().enumerate() {
+            let b = &self.map.as_slice()[i * 4..i * 4 + 4];
+            *w = u32::from_le_bytes(b.try_into().unwrap());
+        }
+        out
+    }
+
     /// Submit via AMDXDNA_EXEC_CMD. `arg_handles` are the BO handles the
     /// command touches (the driver pins them and records them on the job);
     /// the register map itself already carries their addresses. Returns the
