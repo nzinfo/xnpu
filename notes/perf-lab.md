@@ -2997,3 +2997,98 @@ submit 受限于 host attention 串行链），或减少 exec 数（attention
 工具落盘：tools/lv2_floor_pack.py（地板 pack）、main.rs
 LV2LOOP_W 环境变量（W 路径覆盖）、内核 K=2049 口味（lv_body 首
 判，PERF ONLY）。
+
+## P28-8（2026-09-29⑯）E2E 流水化：数据就绪轮询 + 提前 submit —— 27.75→26.23ms
+
+P28-7 后账本：707µs/exec = 499 填充墙 + 132 组固定 + 75 胶水残余，
+组固定成本 ×33 ≈ 4.4ms 是最大单项。假设：它是 exec 间"完成→派发"
+串行空隙，submit 提前可让 ERT 预排队吃掉它。
+
+### 1. lv2loop 判别（LV2LOOP_PIPE=<depth>，独立 ctrl BO ×N）
+
+- **第一版教训（单 BO 重提交）**：12 次 submit 同一 ctrl BO → 驱动
+  合并/替换，wait 全部立即返回 + 状态字 NEW —— 假完成。独立 BO 才
+  有效；且 burst 全量预提交也无意义（submit ioctl 风暴自身爬行
+  ~143µs/个，6f-6 双峰复现；fence timeline 在队列模式下成团推进）。
+- **深度受限流水（与 E2E 真实形态匹配）**：
+
+| depth | pace med | 说明 |
+|---|---|---|
+| 1 | 656µs | 纯串行基线（旧 707 含 sleep+hash host 杂费） |
+| 2 | **603µs** | submit 提前 1 = −53µs，ERT 预排队吃掉部分空隙 |
+| 3 | 604µs | 深度 2 饱和 |
+
+全部状态 =4。剩余 603 = 499 墙 + 75 胶水 + ~29 不可再压的尾巴。
+
+### 2. E2E 移植（LV2_PIPE，默认开，=0 回退串行）
+
+关键：**只改一处**——(d) 的无条件 syncobj 等待换成"数据就绪轮询"，
+原循环顺序天然形成流水（读/gate/attention/填充落进 exec 尾巴）。
+
+- **哨兵设计（无撕裂的正确性来源）**：每 worker 的**最后一个 C 元素**
+  （末个 cxn drain，32B）≠ 上一 exec 快照。每 worker 单 S2MM 通道
+  按 fifo 序（qkv→cxn）投递 → 末元素落盘 ⟺ 该 worker 全像已在内存。
+  8 worker 哨兵全变化 = 就绪。超时 5ms 回退 syncobj 等待（全程未触发）。
+- **读路径**：流水模式 clflush+mmap 直读（FromDevice ioctl 会与仍在
+  飞的 exec 尾巴 fence，重新串行化——P21-3 的 ioctl 只留给串行路径
+  和最后 exec）。
+- **结果（同板窗背靠背 A/B）**：串行 28.51 → **流水 26.23ms/token
+  （38.1 tok/s，−8%）**；gates 双路数值逐位相同（hidden 0.0348 /
+  argmax 25868 / top-8 8/8）= 轮询读零撕裂的直接证据。lv2exec solo
+  新口径（submit→data-ready）635µs。
+
+### 3. 账本更新
+
+E2E 26.23 = 33×~603（流水 pace）+ lm 3.2 + host 残余 ~3.1？——精确
+分解待下轮（attention/填充是否全部塞进了 603µs pace 窗口，还是部分
+溢出到边界上）。对标 FLM 21.44：差距 4.8ms。下一刀排序：
+(a) lm_head 43.5→55.3 GB/s（−0.66ms，单独 op 好下手）；
+(b) 胶水残余 75µs（downelem 向量累加需单元测试、rms reduce）；
+(c) R2b attention 上板（exec 33→32 + host 链全消，战略项）。
+
+## P28-8（2026-09-29⑯）E2E 流水化：数据就绪轮询 + 提前 submit —— 27.75→26.23ms
+
+P28-7 后账本：707µs/exec = 499 填充墙 + 132 组固定 + 75 胶水残余，
+组固定成本 ×33 ≈ 4.4ms 是最大单项。假设：它是 exec 间"完成→派发"
+串行空隙，submit 提前可让 ERT 预排队吃掉它。
+
+### 1. lv2loop 判别（LV2LOOP_PIPE=<depth>，独立 ctrl BO ×N）
+
+- **第一版教训（单 BO 重提交）**：12 次 submit 同一 ctrl BO → 驱动
+  合并/替换，wait 全部立即返回 + 状态字 NEW —— 假完成。独立 BO 才
+  有效；且 burst 全量预提交也无意义（submit ioctl 风暴自身爬行
+  ~143µs/个，6f-6 双峰复现；fence timeline 在队列模式下成团推进）。
+- **深度受限流水（与 E2E 真实形态匹配）**：
+
+| depth | pace med | 说明 |
+|---|---|---|
+| 1 | 656µs | 纯串行基线（旧 707 含 sleep+hash host 杂费） |
+| 2 | **603µs** | submit 提前 1 = −53µs，ERT 预排队吃掉部分空隙 |
+| 3 | 604µs | 深度 2 饱和 |
+
+全部状态 =4。剩余 603 = 499 墙 + 75 胶水 + ~29 不可再压的尾巴。
+
+### 2. E2E 移植（LV2_PIPE，默认开，=0 回退串行）
+
+关键：**只改一处**——(d) 的无条件 syncobj 等待换成"数据就绪轮询"，
+原循环顺序天然形成流水（读/gate/attention/填充落进 exec 尾巴）。
+
+- **哨兵设计（无撕裂的正确性来源）**：每 worker 的**最后一个 C 元素**
+  （末个 cxn drain，32B）≠ 上一 exec 快照。每 worker 单 S2MM 通道
+  按 fifo 序（qkv→cxn）投递 → 末元素落盘 ⟺ 该 worker 全像已在内存。
+  8 worker 哨兵全变化 = 就绪。超时 5ms 回退 syncobj 等待（全程未触发）。
+- **读路径**：流水模式 clflush+mmap 直读（FromDevice ioctl 会与仍在
+  飞的 exec 尾巴 fence，重新串行化——P21-3 的 ioctl 只留给串行路径
+  和最后 exec）。
+- **结果（同板窗背靠背 A/B）**：串行 28.51 → **流水 26.23ms/token
+  （38.1 tok/s，−8%）**；gates 双路数值逐位相同（hidden 0.0348 /
+  argmax 25868 / top-8 8/8）= 轮询读零撕裂的直接证据。lv2exec solo
+  新口径（submit→data-ready）635µs。
+
+### 3. 账本更新
+
+E2E 26.23 = 33×~603（流水 pace）+ lm 3.2 + host 残余。对标 FLM
+21.44：差距 4.8ms。下一刀排序：(a) lm_head 43.5→55.3 GB/s
+（−0.66ms，单独 op 好下手）；(b) 胶水残余 75µs（downelem 向量累加
+需单元测试、rms reduce）；(c) R2b attention 上板（exec 33→32 +
+host 链全消，战略项）。
