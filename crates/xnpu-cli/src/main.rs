@@ -5646,6 +5646,88 @@ fn cmd_run_lv2loop(iters: usize, n: usize) -> ExitCode {
     let mut times: Vec<f64> = Vec::with_capacity(iters);
     let mut slow: Vec<(usize, f64)> = Vec::new();
     let mut prev_hash: Option<u64> = None;
+
+    // P28-8a discriminator: LV2LOOP_PIPE builds `iters` INDEPENDENT
+    // command BOs (re-submitting ONE ctrl BO lets the driver coalesce/
+    // replace queued commands — first attempt measured 1us paces from
+    // fake completions), submits them all up front, then waits in
+    // sequence. The fixture is static, so the ERT is free to pre-queue
+    // command k+1 while k streams. The median DELTA between consecutive
+    // wait returns is the true back-to-back exec pace; if it drops well
+    // below the serialized 707us, the ~132us per-exec fixed cost is
+    // dispatch latency that submit-ahead can hide in the E2E chain too.
+    if std::env::var("LV2LOOP_PIPE").is_ok() {
+        let mut pipe_ops: Vec<ChainOp> = Vec::with_capacity(iters);
+        let mut pipe_handles: Vec<Vec<u32>> = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            match chain_op(&dev, "lv2loopP", &instr, 0, &vas) {
+                Some(o) => pipe_ops.push(o),
+                None => return ExitCode::FAILURE,
+            }
+        }
+        for op in &pipe_ops {
+            let mut h = vec![op.ctrl_bo.handle()];
+            h.extend(live.iter().map(|(bo, _)| bo.handle()));
+            pipe_handles.push(h);
+        }
+        // Depth-bounded pipeline (LV2LOOP_PIPE=<depth>, default 2 — the
+        // E2E-relevant regime: at most <depth> commands in flight, submit
+        // k+1 right after k, wait in order). The burst-submit variant
+        // (all up front) is meaningless: the submit ioctl storm crawls
+        // (~143us each, 6f-6) and the fence timeline lumps — states read
+        // NEW. Pace = median delta between consecutive wait returns.
+        let depth: usize = std::env::var("LV2LOOP_PIPE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|v| *v >= 1)
+            .unwrap_or(2);
+        let mut seqs = vec![0u64; iters];
+        let mut next_sub = 0usize;
+        let mut dones: Vec<f64> = Vec::with_capacity(iters);
+        let mut t0all = std::time::Instant::now();
+        for it in 0..iters {
+            while next_sub < iters && next_sub < it + depth {
+                match pipe_ops[next_sub].pkt.submit(&dev, &ctx, &pipe_handles[next_sub]) {
+                    Ok(s) => seqs[next_sub] = s,
+                    Err(e) => {
+                        eprintln!("lv2loop pipe submit (it {next_sub}): {e}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+                next_sub += 1;
+            }
+            if it == 0 {
+                t0all = std::time::Instant::now();
+            }
+            if let Err(e) =
+                syncobj_timeline_wait(&dev, ctx.syncobj_handle, seqs[it], wait_s * 1_000_000_000)
+            {
+                eprintln!("lv2loop pipe wait (it {it}): {e}");
+                return ExitCode::FAILURE;
+            }
+            dones.push(t0all.elapsed().as_secs_f64() * 1e6);
+            let st = pipe_ops[it].pkt.state();
+            if st != 4 {
+                println!("  pipe it {it}: state={st} <-- NOT COMPLETED");
+            }
+        }
+        let mut pace: Vec<f64> = Vec::with_capacity(iters - 1);
+        for w in dones.windows(2) {
+            pace.push(w[1] - w[0]);
+        }
+        let mut p = pace.clone();
+        p.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        println!(
+            "lv2loop PIPE depth={depth}: n={n} pace med {:.0}us min {:.0}us max {:.0}us (serialized ref ~707)",
+            p[p.len() / 2],
+            p[0],
+            p[p.len() - 1],
+            n = n
+        );
+        println!("  paces: {:.0?}", pace);
+        return ExitCode::SUCCESS;
+    }
+
     for it in 0..iters {
         let seq = match op.pkt.submit(&dev, &ctx, &handles) {
             Ok(s) => s,
@@ -6083,7 +6165,20 @@ fn cmd_run_decode_lv2(
                 let (bo, map) = &live[2];
                 sync_to_device(bo, map, 0, c_bytes);
             }
-            // (d) submit + wait on CU0 (device-dominated segment).
+            // (d) submit + data-ready on CU0 (device-dominated segment).
+            // P28-8 pipelined chain (LV2_PIPE=0 reverts to the P28-5
+            // serialized wait): the host releases at DATA-READY, not at
+            // formal completion. Sentinel = every worker's LAST C
+            // element (its final cxn drain, 32B) differing from the
+            // previous exec's image — each worker's single S2MM channel
+            // delivers elements in fifo order (qkv then cxn), so the
+            // last element landing means that worker's whole image is
+            // already in memory. Everything between here and the next
+            // submit (read/gate/attention/fills) then hides inside exec
+            // e's TCT/syncobj tail; the lv2loop PIPE discriminator
+            // measured the pace win at 656 -> 603us.
+            let piped = e < execs
+                && std::env::var("LV2_PIPE").map(|v| v != "0").unwrap_or(true);
             let ts = std::time::Instant::now();
             let seq = hp!(HSeg::Lv2Wait, {
                 match ops[e - 1].pkt.submit(&dev, &ctx, &handles[e - 1]) {
@@ -6094,24 +6189,80 @@ fn cmd_run_decode_lv2(
                     }
                 }
             });
-            hp!(HSeg::Lv2Wait, {
-                if let Err(err) =
-                    syncobj_timeline_wait(&dev, ctx.syncobj_handle, seq, 60_000_000_000)
-                {
-                    eprintln!("lv2 wait (exec {e}, seq {seq}): {err}");
-                    return false;
+            let mut ready = false;
+            if piped {
+                let deadline = std::time::Instant::now()
+                    + std::time::Duration::from_millis(5);
+                while std::time::Instant::now() < deadline {
+                    let cmap = &live[2].1;
+                    for w in 0..8usize {
+                        // last 16 bf16 of worker w's rows
+                        let off = (w * DRAIN_ROWS + DRAIN_ROWS - 16) * 2;
+                        cmap.clflush_region(off, 32);
+                    }
+                    let cs = live[2].1.as_slice();
+                    let mut all = true;
+                    for w in 0..8usize {
+                        let base = (w * DRAIN_ROWS + DRAIN_ROWS - 16) * 2;
+                        for j in 0..16usize {
+                            let b = [cs[base + j * 2], cs[base + j * 2 + 1]];
+                            let old = drain[w * DRAIN_ROWS + DRAIN_ROWS - 16 + j];
+                            if b != old.to_le_bytes() {
+                                all = false;
+                                break;
+                            }
+                        }
+                        if !all {
+                            break;
+                        }
+                    }
+                    if !all {
+                        ready = true;
+                        break;
+                    }
+                    std::hint::spin_loop();
                 }
-            });
+                if !ready {
+                    eprintln!("lv2 poll (exec {e}) timed out; falling back");
+                }
+            }
+            if !ready {
+                hp!(HSeg::Lv2Wait, {
+                    if let Err(err) = syncobj_timeline_wait(
+                        &dev,
+                        ctx.syncobj_handle,
+                        seq,
+                        60_000_000_000,
+                    ) {
+                        eprintln!("lv2 wait (exec {e}, seq {seq}): {err}");
+                        return false;
+                    }
+                });
+            }
             if it > 0 {
                 rec.solo(&lv2_meta, it, ts, *rec_seq);
                 *rec_seq += 1;
             }
-            // (e) read the drain image.
+            // (e) read the drain image. Piped: the sentinel proved the
+            // data is in memory — clflush the region and read the mmap
+            // (the FromDevice ioctl would fence against exec e's still
+            // in-flight tail, re-serializing the chain). Serialized:
+            // keep the fw-fence ioctl (P21-3 correctness).
             hp!(HSeg::Lv2Read, {
-                let _ = live[2].0.sync(SyncDirection::FromDevice, 0, live[2].0.size() as u64);
-                let cs = live[2].1.as_slice();
-                for i in 0..8 * DRAIN_ROWS {
-                    drain[i] = u16::from_le_bytes([cs[i * 2], cs[i * 2 + 1]]);
+                if ready {
+                    live[2].1.clflush_region(0, c_bytes);
+                    let cs = live[2].1.as_slice();
+                    for i in 0..8 * DRAIN_ROWS {
+                        drain[i] = u16::from_le_bytes([cs[i * 2], cs[i * 2 + 1]]);
+                    }
+                } else {
+                    let _ = live[2]
+                        .0
+                        .sync(SyncDirection::FromDevice, 0, live[2].0.size() as u64);
+                    let cs = live[2].1.as_slice();
+                    for i in 0..8 * DRAIN_ROWS {
+                        drain[i] = u16::from_le_bytes([cs[i * 2], cs[i * 2 + 1]]);
+                    }
                 }
             });
             if std::env::var("LV2_DUMP_ALL").is_ok() {
