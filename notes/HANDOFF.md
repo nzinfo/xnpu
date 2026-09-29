@@ -58,8 +58,11 @@
 
 ## 4. 当前进度快照（截至本文件时刻）
 
-- **E2E 现状**：lv2 路径 33 exec/token，**30.6ms/token（32.7 tok/s）**，双门 PASS；
-  对标 FLM 21.44ms。
+- **E2E 现状**：lv2 路径 33 exec/token，**27.75ms/token（36.0 tok/s）**，双门 PASS；
+  对标 FLM 21.44ms（差距 6.3ms）。P28-7（perf-lab ⑮）已落地：quant 路径
+  向量化 762→707µs/exec + K=2049 地板判别（floor 632µs = 499+132+1，
+  6f-9 模型直接闭合；胶水暴露 131→75µs）。四条新定律见 perf-lab P28-7
+  （向量代数先证后编 / acc 域加法双面 / 对齐律 store 侧 / 证明算子类组合法）。
 - **瓶颈已定案**（perf-lab 6f-9 §7 终模型，两级自我否证后）：
   `T_exec = W_bytes/55.3GB/s + Σ胶水相位停摆(~250µs)`；36.6GB/s = 55.6×占空比 2/3；
   FLM 同墙 duty≈0.9+。差距本质 = 占空比，不是带宽/通道/计算/ring。
@@ -72,11 +75,10 @@
 - 关键契约：runtime-N 内核从 X 元素 [6404,6408) u32 读 worker 数
   （`design_layerv2.py:35`）；K-header 口味表（2048/101/102/103/104/105）；
   IRON 内核符号必须 `extern "C"`。
-- **T_stall 直接测量工具已就绪未上板**：`tools/lv2_floor_pack.py`
-  （P28-7）——把全部 W 元素 K 头改 2049（dummy-compute 口味），跑通
-  A 流+计算+C drain 但零胶水相位；T(full)−T(floor) = 胶水暴露量，
-  即 6f-9 §7 闭合反推 ~250µs 的直接裁决。与 r0 探针配对可再剥掉
-  gather。
+- **地板判别已上板并闭合**（P28-7）：`tools/lv2_floor_pack.py` + 内核
+  K=2049 口味 + main.rs `LV2LOOP_W` 覆盖。floor 632µs 直接实证 6f-9。
+  用法：`LV2LOOP_W=/tmp/lv2_floor_exec05.bin xnpu-cli run-lv2loop 12 8`
+  （pack 先由工具生成）。
 
 ## 5. 进行中 / 悬而未决
 

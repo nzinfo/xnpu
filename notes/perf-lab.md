@@ -2912,3 +2912,88 @@ rendezvous 全在 core↔shim 的 depth-2 协议里，而 plain v5 lm
 - 判别实验（若需直接证据）：echo 时间戳计数器进 lv_cxn 探针窗
   （每胶水相位边界写 .bss 计数，比 6f-6 的 2ms 轮询细）——但模
   型已闭合 6+2 数据点（含 pair/quad 时代），优先级让位于修复本体。
+
+## P28-7（2026-09-29⑮）胶水清剿第一刀：quant 路径向量化 + K=2049 地板判别 —— 762→707µs，E2E 30.6→27.75ms
+
+6f-9 处方的执行：T_exec = W/55.3 + 胶水停摆(~250µs，实为 132 组固定
++ ~120 胶水本体)。本刀只动内核标量胶水（bit-exact 约束下），不动
+fill 拓扑。**地板判别首次直接实测**：tools/lv2_floor_pack.py 把
+exec05 全部 186×8 个 W 元素 K 头改 2049（新加的 PERF-ONLY
+dummy-compute 口味：lv_compute 写死 lv_dummy，零状态零胶水），A 流
++满计算+C drain 全跑：
+
+> **floor = 632µs med ≈ 499(W@55.3 墙) + 132(组固定) + ~1** ——
+> 6f-9 两分量模型第一次被直接裁决闭合。胶水暴露 = full−floor =
+> **131µs**（旧内核 762）→ **75µs**（新内核 707）。
+
+### 1. 二分七轮全记录（教科书主素材：AIE 向量化的暗礁地图）
+
+| 轮 | 配置 | 结果 | 裁决 |
+|---|---|---|---|
+| R0 | amax=broke + x/downelem vec | 单失配 675.7µs | amax 代数错 |
+| R1 | amax=broke + x 标量 + downelem vadd.f | 单失配 | vadd.f 也有错 |
+| R2 | amax 修正 + 全标量 | **PASS** | amax 新公式成立 |
+| R3 | + mac-form downelem | 大面积损坏 | mac 累加形态更糟 |
+| R4 | + x-vec（concat 复制） | 大面积损坏 | x-vec 定罪 |
+| R5 | 仅 x32-vec（无复制） | **PASS** | **pack 窄化无罪** |
+| R6 | x-vec 16B store×8 | 大面积损坏 | **对齐律 store 侧** |
+| R7 | pack + lv_build_arena 复制体 | **PASS 5/5** | 全证明算子类组合 |
+
+四条新定律/教训：
+
+1. **AIE 向量代数先证后编（numpy 检查器必经）**：直觉公式
+   `max(b_signed, −b_signed) ≡ b & 0x7fffffff` 是**错的**——
+   float 是符号幅值，取反得补码 2³¹−m ≠ 幅值位型 m（200k 随机
+   100% 失配；我最初的"手验"恰好用了 m=2³⁰ 的巧合值）。正解：
+   `max(reduce_max(t), reduce_max(t + INT_MIN 回绕))` —— 正数
+   lane 落在 t、负数 lane 的幅值位型落在 t+2³¹，两树取大即
+   masked-bit max，含 ±0/NaN/denormal 全模式 0 失配（numpy
+   20 万样本 + 对抗集证明后才上板）。vadd.32/vmax 树都是真向量
+   op；aie::abs/bit_and 在 32b lane 上标量化（header 自述），
+   别用。
+2. **累加器域浮点加法有两副面孔**：`aie::add` 直连降成裸
+   `vadd.f dm`（单失配）；P17 风格 `mul→mac(acc,ones,v)` 在本
+   场景大面积损坏。acc 域的每一种加法形态都要单独板验——P17
+   "裸 acc+acc 非法"定律的推广。downelem 16-iter 标量 f32 累加
+   **保持标量**（代价仅 ~6µs，留待单元测试）。
+3. **P28-4 对齐律的 store 侧扩展**：16B int8 `store_v` 落在
+   16-mod-32 地址（dst+16/48/80/112）= 未定义（R6 大面积损坏）。
+   反例：`load_v<16>` at +16 在 lv_build_arena（P19 起板上验证）
+   一直工作——law 的精确边界（load vs store、宽度、寄存器类）
+   待内核单元测试钉死。
+4. **证明算子类组合法（R7 一次通过的秘诀）**：新向量代码只用
+   已被板上验证的算子类拼装——double-pack 由 x32 单独验证
+   （R5）、load_v<16>+concat+32B store 复制体 = lv_build_arena
+   逐字内联（P19 验证）。fused_sw_x 最终形态：向量 sub/clip/
+   pack → 32B 存 lv_qscratch（该口内已死，复用零 .bss 增量）→
+   arena 复制体写 dst（全 32B 对齐）。
+
+### 2. 数字
+
+- **lv2loop（引擎路径，12 iters）**：full 762→**707µs med**
+  （−55µs, −7.2%）；floor 632µs；C hash 跨新旧内核**逐位相同**
+  （0xa32cff3911de6f45，真实 exec05 权重上的位等价二次确认，
+  比 pytest 更强）。
+- **E2E**：30.6→**27.75ms/token（36.0 tok/s）**，gates PASS
+  （hidden rel_rms 0.0348 / logits argmax 25868 = golden /
+  top-8 8/8）；lv2exec solo 679µs。对标 FLM 21.44ms：差距
+  9.2→**6.3ms**。
+- `.text` 13424→~12.6KB（−800B，PMEM 余量增大）；帧 0x300 不变；
+  无软浮点回流。
+- N=16 pytest 5×TIMEOUT 为**先存失败**（tests_latest.csv 09:36
+  即 0/5，早于本刀；6f-8 引擎路径 N=16 12/12 干净——pytest 夹具
+  侧问题，未跟进）。
+
+### 3. 残余账本（下一刀的坐标）
+
+胶水暴露余 75µs = ring 会合（~20）+ downelem 标量累加（~6）+ rms
+sumsq 归约/调用开销（~10）+ fill 停摆重启延迟（窗口数×固定）。
+地板内 132µs 组固定成本（每 exec 的 ERT 调度/提交/同步尾巴）是
+**下一个最大单项**——需要跨 exec 边界工程（X/XN 双缓冲 + 提前
+submit 受限于 host attention 串行链），或减少 exec 数（attention
+上板，R2b 的 d=128 fused MHA 是正路）。到 22.5ms 追平点的路径：
+~50µs×33（胶水清零）+ ~66µs×33（组成本减半）≈ −3.8ms。
+
+工具落盘：tools/lv2_floor_pack.py（地板 pack）、main.rs
+LV2LOOP_W 环境变量（W 路径覆盖）、内核 K=2049 口味（lv_body 首
+判，PERF ONLY）。
