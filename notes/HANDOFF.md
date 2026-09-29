@@ -72,6 +72,11 @@
 - 关键契约：runtime-N 内核从 X 元素 [6404,6408) u32 读 worker 数
   （`design_layerv2.py:35`）；K-header 口味表（2048/101/102/103/104/105）；
   IRON 内核符号必须 `extern "C"`。
+- **T_stall 直接测量工具已就绪未上板**：`tools/lv2_floor_pack.py`
+  （P28-7）——把全部 W 元素 K 头改 2049（dummy-compute 口味），跑通
+  A 流+计算+C drain 但零胶水相位；T(full)−T(floor) = 胶水暴露量，
+  即 6f-9 §7 闭合反推 ~250µs 的直接裁决。与 r0 探针配对可再剥掉
+  gather。
 
 ## 5. 进行中 / 悬而未决
 
