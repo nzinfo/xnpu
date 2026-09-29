@@ -3092,3 +3092,20 @@ E2E 26.23 = 33×~603（流水 pace）+ lm 3.2 + host 残余。对标 FLM
 （−0.66ms，单独 op 好下手）；(b) 胶水残余 75µs（downelem 向量累加
 需单元测试、rms reduce）；(c) R2b attention 上板（exec 33→32 +
 host 链全消，战略项）。
+
+## P28-9（2026-09-29⑰）ask 模式：引擎第一次回答真实问题
+
+问 "你是谁？"（DeepSeek 风格模板，6 prompt token）——参考链 prefill
+（tools/lv2_ask.py：golden 逐层数学 verbatim，真实 KV）+ NPU 生成环
+（LV2_ASK=<dir>,<steps>：token_step 参数化 x0/posn/rope，每步 x0 =
+embedding 行（tie_word_embeddings，w4u_row_bf16 逐行反量化 lmhead
+pack，零 496MB 落盘））：
+
+> **答："我是混元，由腾讯开发的大模型。2. 请帮我写一段关于
+> '科技与人文的融合'"**（24 token，26.18ms/token，gates 同步 PASS）
+
+意义：引擎从"合成 fixture 单步验证器"成为真实推理器。CPU 介入清单
+随之定案（每 token）：attention 全家（rope/qk-norm/KV append/GQA，
+32 次/exec 间）+ 激活量化（X 元素 g32 ×32 + lm 前 final rms/quant）+
+编排（submit/哨兵轮询/clflush）+ argmax + prefill（全程 CPU，~1s/
+token）+ tokenizer。NPU：全部权重 GEMV + rms/swiglu/量化内核。
